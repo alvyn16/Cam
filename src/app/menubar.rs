@@ -1,4 +1,4 @@
-//! Menu bar status item: record icon (red with the elapsed time while
+//! Menu bar status item (adapted from rec-rs): record icon (red with the elapsed time while
 //! recording) and a menu. Menu actions are queued as `Cmd`s for the app.
 
 use objc2::rc::Retained;
@@ -13,7 +13,7 @@ use crate::util::ns;
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "RecMenuTarget"]
+    #[name = "GlideMenuTarget"]
     pub struct Target;
 
     impl Target {
@@ -28,14 +28,6 @@ define_class!(
         #[unsafe(method(showWindow:))]
         fn show_window(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::ShowWindow);
-        }
-        #[unsafe(method(showSettings:))]
-        fn show_settings(&self, _s: Option<&AnyObject>) {
-            super::push(Cmd::ShowSettings);
-        }
-        #[unsafe(method(revealLast:))]
-        fn reveal_last(&self, _s: Option<&AnyObject>) {
-            super::push(Cmd::RevealLast);
         }
         #[unsafe(method(openFolder:))]
         fn open_folder(&self, _s: Option<&AnyObject>) {
@@ -58,7 +50,6 @@ pub struct MenuBar {
     status: Retained<NSStatusItem>,
     record: Retained<NSMenuItem>,
     pause: Retained<NSMenuItem>,
-    reveal: Retained<NSMenuItem>,
     hotkey: Retained<NSMenuItem>,
     _target: Retained<Target>,
     last: Option<(bool, bool, bool, String)>,
@@ -70,7 +61,6 @@ pub struct View<'a> {
     pub paused: bool,
     pub finishing: bool,
     pub clock: &'a str,
-    pub has_last: bool,
 }
 
 impl MenuBar {
@@ -89,30 +79,26 @@ impl MenuBar {
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
         let record = item("Start Recording", Some(sel!(toggleRecording:)), "r");
-        record.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+        record.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift | NSEventModifierFlags::Option);
         menu.addItem(&record);
         let pause = item("Pause", Some(sel!(togglePause:)), "");
         menu.addItem(&pause);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&item("Show Rec Window", Some(sel!(showWindow:)), ""));
-        menu.addItem(&item("Settings…", Some(sel!(showSettings:)), ","));
+        menu.addItem(&item("Show Glide", Some(sel!(showWindow:)), ""));
+        menu.addItem(&item("Open Projects Folder", Some(sel!(openFolder:)), ""));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        let reveal = item("Reveal Last Recording", Some(sel!(revealLast:)), "");
-        menu.addItem(&reveal);
-        menu.addItem(&item("Open Recordings Folder", Some(sel!(openFolder:)), ""));
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-        let hotkey = item("Global hotkey: ⇧⌘R", None, "");
+        let hotkey = item("Global hotkey: ⌥⇧⌘R", None, "");
         hotkey.setEnabled(false);
         menu.addItem(&hotkey);
-        menu.addItem(&item("Quit Rec", Some(sel!(quit:)), "q"));
+        menu.addItem(&item("Quit Glide", Some(sel!(quit:)), "q"));
         status.setMenu(Some(&menu));
-        let mut mb = MenuBar { status, record, pause, reveal, hotkey, _target: target, last: None };
-        mb.update(&View { recording: false, paused: false, finishing: false, clock: "", has_last: false });
+        let mut mb = MenuBar { status, record, pause, hotkey, _target: target, last: None };
+        mb.update(&View { recording: false, paused: false, finishing: false, clock: "" });
         mb
     }
 
     pub fn hotkey_unavailable(&self) {
-        self.hotkey.setTitle(&ns("Global hotkey ⇧⌘R unavailable"));
+        self.hotkey.setTitle(&ns("Global hotkey ⌥⇧⌘R unavailable"));
     }
 
     pub fn title(&self) -> Option<String> {
@@ -136,7 +122,6 @@ impl MenuBar {
         self.record.setEnabled(!v.finishing);
         self.pause.setTitle(&ns(if v.paused { "Resume" } else { "Pause" }));
         self.pause.setEnabled(v.recording);
-        self.reveal.setEnabled(v.has_last);
         let Some(mtm) = MainThreadMarker::new() else { return };
         let Some(button) = self.status.button(mtm) else { return };
         let (symbol, title, red) = if v.finishing {
@@ -148,7 +133,7 @@ impl MenuBar {
         } else {
             ("record.circle", String::new(), false)
         };
-        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns(symbol), Some(&ns("Rec"))) {
+        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns(symbol), Some(&ns("Glide"))) {
             img.setTemplate(!red);
             button.setImage(Some(&img));
         }

@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use glide::engine::scene::Scene;
 use glide::export::{self, Job, Source};
-use glide::media::writer::{MovieWriter, WriterSpec, fill_bgra};
 use glide::project::model::{Codec, ExportFormat, ExportSettings, Quality};
 use glide::project::{self, Package};
 use glide::render::{Gpu, Renderer, VideoFrame};
@@ -89,6 +88,30 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Open the app (the default with no subcommand).
+    Gui {
+        /// A .glide project to open.
+        project: Option<PathBuf>,
+    },
+    /// Render the UI headlessly to PNG (layout checks without a display).
+    #[command(hide = true)]
+    Snapshot {
+        project: Option<PathBuf>,
+        #[arg(long)]
+        tab: Option<String>,
+        #[arg(long)]
+        zoom: bool,
+        #[arg(long)]
+        export_sheet: bool,
+        #[arg(long)]
+        light: bool,
+        #[arg(long, default_value_t = 0.0)]
+        at: f64,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Transcribe a project's microphone track into captions.
+    Transcribe { project: PathBuf },
     /// List displays, windows, cameras and microphones.
     Devices,
     /// Show (or request) Screen Recording, Microphone and Camera access.
@@ -127,10 +150,31 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
-        None => {
-            println!("glide {}", env!("CARGO_PKG_VERSION"));
+        Some(Cmd::Gui { project }) => glide::app::run(project),
+        Some(Cmd::Snapshot { project, tab, zoom, export_sheet, light, at, output }) => {
+            use glide::app::editor::Tab;
+            let tab = tab.map(|t| {
+                Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
+            });
+            let shot = glide::app::snapshot::Shot {
+                project: project.as_deref(),
+                tab,
+                select_zoom: zoom,
+                export_sheet,
+                dark: !light,
+                playhead_ms: at * 1000.0,
+                size: (1320.0, 840.0),
+            };
+            glide::app::snapshot::render(&shot, &output)?;
+            println!("{}", output.display());
             Ok(())
         }
+        Some(Cmd::Transcribe { project }) => {
+            let n = glide::transcribe::transcribe_package(&Package::new(&project))?;
+            println!("{n} words → {}", glide::transcribe::transcript_path(&Package::new(&project)).display());
+            Ok(())
+        }
+        None => glide::app::run(None),
     }
 }
 
@@ -243,31 +287,8 @@ fn export_cmd(
 }
 
 fn synth(output: PathBuf, duration: f64, width: u32, height: u32) -> Result<()> {
-    let ms = duration * 1000.0;
-    let rec = glide::synth::recording(width, height, ms);
-    let pkg = Package::new(&output);
-    std::fs::create_dir_all(pkg.recording_dir())?;
-    let fps = 60u32;
-    let mut w = MovieWriter::create(
-        &pkg.rec("screen.mov"),
-        &WriterSpec { width, height, fps, codec: Codec::Hevc, bitrate: (width * height) as u64 * 8, audio: false },
-    )?;
-    let frames = (duration * fps as f64) as u64;
-    for i in 0..frames {
-        let px = glide::synth::screen_bgra(width, height, i as f64 * 1000.0 / fps as f64);
-        let pb = w.buffer()?;
-        fill_bgra(&pb, &px, width, height, (width * 4) as usize);
-        w.push_frame(&pb)?;
-    }
-    w.finish()?;
-    project::write_json(&pkg.rec("meta.json"), &rec.meta)?;
-    project::write_json(&pkg.rec("mouse.json"), &rec.mouse)?;
-    project::write_json(&pkg.rec("keys.json"), &rec.keys)?;
-    project::write_json(&pkg.rec("cursors.json"), &rec.cursors)?;
-    project::write_json(&pkg.rec("transcript.json"), &rec.transcript)?;
-    let proj = project::new_project(&pkg.name(), &rec);
-    pkg.save_project(&proj)?;
-    println!("{} ({} frames, {} zooms)", output.display(), frames, proj.timeline.zooms.len());
+    let (frames, zooms) = glide::synth::write_package(&output, duration, width, height)?;
+    println!("{} ({frames} frames, {zooms} zooms)", output.display());
     Ok(())
 }
 

@@ -23,7 +23,7 @@ pub const TOOLBAR_H: f32 = 40.0;
 /// Traffic lights: left inset and the height of the bar they are centred in (points).
 pub const TRAFFIC_LIGHTS: (f64, f64) = (14.0, TOOLBAR_H as f64);
 /// Horizontal room the traffic lights need from the window's left edge.
-pub const TRAFFIC_LIGHTS_W: f32 = 76.0;
+pub const TRAFFIC_LIGHTS_W: f32 = 88.0;
 
 static ACCENT: AtomicU32 = AtomicU32::new(u32::from_be_bytes([0x00, 0x7a, 0xff, 0xff]));
 

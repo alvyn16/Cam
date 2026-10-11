@@ -1,0 +1,499 @@
+//! Inspector: style sections, and properties of the selected timeline item.
+
+use egui::{Color32, CornerRadius, RichText, Sense, Stroke, Ui, vec2};
+
+use super::editor::{Editor, Selection, Tab};
+use super::theme::{self, pal};
+use super::widgets::{self, caption, row, section, segmented, slider, toggle_row};
+use crate::engine::geom::v2;
+use crate::engine::spring::SpringConfig;
+use crate::project::model::*;
+use crate::render::art::WALLPAPERS;
+
+const GRADIENTS: [(&str, [u8; 3], [u8; 3], f64); 6] = [
+    ("Dusk", [255, 120, 80], [130, 70, 220], 135.0),
+    ("Ocean", [40, 160, 255], [20, 220, 190], 120.0),
+    ("Candy", [255, 110, 196], [120, 115, 245], 90.0),
+    ("Forest", [30, 120, 90], [150, 210, 120], 160.0),
+    ("Night", [20, 24, 40], [70, 60, 120], 180.0),
+    ("Paper", [245, 245, 240], [220, 220, 215], 180.0),
+];
+
+pub fn ui(ui: &mut Ui, ed: &mut Editor) {
+    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        let mut draft = ed.project.clone();
+        match ed.selection {
+            Selection::Zoom(id) => zoom_panel(ui, ed, &mut draft, id),
+            Selection::Slice(id) => slice_panel(ui, &mut draft, id),
+            Selection::Layout(id) => layout_panel(ui, &mut draft, id),
+            Selection::None => {
+                tabs(ui, &mut ed.tab);
+                match ed.tab {
+                    Tab::Background => background(ui, ed, &mut draft),
+                    Tab::Cursor => cursor(ui, &mut draft, ed.rec.mouse.is_empty()),
+                    Tab::Camera => camera(ui, &mut draft, ed.rec.meta.camera.is_some()),
+                    Tab::Captions => captions(ui, ed, &mut draft),
+                    Tab::Audio => audio(ui, ed, &mut draft),
+                    Tab::Shortcuts => shortcuts(ui, &mut draft, ed.rec.keys.len()),
+                    Tab::Animation => animation(ui, ed, &mut draft),
+                }
+            }
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            // End of a drag: the next change starts a new undo step.
+        }
+        ed.commit(draft);
+    });
+}
+
+fn tabs(ui: &mut Ui, tab: &mut Tab) {
+    let p = pal(ui);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        for (t, label) in Tab::ALL {
+            let sel = *tab == t;
+            let b = egui::Button::new(RichText::new(label).size(12.0).color(if sel { Color32::WHITE } else { p.text }))
+                .fill(if sel { theme::accent() } else { p.control })
+                .stroke(if sel { Stroke::NONE } else { Stroke::new(0.5, p.control_border) })
+                .corner_radius(CornerRadius::same(12));
+            if ui.add(b).clicked() {
+                *tab = t;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    ui.separator();
+}
+
+fn swatch(ui: &mut Ui, size: egui::Vec2, selected: bool, paint: impl FnOnce(&egui::Painter, egui::Rect)) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    paint(ui.painter(), rect);
+    let stroke = if selected { Stroke::new(2.5, theme::accent()) } else { Stroke::new(1.0, pal(ui).control_border) };
+    ui.painter().rect_stroke(rect, CornerRadius::same(6), stroke, egui::StrokeKind::Outside);
+    resp.clicked()
+}
+
+fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
+    let s = &mut d.style;
+    section(ui, "Background", |ui| {
+        #[derive(Clone, Copy, PartialEq)]
+        enum K {
+            Wall,
+            Grad,
+            Col,
+            Img,
+        }
+        let mut k = match s.background {
+            Background::Wallpaper { .. } => K::Wall,
+            Background::Gradient { .. } => K::Grad,
+            Background::Color { .. } => K::Col,
+            Background::Image { .. } => K::Img,
+        };
+        if segmented(ui, &mut k, &[(K::Wall, "Wallpaper"), (K::Grad, "Gradient"), (K::Col, "Color"), (K::Img, "Image")]) {
+            s.background = match k {
+                K::Wall => Background::Wallpaper { id: "aurora".into() },
+                K::Grad => Background::Gradient { angle: 135.0, stops: vec![(Color::rgb(255, 120, 80), 0.0), (Color::rgb(130, 70, 220), 1.0)] },
+                K::Col => Background::Color { color: Color::rgb(30, 30, 34) },
+                K::Img => Background::Image { path: String::new() },
+            };
+        }
+        ui.add_space(6.0);
+        match &mut s.background {
+            Background::Wallpaper { id } => {
+                let thumbs = ed.thumbs.get_or_insert_with(|| {
+                    WALLPAPERS
+                        .iter()
+                        .map(|w| {
+                            let img = crate::render::art::wallpaper(w.0, 96, 60);
+                            let ci = egui::ColorImage::from_rgba_unmultiplied([96, 60], &img.rgba);
+                            ui.ctx().load_texture(format!("wall-{}", w.0), ci, egui::TextureOptions::LINEAR)
+                        })
+                        .collect()
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for (i, w) in WALLPAPERS.iter().enumerate() {
+                        let tex = thumbs[i].id();
+                        let clicked = swatch(ui, vec2(52.0, 34.0), *id == w.0, |p, r| {
+                            p.image(tex, r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        });
+                        if clicked {
+                            *id = w.0.into();
+                        }
+                    }
+                });
+            }
+            Background::Gradient { angle, stops } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for (_, a, b, ang) in GRADIENTS {
+                        let (ca, cb) = (Color32::from_rgb(a[0], a[1], a[2]), Color32::from_rgb(b[0], b[1], b[2]));
+                        let sel = stops.first().map(|s| s.0) == Some(Color::rgb(a[0], a[1], a[2]));
+                        if swatch(ui, vec2(34.0, 34.0), sel, |p, r| {
+                            let mut mesh = egui::Mesh::default();
+                            mesh.colored_vertex(r.left_top(), ca);
+                            mesh.colored_vertex(r.right_top(), widgets::lerp_color(ca, cb, 0.5));
+                            mesh.colored_vertex(r.right_bottom(), cb);
+                            mesh.colored_vertex(r.left_bottom(), widgets::lerp_color(ca, cb, 0.5));
+                            mesh.add_triangle(0, 1, 2);
+                            mesh.add_triangle(0, 2, 3);
+                            p.add(mesh);
+                        }) {
+                            *angle = ang;
+                            *stops = vec![(Color::rgb(a[0], a[1], a[2]), 0.0), (Color::rgb(b[0], b[1], b[2]), 1.0)];
+                        }
+                    }
+                });
+                slider(ui, "Angle", angle, 0.0..=360.0, "°");
+                for (i, (c, _)) in stops.iter_mut().enumerate() {
+                    row(ui, if i == 0 { "From" } else { "To" }, |ui| {
+                        widgets::color_edit(ui, c);
+                    });
+                }
+            }
+            Background::Color { color } => {
+                row(ui, "Color", |ui| {
+                    widgets::color_edit(ui, color);
+                });
+            }
+            Background::Image { path } => {
+                ui.horizontal(|ui| {
+                    if ui.button("Choose image…").clicked()
+                        && let Some(f) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file()
+                    {
+                        *path = f.to_string_lossy().into_owned();
+                    }
+                    caption(ui, &std::path::Path::new(path.as_str()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "None".into()));
+                });
+            }
+        }
+        slider(ui, "Blur", &mut s.background_blur, 0.0..=60.0, " px");
+    });
+    section(ui, "Frame", |ui| {
+        slider(ui, "Padding", &mut s.padding, 0.0..=40.0, "%");
+        slider(ui, "Roundness", &mut s.corner_radius, 0.0..=60.0, " px");
+        slider(ui, "Inset", &mut s.inset.padding, 0.0..=60.0, " px");
+        if s.inset.padding > 0.0 {
+            row(ui, "Inset color", |ui| {
+                widgets::color_edit(ui, &mut s.inset.color);
+            });
+            slider(ui, "Inset opacity", &mut s.inset.alpha, 0.0..=1.0, "");
+        }
+        row(ui, "Aspect ratio", |ui| {
+            let label = Aspect::PRESETS.iter().find(|(_, a)| *a == s.aspect).map_or("Custom", |(n, _)| n);
+            egui::ComboBox::from_id_salt("aspect").selected_text(label).show_ui(ui, |ui| {
+                for (n, a) in Aspect::PRESETS {
+                    ui.selectable_value(&mut s.aspect, a, n);
+                }
+            });
+        });
+    });
+    section(ui, "Shadow", |ui| {
+        slider(ui, "Intensity", &mut s.shadow.intensity, 0.0..=1.0, "");
+        slider(ui, "Angle", &mut s.shadow.angle, 0.0..=360.0, "°");
+        slider(ui, "Distance", &mut s.shadow.distance, 0.0..=100.0, " px");
+        slider(ui, "Blur", &mut s.shadow.blur, 0.0..=100.0, " px");
+    });
+    section(ui, "Crop", |ui| {
+        let c = &mut s.crop;
+        let (mut l, mut t, mut r, mut b) = (c.x, c.y, 1.0 - c.x - c.w, 1.0 - c.y - c.h);
+        let mut ch = false;
+        ch |= slider(ui, "Left", &mut l, 0.0..=0.45, "");
+        ch |= slider(ui, "Right", &mut r, 0.0..=0.45, "");
+        ch |= slider(ui, "Top", &mut t, 0.0..=0.45, "");
+        ch |= slider(ui, "Bottom", &mut b, 0.0..=0.45, "");
+        if ch {
+            *c = crate::engine::geom::Rect::new(l, t, (1.0 - l - r).max(0.1), (1.0 - t - b).max(0.1));
+        }
+        if ui.small_button("Reset crop").clicked() {
+            *c = crate::engine::geom::Rect::UNIT;
+        }
+    });
+}
+
+fn spring_picker(ui: &mut Ui, label: &str, cfg: &mut Option<SpringConfig>, presets: &[(&str, Option<SpringConfig>)]) {
+    ui.label(label);
+    ui.horizontal_wrapped(|ui| {
+        for (name, p) in presets {
+            let sel = cfg == p;
+            if ui.selectable_label(sel, *name).clicked() {
+                *cfg = *p;
+            }
+        }
+    });
+    if let Some(c) = cfg {
+        egui::CollapsingHeader::new("Customize").id_salt(label).show(ui, |ui| {
+            caption(ui, "Motion follows Newtonian physics: a mass on a spring.");
+            slider(ui, "Rigidity", &mut c.stiffness, 5.0..=1500.0, "");
+            slider(ui, "Smoothness", &mut c.damping, 5.0..=200.0, "");
+            slider(ui, "Momentum", &mut c.mass, 0.1..=15.0, "");
+        });
+    }
+}
+
+fn cursor(ui: &mut Ui, d: &mut Project, no_data: bool) {
+    let c = &mut d.style.cursor;
+    if no_data {
+        caption(ui, "This recording has no cursor data.");
+    }
+    section(ui, "Cursor", |ui| {
+        toggle_row(ui, "Hide cursor", &mut c.hide);
+        slider(ui, "Size", &mut c.size, 0.5..=4.0, "×");
+        row(ui, "Style", |ui| {
+            segmented(ui, &mut c.skin, &[(CursorSkin::Touch, "Touch"), (CursorSkin::Vector, "Vector"), (CursorSkin::System, "System")]);
+        });
+    });
+    section(ui, "Movement", |ui| {
+        spring_picker(
+            ui,
+            "Smoothing",
+            &mut c.smoothing,
+            &[
+                ("Smooth", Some(SpringConfig::CURSOR_SMOOTH)),
+                ("Medium", Some(SpringConfig::CURSOR_MEDIUM)),
+                ("Rapid", Some(SpringConfig::CURSOR_RAPID)),
+                ("Off", None),
+            ],
+        );
+        slider(ui, "Tilt", &mut c.tilt, 0.0..=1.0, "");
+        let mut idle = c.hide_idle_ms.is_some();
+        if toggle_row(ui, "Hide when idle", &mut idle) {
+            c.hide_idle_ms = idle.then_some(2000.0);
+        }
+        if let Some(ms) = &mut c.hide_idle_ms {
+            slider(ui, "Idle after", ms, 500.0..=10_000.0, " ms");
+        }
+        let mut lp = c.loop_ms.is_some();
+        if toggle_row(ui, "Loop position at end", &mut lp) {
+            c.loop_ms = lp.then_some(1000.0);
+        }
+        if let Some(ms) = &mut c.loop_ms {
+            slider(ui, "Loop over", ms, 300.0..=5000.0, " ms");
+        }
+    });
+    section(ui, "Clicks", |ui| {
+        let mut kind = match c.click_effect {
+            ClickEffect::None => 0,
+            ClickEffect::Circle => 1,
+            ClickEffect::Ripple { .. } => 2,
+        };
+        if segmented(ui, &mut kind, &[(0, "None"), (1, "Circle"), (2, "Ripple")]) {
+            c.click_effect = match kind {
+                1 => ClickEffect::Circle,
+                2 => ClickEffect::Ripple { strength: 2.0 },
+                _ => ClickEffect::None,
+            };
+        }
+        if let ClickEffect::Ripple { strength } = &mut c.click_effect {
+            slider(ui, "Strength", strength, 0.5..=5.0, "");
+        }
+        toggle_row(ui, "Click sounds", &mut d.style.audio.click_sounds);
+        if d.style.audio.click_sounds {
+            slider(ui, "Click volume", &mut d.style.audio.click_volume, 0.0..=1.0, "");
+        }
+    });
+}
+
+fn camera(ui: &mut Ui, d: &mut Project, has: bool) {
+    if !has {
+        caption(ui, "Record with the camera on to add a camera bubble.");
+        return;
+    }
+    let c = &mut d.style.camera;
+    section(ui, "Camera", |ui| {
+        toggle_row(ui, "Hide camera", &mut c.hide);
+        toggle_row(ui, "Mirror", &mut c.mirror);
+        slider(ui, "Size", &mut c.size, 0.1..=0.8, "");
+        slider(ui, "Roundness", &mut c.roundness, 0.0..=0.5, "");
+        row(ui, "Shape", |ui| {
+            segmented(ui, &mut c.aspect, &[(CameraAspect::Horizontal, "16:9"), (CameraAspect::Vertical, "9:16"), (CameraAspect::Square, "1:1"), (CameraAspect::Original, "Auto")]);
+        });
+        slider(ui, "Size while zoomed", &mut c.zoom_scale, 0.3..=1.0, "×");
+    });
+    section(ui, "Position", |ui| {
+        ui.horizontal(|ui| {
+            for (name, p) in crate::engine::camera::CORNERS {
+                if ui.selectable_label(c.position == p, name).clicked() {
+                    c.position = p;
+                }
+            }
+        });
+        slider(ui, "Horizontal", &mut c.position.x, 0.0..=1.0, "");
+        slider(ui, "Vertical", &mut c.position.y, 0.0..=1.0, "");
+    });
+}
+
+fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
+    section(ui, "Captions", |ui| {
+        toggle_row(ui, "Show captions", &mut d.style.captions.show);
+        slider(ui, "Size", &mut d.style.captions.size, 0.5..=2.0, "×");
+        if ed.rec.transcript.is_empty() {
+            caption(ui, "No transcript yet.");
+            if ed.rec.meta.mic.is_some() {
+                if ed.transcribing.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        caption(ui, "Transcribing on device…");
+                    });
+                } else if ui.button("Transcribe microphone").clicked() {
+                    let pkg = ed.package.clone();
+                    ed.transcribing = Some(std::thread::spawn(move || {
+                        objc2::rc::autoreleasepool(|_| crate::transcribe::transcribe_package(&pkg)).map_err(|e| format!("{e:#}"))
+                    }));
+                }
+            } else {
+                caption(ui, "Record with the microphone to generate captions.");
+            }
+        } else {
+            caption(ui, &format!("{} words", ed.rec.transcript.len()));
+            let text: String = ed.rec.transcript.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            ui.label(RichText::new(text).size(12.0));
+        }
+    });
+}
+
+fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
+    let a = &mut d.style.audio;
+    section(ui, "Audio", |ui| {
+        slider(ui, "Volume", &mut a.volume, 0.0..=2.0, "");
+        if ed.rec.meta.mic.is_some() {
+            toggle_row(ui, "Mute microphone", &mut a.mute_mic);
+            toggle_row(ui, "Enhance voice", &mut a.enhance_mic);
+        }
+        if ed.rec.meta.system_audio.is_some() {
+            toggle_row(ui, "Mute system audio", &mut a.mute_system);
+        }
+        if ed.rec.meta.mic.is_none() && ed.rec.meta.system_audio.is_none() {
+            caption(ui, "This recording has no audio.");
+        }
+    });
+    section(ui, "Background music", |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Choose…").clicked()
+                && let Some(f) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "m4a", "wav", "aac", "aiff"]).pick_file()
+            {
+                a.music = Some(f.to_string_lossy().into_owned());
+            }
+            if a.music.is_some() && ui.button("Remove").clicked() {
+                a.music = None;
+            }
+        });
+        if let Some(m) = &a.music {
+            caption(ui, &std::path::Path::new(m).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            slider(ui, "Music volume", &mut a.music_volume, 0.0..=1.0, "");
+        }
+    });
+}
+
+fn shortcuts(ui: &mut Ui, d: &mut Project, keys: usize) {
+    let s = &mut d.style.shortcuts;
+    section(ui, "Keyboard shortcuts", |ui| {
+        toggle_row(ui, "Show shortcuts", &mut s.show);
+        toggle_row(ui, "Include single keys", &mut s.single_keys);
+        slider(ui, "Size", &mut s.size, 0.5..=2.0, "×");
+        if keys == 0 {
+            caption(ui, "No key presses were recorded. Grant Glide Input Monitoring in System Settings › Privacy & Security to capture them.");
+        } else {
+            caption(ui, &format!("{keys} key events recorded"));
+        }
+    });
+}
+
+fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
+    section(ui, "Zoom animation", |ui| {
+        let mut cfg = Some(d.style.screen_spring);
+        spring_picker(ui, "Style", &mut cfg, &[("Focused", Some(SpringConfig::SCREEN_FOCUSED)), ("Smooth", Some(SpringConfig::SCREEN_SMOOTH))]);
+        if let Some(c) = cfg {
+            d.style.screen_spring = c;
+        }
+    });
+    section(ui, "Motion blur", |ui| {
+        let m = &mut d.style.motion_blur;
+        slider(ui, "Amount", &mut m.amount, 0.0..=1.0, "");
+        egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
+            slider(ui, "Cursor", &mut m.cursor, 0.0..=1.0, "");
+            slider(ui, "Screen movement", &mut m.screen_move, 0.0..=1.0, "");
+            slider(ui, "Zoom", &mut m.screen_zoom, 0.0..=1.0, "");
+        });
+    });
+    section(ui, "Automatic zooms", |ui| {
+        slider(ui, "Default zoom", &mut d.style.default_zoom, 1.2..=4.0, "×");
+        if ui.button("Regenerate from clicks").clicked() {
+            let events = crate::engine::events::Events::new(ed.rec.mouse.clone());
+            let zooms = crate::engine::zoom::auto_zooms(&events.downs, ed.rec.meta.duration_ms, d.style.default_zoom, &mut d.timeline);
+            d.timeline.zooms = zooms;
+        }
+        let n = d.timeline.zooms.len();
+        caption(ui, &format!("{n} zoom{}", if n == 1 { "" } else { "s" }));
+    });
+}
+
+fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
+    let Some(z) = d.timeline.zooms.iter_mut().find(|z| z.id == id) else { return };
+    let mut delete = false;
+    section(ui, "Zoom", |ui| {
+        slider(ui, "Zoom level", &mut z.scale, 1.0..=5.0, "×");
+        let mut mode = match z.mode {
+            ZoomMode::Auto => 0,
+            ZoomMode::Manual { .. } => 1,
+            ZoomMode::FollowMouse => 2,
+        };
+        if segmented(ui, &mut mode, &[(0, "Auto"), (1, "Manual"), (2, "Follow mouse")]) {
+            z.mode = match mode {
+                1 => ZoomMode::Manual { target: v2(0.5, 0.5) },
+                2 => ZoomMode::FollowMouse,
+                _ => ZoomMode::Auto,
+            };
+        }
+        if let ZoomMode::Manual { target } = &mut z.mode {
+            caption(ui, "Click the preview to choose where to zoom.");
+            slider(ui, "X", &mut target.x, 0.0..=1.0, "");
+            slider(ui, "Y", &mut target.y, 0.0..=1.0, "");
+        } else {
+            slider(ui, "Edge snapping", &mut z.snap_edges, 0.0..=0.5, "");
+        }
+        toggle_row(ui, "Instant (no animation)", &mut z.instant);
+        toggle_row(ui, "Disabled", &mut z.disabled);
+        caption(ui, &format!("{} – {}", widgets::fmt_time(z.start), widgets::fmt_time(z.end)));
+        delete = ui.button("Delete zoom").clicked();
+    });
+    if delete {
+        d.timeline.zooms.retain(|z| z.id != id);
+        ed.selection = Selection::None;
+    }
+    if ui.button("Done").clicked() {
+        ed.selection = Selection::None;
+    }
+}
+
+fn slice_panel(ui: &mut Ui, d: &mut Project, id: u64) {
+    let Some(s) = d.timeline.slices.iter_mut().find(|s| s.id == id) else { return };
+    section(ui, "Clip", |ui| {
+        ui.label("Speed");
+        ui.horizontal_wrapped(|ui| {
+            for sp in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 8.0] {
+                if ui.selectable_label((s.speed - sp).abs() < 1e-6, format!("{sp}×")).clicked() {
+                    s.speed = sp;
+                }
+            }
+        });
+        slider(ui, "Mic volume", &mut s.mic_volume, 0.0..=2.0, "");
+        slider(ui, "System volume", &mut s.system_volume, 0.0..=2.0, "");
+        toggle_row(ui, "Hide cursor", &mut s.hide_cursor);
+        toggle_row(ui, "Raw cursor movement", &mut s.no_smoothing);
+        caption(ui, &format!("Source {} – {}", widgets::fmt_time(s.start), widgets::fmt_time(s.end)));
+    });
+}
+
+fn layout_panel(ui: &mut Ui, d: &mut Project, id: u64) {
+    let Some(l) = d.timeline.layouts.iter_mut().find(|l| l.id == id) else { return };
+    section(ui, "Camera layout", |ui| {
+        segmented(ui, &mut l.kind, &[(LayoutKind::Both, "Both"), (LayoutKind::ScreenOnly, "Screen"), (LayoutKind::CameraOnly, "Camera")]);
+        if l.kind == LayoutKind::Both {
+            let mut size = l.camera_size.unwrap_or(0.35);
+            if slider(ui, "Camera size", &mut size, 0.1..=0.8, "") {
+                l.camera_size = Some(size);
+            }
+        }
+    });
+}

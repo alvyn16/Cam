@@ -1,0 +1,642 @@
+//! The editor: preview, inspector, timeline and export for one project.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use egui::{Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Ui, vec2};
+
+use super::player::AudioPreview;
+use super::preview::Preview;
+use super::theme::{self, pal};
+use super::widgets::{self, fmt_time};
+use super::{inspector, timeline};
+use crate::export::{self, Job, Source, Stats};
+use crate::project::model::{Codec, ExportFormat, ExportSettings, Project, Quality, Slice, Zoom};
+use crate::project::recording::Recording;
+use crate::project::Package;
+use crate::render::Gpu;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    None,
+    Slice(u64),
+    Zoom(u64),
+    Layout(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Background,
+    Cursor,
+    Camera,
+    Captions,
+    Audio,
+    Shortcuts,
+    Animation,
+}
+
+impl Tab {
+    pub const ALL: [(Tab, &'static str); 7] = [
+        (Tab::Background, "Background"),
+        (Tab::Cursor, "Cursor"),
+        (Tab::Camera, "Camera"),
+        (Tab::Captions, "Captions"),
+        (Tab::Audio, "Audio"),
+        (Tab::Shortcuts, "Keys"),
+        (Tab::Animation, "Motion"),
+    ];
+}
+
+pub struct ExportRun {
+    progress: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Result<Stats>>>,
+    pub output: PathBuf,
+    started: Instant,
+}
+
+impl ExportRun {
+    pub fn progress(&self) -> f64 {
+        f64::from_bits(self.progress.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Default)]
+pub struct ExportState {
+    pub open: bool,
+    pub running: Option<ExportRun>,
+    pub result: Option<Result<(PathBuf, Stats), String>>,
+}
+
+pub struct Editor {
+    pub package: Package,
+    pub project: Project,
+    pub rec: Recording,
+    pub preview: Preview,
+    pub audio: AudioPreview,
+    /// Playback time in ms.
+    pub playhead: f64,
+    playing: Option<(Instant, f64)>,
+    pub selection: Selection,
+    pub tab: Tab,
+    undo: Vec<Project>,
+    redo: Vec<Project>,
+    last_commit: Option<Instant>,
+    dirty_at: Option<Instant>,
+    pub export: ExportState,
+    /// Timeline pixels per second.
+    pub px_per_sec: f32,
+    pub status: Option<String>,
+    pub thumbs: Option<Vec<egui::TextureHandle>>,
+    pub close_requested: bool,
+    /// Background transcription (word count or error).
+    pub transcribing: Option<std::thread::JoinHandle<Result<usize, String>>>,
+}
+
+impl Editor {
+    pub fn open(path: &Path, gpu: Gpu) -> Result<Self> {
+        let package = Package::new(path);
+        let (project, rec) = package.load()?;
+        if !package.project_file().exists() {
+            package.save_project(&project)?;
+        }
+        let preview = Preview::new(gpu, path.to_path_buf(), &project, &rec);
+        let mut audio = AudioPreview::new();
+        audio.rebuild(&project, &rec, path);
+        Ok(Editor {
+            package,
+            project,
+            rec,
+            preview,
+            audio,
+            playhead: 0.0,
+            playing: None,
+            selection: Selection::None,
+            tab: Tab::Background,
+            undo: vec![],
+            redo: vec![],
+            last_commit: None,
+            dirty_at: None,
+            export: ExportState::default(),
+            px_per_sec: 80.0,
+            status: None,
+            thumbs: None,
+            close_requested: false,
+            transcribing: None,
+        })
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.preview.scene.duration()
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing.is_some()
+    }
+
+    /// Apply an edit made on a draft copy of the project.
+    pub fn commit(&mut self, draft: Project) {
+        if draft == self.project {
+            return;
+        }
+        // Coalesce rapid edits (slider drags) into one undo step.
+        let coalesce = self.last_commit.is_some_and(|t| t.elapsed() < Duration::from_millis(600));
+        if !coalesce {
+            self.undo.push(self.project.clone());
+            if self.undo.len() > 200 {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+        self.last_commit = Some(Instant::now());
+        self.apply(draft);
+    }
+
+    fn apply(&mut self, mut p: Project) {
+        let audio_changed = p.timeline.slices != self.project.timeline.slices || p.style.audio != self.project.style.audio;
+        p.updated_ms = crate::recorder::now_ms();
+        self.project = p;
+        self.preview.set_project(&self.project, &self.rec);
+        if audio_changed {
+            self.audio.rebuild(&self.project, &self.rec, &self.package.root);
+        }
+        self.playhead = self.playhead.min(self.duration());
+        self.dirty_at = Some(Instant::now());
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(p) = self.undo.pop() {
+            self.redo.push(self.project.clone());
+            self.last_commit = None;
+            self.apply(p);
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(p) = self.redo.pop() {
+            self.undo.push(self.project.clone());
+            self.last_commit = None;
+            self.apply(p);
+        }
+    }
+
+    pub fn edit(&mut self, f: impl FnOnce(&mut Project)) {
+        let mut d = self.project.clone();
+        f(&mut d);
+        self.last_commit = None;
+        self.commit(d);
+    }
+
+    pub fn save(&mut self) {
+        if let Err(e) = self.package.save_project(&self.project) {
+            self.status = Some(format!("Couldn't save: {e}"));
+        }
+        self.dirty_at = None;
+    }
+
+    pub fn toggle_play(&mut self) {
+        if self.playing.is_some() {
+            self.playing = None;
+            self.audio.pause();
+        } else {
+            if self.playhead >= self.duration() - 1.0 {
+                self.playhead = 0.0;
+            }
+            self.playing = Some((Instant::now(), self.playhead));
+            self.audio.play(self.playhead);
+        }
+    }
+
+    pub fn seek(&mut self, ms: f64) {
+        self.playhead = ms.clamp(0.0, self.duration());
+        if self.playing.is_some() {
+            self.playing = Some((Instant::now(), self.playhead));
+            self.audio.play(self.playhead);
+        }
+    }
+
+    /// Source time under the playhead.
+    pub fn source_at_playhead(&self) -> f64 {
+        self.preview.scene.map.to_source(self.playhead)
+    }
+
+    /// Split the slice under the playhead.
+    pub fn split(&mut self) {
+        let src = self.source_at_playhead();
+        let map = self.preview.scene.map.clone();
+        self.edit(|p| {
+            if p.timeline.slices.is_empty() {
+                let id = p.timeline.new_id();
+                p.timeline.slices.push(Slice { id, start: 0.0, end: map.source_end(), ..Default::default() });
+            }
+            if let Some(i) = p.timeline.slices.iter().position(|s| src > s.start + 100.0 && src < s.end - 100.0) {
+                let id = p.timeline.new_id();
+                let mut right = p.timeline.slices[i];
+                right.id = id;
+                right.start = src;
+                p.timeline.slices[i].end = src;
+                p.timeline.slices.insert(i + 1, right);
+            }
+        });
+    }
+
+    pub fn delete_selection(&mut self) {
+        let sel = self.selection;
+        self.edit(|p| match sel {
+            Selection::Slice(id) => {
+                if p.timeline.slices.len() > 1 {
+                    p.timeline.slices.retain(|s| s.id != id);
+                }
+            }
+            Selection::Zoom(id) => p.timeline.zooms.retain(|z| z.id != id),
+            Selection::Layout(id) => p.timeline.layouts.retain(|l| l.id != id),
+            Selection::None => {}
+        });
+        self.selection = Selection::None;
+    }
+
+    /// Add a zoom at the playhead.
+    pub fn add_zoom(&mut self) {
+        let src = self.source_at_playhead();
+        let end_limit = self.rec.meta.duration_ms;
+        let mut new_id = 0;
+        self.edit(|p| {
+            let id = p.timeline.new_id();
+            new_id = id;
+            let start = src.max(0.0);
+            let end = (start + 2500.0).min(end_limit);
+            p.timeline.zooms.push(Zoom { id, start, end, scale: p.style.default_zoom, ..Default::default() });
+        });
+        self.selection = Selection::Zoom(new_id);
+    }
+
+    fn start_export(&mut self) {
+        let settings = self.project.export;
+        let output = export::default_output(&self.package.root, &settings);
+        let job = Job {
+            project: self.project.clone(),
+            recording: self.rec.clone(),
+            source: Source::Package(self.package.root.clone()),
+            settings,
+            output: output.clone(),
+        };
+        let progress = Arc::new(AtomicU64::new(0f64.to_bits()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (p2, c2) = (progress.clone(), cancel.clone());
+        let handle = std::thread::spawn(move || {
+            objc2::rc::autoreleasepool(|_| export::run(&job, &mut |f| p2.store(f.to_bits(), Ordering::Relaxed), &c2))
+        });
+        self.export.result = None;
+        self.export.running = Some(ExportRun { progress, cancel, handle: Some(handle), output, started: Instant::now() });
+    }
+
+    /// Per-frame housekeeping. Returns true while something animates.
+    pub fn tick(&mut self) -> bool {
+        if let Some((t0, from)) = self.playing {
+            self.playhead = from + t0.elapsed().as_secs_f64() * 1000.0;
+            if self.playhead >= self.duration() {
+                self.playhead = self.duration();
+                self.playing = None;
+                self.audio.pause();
+            }
+        }
+        self.audio.tick();
+        if self.dirty_at.is_some_and(|t| t.elapsed() > Duration::from_millis(800)) {
+            self.save();
+        }
+        if let Some(run) = &mut self.export.running
+            && run.handle.as_ref().is_some_and(|h| h.is_finished())
+        {
+            let r = run.handle.take().unwrap().join();
+            let out = run.output.clone();
+            self.export.result = Some(match r {
+                Ok(Ok(stats)) => Ok((out, stats)),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err("export crashed".into()),
+            });
+            self.export.running = None;
+        }
+        if self.transcribing.as_ref().is_some_and(|h| h.is_finished()) {
+            match self.transcribing.take().unwrap().join() {
+                Ok(Ok(n)) => {
+                    if let Ok(r) = self.package.load_recording() {
+                        self.rec = r;
+                        self.preview.set_project(&self.project, &self.rec);
+                    }
+                    self.status = Some(if n == 0 { "No speech found in the microphone track".into() } else { format!("Transcribed {n} words") });
+                }
+                Ok(Err(e)) => self.status = Some(format!("Transcription failed: {e}")),
+                Err(_) => self.status = Some("Transcription crashed".into()),
+            }
+        }
+        self.playing.is_some() || self.export.running.is_some() || self.transcribing.is_some()
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (cmd, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
+        let pressed = |k| ctx.input(|i| i.key_pressed(k));
+        if pressed(egui::Key::Space) {
+            self.toggle_play();
+        }
+        if cmd && pressed(egui::Key::Z) {
+            if shift { self.redo() } else { self.undo() }
+        } else if pressed(egui::Key::S) && !cmd {
+            self.split();
+        } else if pressed(egui::Key::Z) && !cmd {
+            self.add_zoom();
+        }
+        if cmd && pressed(egui::Key::E) {
+            self.export.open = true;
+        }
+        if cmd && pressed(egui::Key::S) {
+            self.save();
+        }
+        if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
+            self.delete_selection();
+        }
+        let step = 1000.0 / 60.0;
+        if pressed(egui::Key::ArrowLeft) {
+            self.seek(self.playhead - if shift { 1000.0 } else { step });
+        }
+        if pressed(egui::Key::ArrowRight) {
+            self.seek(self.playhead + if shift { 1000.0 } else { step });
+        }
+        if pressed(egui::Key::Escape) {
+            if self.export.open && self.export.running.is_none() {
+                self.export.open = false;
+            } else {
+                self.selection = Selection::None;
+            }
+        }
+    }
+
+    /// Draw the editor. `back` is set when the user leaves for the library.
+    pub fn ui(&mut self, ui: &mut Ui, egui_renderer: &mut egui_wgpu::Renderer, back: &mut bool) {
+        let ctx = ui.ctx().clone();
+        self.handle_keys(&ctx);
+        let p = pal(ui);
+
+        // Toolbar.
+        egui::Panel::top("editor-toolbar")
+            .exact_size(theme::TOOLBAR_H)
+            .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::TRAFFIC_LIGHTS_W as i8, right: 12, top: 0, bottom: 0 }))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if ui.button("‹ Projects").clicked() {
+                        self.save();
+                        *back = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(&self.project.name).font(theme::semibold(theme::BODY)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::primary(ui, "Export").clicked() {
+                            self.export.open = true;
+                        }
+                        ui.add_space(6.0);
+                        if widgets::icon_button(ui, widgets::Icon::Redo, !self.redo.is_empty()).on_hover_text("Redo ⇧⌘Z").clicked() {
+                            self.redo();
+                        }
+                        if widgets::icon_button(ui, widgets::Icon::Undo, !self.undo.is_empty()).on_hover_text("Undo ⌘Z").clicked() {
+                            self.undo();
+                        }
+                    });
+                });
+            });
+
+        // Inspector.
+        egui::Panel::right("inspector")
+            .exact_size(320.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(p.inspector).inner_margin(egui::Margin::symmetric(14, 10)))
+            .show(ui, |ui| {
+                inspector::ui(ui, self);
+            });
+
+        // Timeline.
+        egui::Panel::bottom("timeline")
+            .exact_size(232.0)
+            .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(12, 8)))
+            .show(ui, |ui| {
+                self.transport(ui);
+                ui.add_space(4.0);
+                timeline::ui(ui, self);
+            });
+
+        // Preview.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(if ui.visuals().dark_mode { Color32::from_rgb(0x1c, 0x1c, 0x1e) } else { Color32::from_rgb(0xe4, 0xe4, 0xe7) }))
+            .show(ui, |ui| {
+                let avail = ui.available_rect_before_wrap().shrink(24.0);
+                let aspect = self.preview.output_aspect();
+                let mut size = vec2(avail.width(), avail.width() / aspect);
+                if size.y > avail.height() {
+                    size = vec2(avail.height() * aspect, avail.height());
+                }
+                let rect = egui::Rect::from_center_size(avail.center(), size);
+                let ppp = ctx.pixels_per_point();
+                let px = ((size.x * ppp) as u32, (size.y * ppp) as u32);
+                if let Some(id) = self.preview.render(egui_renderer, self.playhead, px) {
+                    let shadow = egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(60) };
+                    ui.painter().add(shadow.as_shape(rect, CornerRadius::same(4)));
+                    ui.painter().image(id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                // Click on the preview while a manual zoom is selected picks its target.
+                let resp = ui.interact(rect, ui.id().with("preview"), Sense::click());
+                if resp.clicked() {
+                    if let (Selection::Zoom(id), Some(pos)) = (self.selection, resp.interact_pointer_pos()) {
+                        self.pick_zoom_target(id, (pos - rect.min) / rect.size());
+                    } else {
+                        self.toggle_play();
+                    }
+                }
+                if let Some(s) = &self.status {
+                    ui.painter().text(rect.left_bottom() + vec2(0.0, 14.0), egui::Align2::LEFT_TOP, s, egui::FontId::proportional(11.0), p.secondary);
+                }
+            });
+
+        if self.export.open {
+            self.export_sheet(&ctx);
+        }
+    }
+
+    fn pick_zoom_target(&mut self, id: u64, at: egui::Vec2) {
+        // Map the click from output space back to the unzoomed screen.
+        let sizes = self.preview.scene.sizes;
+        let out = egui::vec2(sizes.output.x as f32, sizes.output.y as f32);
+        let px = egui::vec2(at.x * out.x, at.y * out.y);
+        let body = sizes.default_body();
+        let x = ((px.x as f64 - sizes.pad - body.x) / body.w).clamp(0.0, 1.0);
+        let y = ((px.y as f64 - sizes.pad - body.y) / body.h).clamp(0.0, 1.0);
+        self.edit(|p| {
+            if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) {
+                z.mode = crate::project::model::ZoomMode::Manual { target: crate::engine::geom::v2(x, y) };
+            }
+        });
+    }
+
+    fn transport(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let label = if self.is_playing() { "⏸" } else { "▶" };
+            if ui.add(egui::Button::new(RichText::new(label).size(14.0)).min_size(vec2(32.0, 24.0))).on_hover_text("Play/Pause (Space)").clicked() {
+                self.toggle_play();
+            }
+            ui.label(RichText::new(format!("{} / {}", fmt_time(self.playhead), fmt_time(self.duration()))).monospace());
+            ui.separator();
+            if ui.button("✂ Split").on_hover_text("Split at playhead (S)").clicked() {
+                self.split();
+            }
+            if ui.button("＋ Zoom").on_hover_text("Add zoom at playhead (Z)").clicked() {
+                self.add_zoom();
+            }
+            if self.rec.meta.camera.is_some() && ui.button("＋ Layout").clicked() {
+                let src = self.source_at_playhead();
+                self.edit(|p| {
+                    let id = p.timeline.new_id();
+                    p.timeline.layouts.push(crate::project::model::LayoutRange {
+                        id,
+                        start: src,
+                        end: src + 3000.0,
+                        kind: crate::project::model::LayoutKind::CameraOnly,
+                        ..Default::default()
+                    });
+                });
+            }
+            if ui.add_enabled(self.selection != Selection::None, egui::Button::new("Delete")).clicked() {
+                self.delete_selection();
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add(egui::Slider::new(&mut self.px_per_sec, 20.0..=400.0).logarithmic(true).show_value(false));
+                widgets::caption(ui, "Zoom");
+            });
+        });
+    }
+
+    fn export_sheet(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("Export")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .fixed_size(vec2(380.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let mut s = self.project.export;
+                let running = self.export.running.is_some();
+                ui.add_enabled_ui(!running, |ui| {
+                    widgets::row(ui, "Format", |ui| {
+                        let before = s.format;
+                        widgets::segmented(ui, &mut s.format, &[(ExportFormat::Gif, "GIF"), (ExportFormat::Mp4, "MP4")]);
+                        if s.format != before {
+                            s = if s.format == ExportFormat::Gif { ExportSettings::gif_default() } else { ExportSettings::default() };
+                        }
+                    });
+                    let (heights, fpss): (&[u32], &[u32]) = match s.format {
+                        ExportFormat::Mp4 => (&ExportSettings::MP4_HEIGHTS, &ExportSettings::MP4_FPS),
+                        ExportFormat::Gif => (&ExportSettings::GIF_HEIGHTS, &ExportSettings::GIF_FPS),
+                    };
+                    widgets::row(ui, "Resolution", |ui| {
+                        egui::ComboBox::from_id_salt("res").selected_text(res_label(s.height)).show_ui(ui, |ui| {
+                            for h in heights {
+                                ui.selectable_value(&mut s.height, *h, res_label(*h));
+                            }
+                        });
+                    });
+                    widgets::row(ui, "Frame rate", |ui| {
+                        egui::ComboBox::from_id_salt("fps").selected_text(format!("{} fps", s.fps)).show_ui(ui, |ui| {
+                            for f in fpss {
+                                ui.selectable_value(&mut s.fps, *f, format!("{f} fps"));
+                            }
+                        });
+                    });
+                    widgets::row(ui, "Quality", |ui| {
+                        egui::ComboBox::from_id_salt("q").selected_text(s.quality.label()).show_ui(ui, |ui| {
+                            let qs: &[Quality] = if s.format == ExportFormat::Gif { &[Quality::Studio, Quality::Social] } else { &Quality::ALL };
+                            for q in qs {
+                                ui.selectable_value(&mut s.quality, *q, q.label());
+                            }
+                        });
+                    });
+                    if s.format == ExportFormat::Mp4 {
+                        widgets::row(ui, "Codec", |ui| {
+                            widgets::segmented(ui, &mut s.codec, &[(Codec::H264, "H.264"), (Codec::Hevc, "HEVC")]);
+                        });
+                    } else {
+                        widgets::toggle_row(ui, "Loop", &mut s.gif_loop);
+                    }
+                    let (w, h) = self.preview.scene.sizes.render_size(s.height);
+                    let secs = self.duration() / 1000.0;
+                    let mb = if s.format == ExportFormat::Mp4 {
+                        (s.bitrate(w, h) as f64 * secs + 192_000.0 * secs) / 8.0 / 1e6
+                    } else {
+                        (w * h) as f64 * secs * s.fps as f64 * 0.08 / 1e6
+                    };
+                    widgets::caption(ui, &format!("{w}×{h} • {:.1} s • about {:.0} MB", secs, mb.max(0.1)));
+                });
+                if s != self.project.export {
+                    let mut d = self.project.clone();
+                    d.export = s;
+                    self.commit(d);
+                }
+                ui.add_space(8.0);
+                if let Some(run) = &self.export.running {
+                    let f = run.progress();
+                    ui.add(egui::ProgressBar::new(f as f32).show_percentage());
+                    let el = run.started.elapsed().as_secs_f64();
+                    if f > 0.02 {
+                        widgets::caption(ui, &format!("{:.0} s left", el / f - el));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        run.cancel.store(true, Ordering::SeqCst);
+                    }
+                } else {
+                    match &self.export.result {
+                        Some(Ok((path, stats))) => {
+                            ui.label(RichText::new("✓ Exported").color(Color32::from_rgb(52, 199, 89)));
+                            widgets::caption(ui, &format!(
+                                "{} • {:.1} MB • {:.1}× real time",
+                                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                stats.bytes as f64 / 1e6,
+                                stats.speed()
+                            ));
+                            let path = path.clone();
+                            ui.horizontal(|ui| {
+                                if ui.button("Show in Finder").clicked() {
+                                    super::macos::reveal(&path);
+                                }
+                                if ui.button("Copy").on_hover_text("Copy the file to the clipboard").clicked() {
+                                    super::macos::copy_file(&path);
+                                }
+                                if ui.button("Open").clicked() {
+                                    super::macos::open(&path);
+                                }
+                            });
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(Color32::from_rgb(255, 69, 58), e);
+                        }
+                        None => {}
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::primary(ui, "Export").clicked() {
+                            self.start_export();
+                        }
+                    });
+                }
+                let _ = Stroke::NONE;
+            });
+        if !open && self.export.running.is_none() {
+            self.export.open = false;
+        }
+    }
+}
+
+fn res_label(h: u32) -> String {
+    if h == 2160 { "4K".into() } else { format!("{h}p") }
+}

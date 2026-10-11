@@ -118,3 +118,35 @@ pub fn recording(w: u32, h: u32, duration_ms: f64) -> Recording {
         transcript,
     }
 }
+
+/// Write a synthetic `.glide` package (HEVC screen track plus scripted input).
+/// Returns (frames, auto zooms).
+pub fn write_package(output: &std::path::Path, duration: f64, width: u32, height: u32) -> anyhow::Result<(u64, usize)> {
+    use crate::media::writer::{MovieWriter, WriterSpec, fill_bgra};
+    use crate::project::{self, Package, model::Codec};
+    let ms = duration * 1000.0;
+    let rec = recording(width, height, ms);
+    let pkg = Package::new(output);
+    std::fs::create_dir_all(pkg.recording_dir())?;
+    let fps = 60u32;
+    let mut w = MovieWriter::create(
+        &pkg.rec("screen.mov"),
+        &WriterSpec { width, height, fps, codec: Codec::Hevc, bitrate: (width * height) as u64 * 8, audio: false },
+    )?;
+    let frames = (duration * fps as f64) as u64;
+    for i in 0..frames {
+        let px = screen_bgra(width, height, i as f64 * 1000.0 / fps as f64);
+        let pb = w.buffer()?;
+        fill_bgra(&pb, &px, width, height, (width * 4) as usize);
+        w.push_frame(&pb)?;
+    }
+    w.finish()?;
+    project::write_json(&pkg.rec("meta.json"), &rec.meta)?;
+    project::write_json(&pkg.rec("mouse.json"), &rec.mouse)?;
+    project::write_json(&pkg.rec("keys.json"), &rec.keys)?;
+    project::write_json(&pkg.rec("cursors.json"), &rec.cursors)?;
+    project::write_json(&pkg.rec("transcript.json"), &rec.transcript)?;
+    let proj = project::new_project(&pkg.name(), &rec);
+    pkg.save_project(&proj)?;
+    Ok((frames, proj.timeline.zooms.len()))
+}

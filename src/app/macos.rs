@@ -81,3 +81,29 @@ pub fn open_folder(dir: &std::path::Path) {
     let url = objc2_foundation::NSURL::fileURLWithPath(&crate::util::ns(&dir.to_string_lossy()));
     objc2_app_kit::NSWorkspace::sharedWorkspace().openURL(&url);
 }
+
+/// Open a file with its default app.
+pub fn open(path: &std::path::Path) {
+    let url = objc2_foundation::NSURL::fileURLWithPath(&crate::util::ns(&path.to_string_lossy()));
+    objc2_app_kit::NSWorkspace::sharedWorkspace().openURL(&url);
+}
+
+/// Put a file on the pasteboard (paste into Slack, Mail, Finder…).
+pub fn copy_file(path: &std::path::Path) {
+    use objc2::runtime::ProtocolObject;
+    use objc2_foundation::{NSArray, NSURL};
+    let url = NSURL::fileURLWithPath(&crate::util::ns(&path.to_string_lossy()));
+    let pb = objc2_app_kit::NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    let item: objc2::rc::Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>> = ProtocolObject::from_retained(url);
+    pb.writeObjects(&NSArray::from_retained_slice(&[item]));
+}
+
+/// Move a file or package to the Trash.
+pub fn trash(path: &std::path::Path) {
+    let url = objc2_foundation::NSURL::fileURLWithPath(&crate::util::ns(&path.to_string_lossy()));
+    let fm = objc2_foundation::NSFileManager::defaultManager();
+    if let Err(e) = fm.trashItemAtURL_resultingItemURL_error(&url, None) {
+        eprintln!("glide: couldn't trash {}: {}", path.display(), e.localizedDescription());
+    }
+}

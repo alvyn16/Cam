@@ -44,6 +44,7 @@ const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
 pub const KEY_R: u32 = 15; // kVK_ANSI_R
 pub const CMD: u32 = 1 << 8; // cmdKey
 pub const SHIFT: u32 = 1 << 9; // shiftKey
+pub const OPTION: u32 = 1 << 11; // optionKey
 
 thread_local! {
     static CALLBACK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
@@ -70,7 +71,7 @@ pub fn register(key: u32, modifiers: u32, callback: impl Fn() + 'static) -> Resu
         if st != 0 {
             return Err(st);
         }
-        let id = EventHotKeyID { signature: u32::from_be_bytes(*b"REC1"), id: 1 };
+        let id = EventHotKeyID { signature: u32::from_be_bytes(*b"GLD1"), id: 1 };
         let mut hk = std::ptr::null_mut();
         let st = RegisterEventHotKey(key, modifiers, id, target, 0, &mut hk);
         if st != 0 {
