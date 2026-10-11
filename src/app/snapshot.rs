@@ -131,3 +131,21 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
     image::save_buffer(out_file, &rgba, pw, ph, image::ExtendedColorType::Rgba8)?;
     Ok(())
 }
+
+/// Time the editor preview path (decode + zero-copy upload + render) over
+/// consecutive frames, as playback does. Returns frames per second.
+pub fn bench_preview(project: &Path, size: (u32, u32), frames: u32) -> Result<f64> {
+    let gpu = Gpu::headless()?;
+    let mut renderer = egui_wgpu::Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
+    let ed = Editor::open(project, gpu.clone())?;
+    let mut preview = ed.preview;
+    let step = 1000.0 / 60.0;
+    // Warm up (first decode, pipeline creation).
+    preview.render(&mut renderer, 0.0, size);
+    let t = std::time::Instant::now();
+    for i in 1..=frames {
+        preview.render(&mut renderer, i as f64 * step, size);
+    }
+    gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    Ok(frames as f64 / t.elapsed().as_secs_f64())
+}

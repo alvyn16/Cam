@@ -66,10 +66,24 @@ at the same encode speed.
 - The GPU renderer has ample headroom for live preview: ~535 frames/s at
   1080p and ~350 frames/s at 4K in the export pipeline, versus 60 needed.
 
+## Editor preview (real-time playback)
+
+`glide bench-preview` runs the editor's actual preview path — decode the
+source frame, wrap it as a GPU texture without copying, render the full
+scene into a 2400×1500 px target (the preview area of a full-screen editor
+on a Retina display) — over 240 consecutive 60 fps frames.
+
+| Project | Preview frames/s | vs. 60 fps playback |
+|---|---|---|
+| Real 5K display recording (HEVC 5120×2880) | 189 | 3.1× headroom |
+| Real 5K recording with a blur + highlight mask, 1600×1000 | 165 | 2.7× |
+| Synthetic 2560×1600 recording | 600 | 10× |
+
 ## How to reproduce
 
 ```sh
 scripts/bench.sh              # needs Screen Recording permission for the terminal
 scripts/bench.sh --no-screen  # synthetic sources only
 GLIDE_PROFILE=1 dist/glide export Project.glide --height 2160
+dist/glide bench-preview Project.glide
 ```

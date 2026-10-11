@@ -139,6 +139,15 @@ enum Cmd {
     /// Run an audio file through voice isolation (writes 48 kHz WAV).
     #[command(hide = true)]
     Denoise { input: PathBuf, output: PathBuf },
+    /// Measure editor preview playback speed (frames per second).
+    #[command(hide = true)]
+    BenchPreview {
+        project: PathBuf,
+        #[arg(long, default_value_t = 2400)]
+        width: u32,
+        #[arg(long, default_value_t = 1500)]
+        height: u32,
+    },
     /// Transcribe a project's microphone track into captions.
     Transcribe { project: PathBuf },
     /// List displays, windows, cameras and microphones.
@@ -180,6 +189,11 @@ fn main() -> Result<()> {
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
         Some(Cmd::Gui { project }) => glide::app::run(project),
+        Some(Cmd::BenchPreview { project, width, height }) => {
+            let fps = glide::app::snapshot::bench_preview(&project, (width, height), 240)?;
+            println!("preview {width}x{height}: {fps:.0} frames/s");
+            Ok(())
+        }
         Some(Cmd::Denoise { input, output }) => {
             let audio = glide::media::read_audio(&input, 0)?;
             let t = Instant::now();
