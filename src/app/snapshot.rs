@@ -55,6 +55,9 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         ed.seek(shot.playhead_ms);
     }
     let mut settings = Settings::default();
+    if let Some(dir) = std::env::var_os("GLIDE_OUTPUT_DIR") {
+        settings.projects_dir = Some(dir.into());
+    }
     let mut devices = Devices::load();
     let mut projects = home::scan_projects(&settings.dir());
     let mut thumbs = Thumbs::default();
@@ -69,7 +72,12 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         };
         input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
         // Thumbnails load on background threads.
-        std::thread::sleep(std::time::Duration::from_millis(if i == 4 { 600 } else { 20 }));
+        let wait = match (i, editor.is_some()) {
+            (4, true) => 600,
+            (4, false) => 5000,
+            _ => 20,
+        };
+        std::thread::sleep(std::time::Duration::from_millis(wait));
         let out = ctx.run_ui(input, |ui| match &mut editor {
             Some(ed) => {
                 let mut back = false;

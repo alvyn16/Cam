@@ -181,11 +181,19 @@ pub fn scan_projects(dir: &Path) -> Vec<ProjectEntry> {
 }
 
 /// Thumbnails rendered on a background thread and cached on disk.
-#[derive(Default)]
 pub struct Thumbs {
     pub textures: HashMap<PathBuf, egui::TextureHandle>,
     pending: Arc<Mutex<Vec<(PathBuf, crate::render::Image)>>>,
     requested: std::collections::HashSet<PathBuf>,
+    /// One background worker renders thumbnails in order (each needs a
+    /// decoder and a GPU renderer, so they're never made in parallel).
+    queue: Option<std::sync::mpsc::Sender<(PathBuf, egui::Context)>>,
+}
+
+impl Default for Thumbs {
+    fn default() -> Self {
+        Thumbs { textures: HashMap::new(), pending: Arc::new(Mutex::new(vec![])), requested: Default::default(), queue: None }
+    }
 }
 
 impl Thumbs {
@@ -198,14 +206,20 @@ impl Thumbs {
             return Some(t.id());
         }
         if self.requested.insert(path.to_path_buf()) {
-            let (p, pending) = (path.to_path_buf(), self.pending.clone());
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                if let Some(img) = thumbnail(&p) {
-                    pending.lock().unwrap().push((p, img));
-                    ctx.request_repaint();
-                }
+            let pending = self.pending.clone();
+            let tx = self.queue.get_or_insert_with(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, egui::Context)>();
+                std::thread::spawn(move || {
+                    for (p, ctx) in rx {
+                        if let Some(img) = thumbnail(&p) {
+                            pending.lock().unwrap().push((p, img));
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+                tx
             });
+            let _ = tx.send((path.to_path_buf(), ctx.clone()));
         }
         None
     }
@@ -216,18 +230,29 @@ impl Thumbs {
     }
 }
 
-/// Load `thumb.png` or render one from a frame 1 s in.
+fn modified(p: &Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// Load `thumb.png` (unless the project changed since) or render one from a
+/// moment without a zoom, so it shows the whole composition.
 fn thumbnail(path: &Path) -> Option<crate::render::Image> {
+    let pkg = Package::new(path);
     let thumb = path.join("thumb.png");
-    if let Ok(img) = image::open(&thumb) {
+    if modified(&thumb) >= modified(&pkg.project_file())
+        && let Ok(img) = image::open(&thumb)
+    {
         let img = img.to_rgba8();
         return Some(crate::render::Image { width: img.width(), height: img.height(), rgba: img.into_raw() });
     }
     objc2::rc::autoreleasepool(|_| {
-        let pkg = Package::new(path);
         let (p, rec) = pkg.load().ok()?;
         let mut scene = crate::engine::scene::Scene::new(p.clone(), &rec, 30.0);
-        let t = (scene.duration() * 0.25).min(1500.0);
+        let d = scene.duration();
+        let t = [(d * 0.25).min(1500.0), d * 0.1, d * 0.5, d * 0.75, 0.0]
+            .into_iter()
+            .find(|&t| crate::engine::zoom::active(&p.timeline.zooms, scene.map.to_source(t)).is_none())
+            .unwrap_or(0.0);
         let frame = scene.frame(t, 270.0);
         let gpu = crate::render::Gpu::headless().ok()?;
         let mut r = crate::render::Renderer::new(gpu);
@@ -235,6 +260,12 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
         let mut src = crate::media::FrameSource::open(&pkg.rec(&rec.meta.screen.file)).ok()?;
         if let Some(f) = src.frame_at(frame.source_ms) {
             f.with_bgra(|v| r.set_screen(v));
+        }
+        if let Some(cam) = &rec.meta.camera
+            && let Ok(mut c) = crate::media::FrameSource::open(&pkg.rec(&cam.file))
+            && let Some(f) = c.frame_at(frame.source_ms - cam.offset_ms)
+        {
+            f.with_bgra(|v| r.set_camera(v));
         }
         let img = r.render_to_image(&frame, &p.style);
         let _ = image::save_buffer(&thumb, &img.rgba, img.width, img.height, image::ExtendedColorType::Rgba8);

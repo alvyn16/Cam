@@ -740,6 +740,8 @@ impl App {
                 let mut back = false;
                 ed.ui(ui, renderer, &mut back);
                 if back {
+                    // Its thumbnail re-renders if the project changed.
+                    self.thumbs.forget(&ed.package.root);
                     self.view = View::Home;
                     self.projects = home::scan_projects(&self.settings.dir());
                     if let Some(w) = &self.main {
