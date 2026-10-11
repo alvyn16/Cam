@@ -81,8 +81,12 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
         .inner_margin(egui::Margin::same(2))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            // Inside right-aligned rows items flow right to left; add them in
+            // reverse so they still read left to right.
+            let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
             ui.horizontal(|ui| {
-                for (v, label) in options {
+                let order: Vec<&(T, &str)> = if rtl { options.iter().rev().collect() } else { options.iter().collect() };
+                for (v, label) in order {
                     let sel = *value == *v;
                     let text = RichText::new(*label).size(theme::SECONDARY + 1.0);
                     let b = egui::Button::new(text)

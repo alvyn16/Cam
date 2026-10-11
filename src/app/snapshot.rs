@@ -18,6 +18,8 @@ pub struct Shot<'a> {
     /// Select the first "zoom", "mask" or "slice".
     pub select: Option<String>,
     pub export_sheet: bool,
+    /// Show the just-recorded banner.
+    pub fresh: bool,
     pub dark: bool,
     pub playhead_ms: f64,
     pub size: (f32, f32),
@@ -49,6 +51,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
             _ => Selection::None,
         };
         ed.export.open = shot.export_sheet;
+        ed.fresh = shot.fresh;
         ed.seek(shot.playhead_ms);
     }
     let mut settings = Settings::default();

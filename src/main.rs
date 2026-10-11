@@ -113,6 +113,9 @@ enum Cmd {
         select: Option<String>,
         #[arg(long)]
         export_sheet: bool,
+        /// Show the just-recorded banner.
+        #[arg(long)]
+        fresh: bool,
         #[arg(long)]
         light: bool,
         #[arg(long, default_value_t = 0.0)]
@@ -184,7 +187,7 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Snapshot { project, tab, select, export_sheet, light, at, output }) => {
+        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, output }) => {
             use glide::app::editor::Tab;
             let tab = tab.map(|t| {
                 Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
@@ -194,6 +197,7 @@ fn main() -> Result<()> {
                 tab,
                 select,
                 export_sheet,
+                fresh,
                 dark: !light,
                 playhead_ms: at * 1000.0,
                 size: (1320.0, 840.0),

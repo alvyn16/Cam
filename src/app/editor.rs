@@ -108,6 +108,9 @@ pub struct Editor {
     /// Voice-over being recorded.
     pub voice: Option<super::voiceover::VoiceRecorder>,
     pub deferred: Option<Deferred>,
+    /// Opened straight after recording: offer a one-click export.
+    pub fresh: bool,
+    copy_when_exported: bool,
 }
 
 impl Editor {
@@ -144,6 +147,8 @@ impl Editor {
             looping: false,
             voice: None,
             deferred: None,
+            fresh: false,
+            copy_when_exported: false,
         })
     }
 
@@ -476,6 +481,13 @@ impl Editor {
                 Err(_) => Err("export crashed".into()),
             });
             self.export.running = None;
+            if self.copy_when_exported {
+                self.copy_when_exported = false;
+                if let Some(Ok((path, _))) = &self.export.result {
+                    super::macos::copy_file(path);
+                    self.status = Some(format!("Exported and copied {} — paste it anywhere", path.file_name().unwrap_or_default().to_string_lossy()));
+                }
+            }
         }
         if self.transcribing.as_ref().is_some_and(|h| h.is_finished()) {
             match self.transcribing.take().unwrap().join() {
@@ -691,6 +703,34 @@ impl Editor {
                 }
                 if let Some(s) = &self.status {
                     ui.painter().text(rect.left_bottom() + vec2(0.0, 14.0), egui::Align2::LEFT_TOP, s, egui::FontId::proportional(11.0), p.secondary);
+                }
+                // Just recorded: a quick way out without touching the editor.
+                if self.fresh && self.export.running.is_none() {
+                    let bar = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() - 4.0), vec2(420.0, 40.0));
+                    let bar = bar.translate(vec2(0.0, -bar.height() / 2.0 + 18.0));
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+                        egui::Frame::new()
+                            .fill(p.popover)
+                            .stroke(Stroke::new(0.5, p.control_border))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(12, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Recorded {}", fmt_time(self.duration())));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if widgets::icon_button(ui, widgets::Icon::Close, true).on_hover_text("Dismiss").clicked() {
+                                            self.fresh = false;
+                                        }
+                                        if widgets::primary(ui, "Export & copy").on_hover_text("Export with the current settings and put the file on the clipboard").clicked() {
+                                            self.fresh = false;
+                                            self.copy_when_exported = true;
+                                            self.export.open = true;
+                                            self.start_export();
+                                        }
+                                    });
+                                });
+                            });
+                    });
                 }
             });
 

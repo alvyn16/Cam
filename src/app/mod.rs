@@ -556,6 +556,9 @@ impl App {
                 Ok(path) => {
                     self.projects = home::scan_projects(&self.settings.dir());
                     self.open_project(el, path);
+                    if let View::Editor(ed) = &mut self.view {
+                        ed.fresh = true;
+                    }
                 }
                 Err(e) => {
                     self.error = Some(format!("Recording failed: {e}"));
