@@ -79,6 +79,17 @@ on a Retina display) — over 240 consecutive 60 fps frames.
 | Real 5K recording with a blur + highlight mask, 1600×1000 | 165 | 2.7× |
 | Synthetic 2560×1600 recording | 600 | 10× |
 
+## Mask checks ("data may be visible")
+
+`glide check-masks` runs the same background check the editor uses: every
+blur/pixelate mask is compared with its first frame every 100 ms, all masks
+sharing one forward decoding pass.
+
+| Project | Masks | Time |
+|---|---|---|
+| Real 5K display recording, 3 s | 4 (each the full 3 s) | 1.22 s (4.60 s when each mask decoded its own range) |
+| Synthetic 2560×1600, 12 s | 2 over 3.8 s | 0.59 s |
+
 ## Idle
 
 With a project open in the editor and nothing playing, the app used 0.00 s
