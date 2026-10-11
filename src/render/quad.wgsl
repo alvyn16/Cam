@@ -10,6 +10,7 @@ const MODE_GRADIENT: u32 = 4u;
 const MODE_COMPOSITE: u32 = 5u;
 const MODE_MASK: u32 = 6u;
 const MODE_DIM: u32 = 7u;
+const MODE_FILL: u32 = 8u;
 
 const PI: f32 = 3.14159265;
 
@@ -373,6 +374,26 @@ fn mode_dim(local: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(d.color.rgb * a, a);
 }
 
+// Rounded rect with a vertical gradient (color → p1) and an inner border
+// (p4 colour, p2.x width). Used for device frames.
+fn mode_fill(local: vec2<f32>) -> vec4<f32> {
+    let half = d.shape.zw * 0.5;
+    let dist = sd_round_rect(local, d.shape.xy + half, half, d.p0.x);
+    let cov = coverage(dist);
+    if cov <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let t = clamp((local.y - d.shape.y) / max(d.shape.w, 1.0), 0.0, 1.0);
+    var c = mix(d.color, d.p1, t);
+    let bw = d.p2.x;
+    if bw > 0.0 {
+        // 1 at the outer edge fading to 0 at `bw` inside.
+        let edge = clamp(1.0 - (-dist) / bw, 0.0, 1.0);
+        c = mix(c, d.p4, edge);
+    }
+    return premul(vec4<f32>(c.rgb, c.a * cov * d.p0.w));
+}
+
 @fragment
 fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let mode = u32(d.out.z);
@@ -384,6 +405,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         case 5u: { return mode_composite(i.local); }
         case 6u: { return mode_mask(i.local); }
         case 7u: { return mode_dim(i.local); }
+        case 8u: { return mode_fill(i.local); }
         default: { return mode_texture(i.local); }
     }
 }

@@ -34,6 +34,7 @@ const MODE_GRADIENT: f32 = 4.0;
 const MODE_COMPOSITE: f32 = 5.0;
 const MODE_MASK: f32 = 6.0;
 const MODE_DIM: f32 = 7.0;
+const MODE_FILL: f32 = 8.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -511,14 +512,29 @@ impl Renderer {
             let a = s.angle.to_radians();
             let off = v2(a.cos() * dist, a.sin() * dist);
             let sigma = (s.blur * ws).max(1.0) * 0.6;
-            let shape = win.rect.translate(off);
+            // With a device frame the shadow follows the device body.
+            let (outline, radius) = frame.device_body.unwrap_or((win.rect, win.radius));
+            let shape = outline.translate(off);
             let rect = shape.inset(-(sigma * 3.0 + 2.0));
             let mut d = Draw::new(MODE_SHADOW, rect, size);
             d.shape = r4(shape);
             d.color = [0.0, 0.0, 0.0, (s.intensity * 0.85) as f32];
-            d.p0[0] = win.radius as f32;
+            d.p0[0] = radius as f32;
             d.p2[0] = sigma as f32;
             layer.push((d, TexId::Dummy));
+        }
+        let device_draw = |p: &crate::engine::device::Part| {
+            let mut d = Draw::new(MODE_FILL, p.rect.inset(-1.0), size);
+            d.shape = r4(p.rect);
+            d.color = p.top.to_f32();
+            d.p1 = p.bottom.to_f32();
+            d.p4 = p.border.to_f32();
+            d.p0 = [p.radius as f32, 0.0, 0.0, 1.0];
+            d.p2[0] = p.border_width as f32;
+            d
+        };
+        for p in frame.device.iter().filter(|p| !p.over) {
+            layer.push((device_draw(p), TexId::Dummy));
         }
         {
             let mut d = Draw::new(MODE_WINDOW, win.rect.inset(-1.0), size);
@@ -533,6 +549,9 @@ impl Renderer {
             }
             let tex = if self.has_screen { TexId::Screen } else { TexId::Dummy };
             layer.push((d, tex));
+        }
+        for p in frame.device.iter().filter(|p| p.over) {
+            layer.push((device_draw(p), TexId::Dummy));
         }
         // Masks move with the window, so they go into the same layer.
         for m in &frame.masks {

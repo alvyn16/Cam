@@ -3,6 +3,7 @@
 //! Sizes are computed in "design" pixels at the recording's scale; export
 //! scales the whole design uniformly to the requested height.
 
+use super::device::{self, Margins};
 use super::geom::{Rect, Vec2, v2};
 use crate::project::model::Style;
 
@@ -29,6 +30,8 @@ pub struct Sizes {
     pub content: Vec2,
     /// Window scale at zoom 1.
     pub initial_zoom: f64,
+    /// Space taken by a device frame around the window.
+    pub frame: Margins,
 }
 
 impl Sizes {
@@ -37,17 +40,19 @@ impl Sizes {
         let crop = Rect::new(c.x * recording.x, c.y * recording.y, c.w * recording.x, c.h * recording.y);
         let inset = style.inset.padding.max(0.0);
         let window = crop.size() + Vec2::splat(2.0 * inset);
+        let frame = device::margins(style.device, window);
+        let framed = window + frame.size();
         let pad = (window.avg() * style.padding.max(0.0) / 100.0).ceil();
-        let natural = window + Vec2::splat(2.0 * pad);
+        let natural = framed + Vec2::splat(2.0 * pad);
         let output = match style.aspect.ratio() {
             Some(r) if (natural.aspect() - r).abs() > 1e-3 => natural.expand_to_aspect(r),
             _ => natural,
         };
         let content = output - Vec2::splat(2.0 * pad);
-        let aspect_pad = (content - window) / 2.0;
-        let fill = content.div(window);
+        let aspect_pad = (content - framed) / 2.0 + v2(frame.l, frame.t);
+        let fill = content.div(framed);
         let initial_zoom = if output.y > output.x || pad <= 0.0 { fill.max_elem() } else { 1.0 };
-        Sizes { recording, crop, inset, window, pad, output, aspect_pad, content, initial_zoom }
+        Sizes { recording, crop, inset, window, pad, output, aspect_pad, content, initial_zoom, frame }
     }
 
     /// Unzoomed window rect within the content area.
@@ -91,6 +96,17 @@ mod tests {
         let s = Sizes::new(&style, v2(2000.0, 1000.0));
         assert_eq!(s.output, v2(2300.0, 2300.0));
         assert_eq!(s.aspect_pad, v2(0.0, 500.0));
+    }
+
+    #[test]
+    fn device_frame_adds_room() {
+        let mut style = Style::default();
+        style.device = crate::project::model::DeviceFrame::Laptop;
+        let s = Sizes::new(&style, v2(2000.0, 1000.0));
+        assert!(s.output.x > 2300.0 && s.output.y > 1300.0);
+        let body = s.default_body();
+        assert!(body.x >= s.frame.l - 1e-9 && body.y >= s.frame.t - 1e-9);
+        assert!((body.w - 2000.0).abs() < 1e-9);
     }
 
     #[test]

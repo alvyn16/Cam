@@ -297,6 +297,17 @@ impl Default for AudioStyle {
     }
 }
 
+/// A device mockup drawn around the screen (generated, not artwork).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceFrame {
+    #[default]
+    None,
+    Laptop,
+    Phone,
+    Tablet,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Style {
@@ -320,6 +331,7 @@ pub struct Style {
     pub audio: AudioStyle,
     /// Zoom level used for new automatic zooms.
     pub default_zoom: f64,
+    pub device: DeviceFrame,
 }
 
 impl Default for Style {
@@ -341,6 +353,7 @@ impl Default for Style {
             captions: CaptionStyle::default(),
             audio: AudioStyle::default(),
             default_zoom: 2.0,
+            device: DeviceFrame::None,
         }
     }
 }

@@ -183,7 +183,13 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     });
     section(ui, "Frame", |ui| {
         slider(ui, "Padding", &mut s.padding, 0.0..=40.0, "%");
-        slider(ui, "Roundness", &mut s.corner_radius, 0.0..=60.0, " px");
+        row(ui, "Device", |ui| {
+            use crate::project::model::DeviceFrame as D;
+            segmented(ui, &mut s.device, &[(D::None, "None"), (D::Laptop, "Laptop"), (D::Phone, "Phone"), (D::Tablet, "Tablet")]);
+        });
+        if s.device == crate::project::model::DeviceFrame::None {
+            slider(ui, "Roundness", &mut s.corner_radius, 0.0..=60.0, " px");
+        }
         slider(ui, "Inset", &mut s.inset.padding, 0.0..=60.0, " px");
         if s.inset.padding > 0.0 {
             row(ui, "Inset color", |ui| {

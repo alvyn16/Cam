@@ -134,6 +134,10 @@ pub struct Frame {
     pub camera_full: Option<CameraLayer>,
     pub texts: Vec<TextLayer>,
     pub masks: Vec<MaskLayer>,
+    /// Device frame shapes around the window, back to front.
+    pub device: Vec<super::device::Part>,
+    /// The device body outline for the drop shadow.
+    pub device_body: Option<(Rect, f64)>,
 }
 
 struct Anim {
@@ -309,6 +313,9 @@ impl Scene {
         let inner_radius = (style.corner_radius - inset / rscale).max(4.0) * rscale;
         let rec = self.sizes.recording;
         let crop = self.sizes.crop;
+        let device_screen = super::device::screen_radius(style.device, rect);
+        let radius = device_screen.unwrap_or(radius);
+        let inner_radius = device_screen.map_or(inner_radius, |r| (r - inset).max(0.0));
         let window = WindowLayer {
             rect,
             radius,
@@ -321,6 +328,12 @@ impl Scene {
             scale: k * zoom_scale,
             blur: wblur,
         };
+
+        // The visible (cropped) screen in output px.
+        let screen_rect = Rect::from_min_size(
+            self.screen_to_output(self.sizes.crop.min(), rect),
+            self.sizes.crop.size().mul(rect.size().div(self.sizes.window)),
+        );
 
         // Cursor.
         let mut cursor = None;
@@ -347,11 +360,13 @@ impl Scene {
                 _ => Vec2::ZERO,
             };
             let image = Events::last_at(&self.events.all, src).map_or(0, |e| e.cursor);
+            // A cursor outside the cropped screen isn't shown.
+            let visible = screen_rect.inset(-2.0).contains(pos);
             cursor = Some(CursorLayer {
                 pos,
                 height: cursor::BASE_HEIGHT * style.cursor.size * k * zoom_scale,
                 rotation: cv[2],
-                alpha: fv[0].clamp(0.0, 1.0),
+                alpha: if visible { fv[0].clamp(0.0, 1.0) } else { 0.0 },
                 scale: fv[1],
                 blur: fv[2].max(0.0),
                 image,
@@ -446,9 +461,10 @@ impl Scene {
         if style.captions.show
             && let Some(line) = captions::line_at(&self.lines, src)
         {
+            let text = line.text();
             texts.push(TextLayer {
-                text: line.text(),
-                size: base_font * style.captions.size,
+                size: fit_font(&text, base_font * style.captions.size, size.x * 0.92),
+                text,
                 center: v2(size.x / 2.0, size.y - base_font * 1.6),
                 alpha: 1.0,
                 blur: 0.0,
@@ -495,10 +511,6 @@ impl Scene {
         }
 
         // Masks, clipped to the visible (cropped) screen.
-        let screen_rect = Rect::from_min_size(
-            self.screen_to_output(self.sizes.crop.min(), rect),
-            self.sizes.crop.size().mul(rect.size().div(self.sizes.window)),
-        );
         let zk = k * zoom_scale;
         let masks = self
             .project
@@ -541,8 +553,17 @@ impl Scene {
             camera_full: cam_full,
             texts,
             masks,
+            device: super::device::parts(style.device, rect),
+            device_body: super::device::body(style.device, rect),
         }
     }
+}
+
+/// Shrink a one-line label's font so it fits `max_w` (narrow outputs).
+fn fit_font(text: &str, size: f64, max_w: f64) -> f64 {
+    // Inter SemiBold averages ~0.56 em per character, plus the pill padding.
+    let est = text.chars().count() as f64 * size * 0.56 + size;
+    if est > max_w { size * max_w / est } else { size }
 }
 
 /// Normalised centre crop that turns `from` aspect into `to` aspect.

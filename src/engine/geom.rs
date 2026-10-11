@@ -17,6 +17,12 @@ impl Vec2 {
     pub const ZERO: Vec2 = v2(0.0, 0.0);
     pub const ONE: Vec2 = v2(1.0, 1.0);
 
+    pub fn min(self, o: Vec2) -> Vec2 {
+        v2(self.x.min(o.x), self.y.min(o.y))
+    }
+    pub fn max(self, o: Vec2) -> Vec2 {
+        v2(self.x.max(o.x), self.y.max(o.y))
+    }
     pub fn splat(v: f64) -> Self {
         v2(v, v)
     }
