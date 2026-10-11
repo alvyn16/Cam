@@ -45,6 +45,8 @@ pub enum Cmd {
     Open(PathBuf),
     /// Show the area picker; `true` starts recording when confirmed.
     SelectArea(bool),
+    /// Record a source chosen from the menu bar.
+    RecordSource(SourceKind),
     Quit,
 }
 
@@ -475,6 +477,25 @@ impl App {
             Cmd::ShowWindow => self.show_main(el),
             Cmd::OpenFolder => macos::open_folder(&self.settings.dir()),
             Cmd::Open(p) => self.open_project(el, p),
+            Cmd::RecordSource(kind) => {
+                if self.recording.is_some() {
+                    return;
+                }
+                self.settings.source = kind;
+                match kind {
+                    SourceKind::Area => push(Cmd::SelectArea(true)),
+                    // Pick which window in the main window first.
+                    SourceKind::Window => {
+                        if let View::Editor(ed) = &mut self.view {
+                            ed.save();
+                        }
+                        self.view = View::Home;
+                        self.devices = Devices::load();
+                        self.show_main(el);
+                    }
+                    _ => push(Cmd::ToggleRecording),
+                }
+            }
             Cmd::SelectArea(record_after) => {
                 if self.recording.is_some() {
                     return;

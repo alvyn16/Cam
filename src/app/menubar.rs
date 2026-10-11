@@ -21,6 +21,18 @@ define_class!(
         fn toggle_recording(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::ToggleRecording);
         }
+        #[unsafe(method(recordDisplay:))]
+        fn record_display(&self, _s: Option<&AnyObject>) {
+            super::push(Cmd::RecordSource(super::home::SourceKind::Display));
+        }
+        #[unsafe(method(recordWindow:))]
+        fn record_window(&self, _s: Option<&AnyObject>) {
+            super::push(Cmd::RecordSource(super::home::SourceKind::Window));
+        }
+        #[unsafe(method(recordArea:))]
+        fn record_area(&self, _s: Option<&AnyObject>) {
+            super::push(Cmd::RecordSource(super::home::SourceKind::Area));
+        }
         #[unsafe(method(togglePause:))]
         fn toggle_pause(&self, _s: Option<&AnyObject>) {
             super::push(Cmd::TogglePause);
@@ -50,6 +62,7 @@ pub struct MenuBar {
     status: Retained<NSStatusItem>,
     record: Retained<NSMenuItem>,
     pause: Retained<NSMenuItem>,
+    sources: [Retained<NSMenuItem>; 3],
     hotkey: Retained<NSMenuItem>,
     _target: Retained<Target>,
     last: Option<(bool, bool, bool, String)>,
@@ -81,6 +94,14 @@ impl MenuBar {
         let record = item("Start Recording", Some(sel!(toggleRecording:)), "r");
         record.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift | NSEventModifierFlags::Option);
         menu.addItem(&record);
+        let sources = [
+            item("Record Display", Some(sel!(recordDisplay:)), ""),
+            item("Record Window…", Some(sel!(recordWindow:)), ""),
+            item("Record Area…", Some(sel!(recordArea:)), ""),
+        ];
+        for s in &sources {
+            menu.addItem(s);
+        }
         let pause = item("Pause", Some(sel!(togglePause:)), "");
         menu.addItem(&pause);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -92,7 +113,7 @@ impl MenuBar {
         menu.addItem(&hotkey);
         menu.addItem(&item("Quit Glide", Some(sel!(quit:)), "q"));
         status.setMenu(Some(&menu));
-        let mut mb = MenuBar { status, record, pause, hotkey, _target: target, last: None };
+        let mut mb = MenuBar { status, record, pause, sources, hotkey, _target: target, last: None };
         mb.update(&View { recording: false, paused: false, finishing: false, clock: "" });
         mb
     }
@@ -127,6 +148,9 @@ impl MenuBar {
         self.record.setEnabled(!v.finishing);
         self.pause.setTitle(&ns(if v.paused { "Resume" } else { "Pause" }));
         self.pause.setEnabled(v.recording);
+        for s in &self.sources {
+            s.setHidden(v.recording || v.finishing);
+        }
         let Some(mtm) = MainThreadMarker::new() else { return };
         let Some(button) = self.status.button(mtm) else { return };
         let (symbol, title, red) = if v.finishing {
