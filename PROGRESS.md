@@ -64,9 +64,10 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-11): 4/4 pass.
 
-- `cargo test` (66): engine, project, presets, renderer helpers, masks,
+- `cargo test` (71): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
-  hotkeys, icon, plus a headless UI smoke test driving every editor panel.
+  hotkeys, timeline clamping, voice isolation, GIF quantisation, icon, plus a
+  headless UI smoke test driving every editor panel.
 - Synthetic package → MP4 and GIF.
 - Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch → area picker opens over
   the display (screenshotted) and is confirmed → record (test pattern) →
@@ -122,3 +123,6 @@ test media.
   loop playback, caption editing, masks, area picker, hide icons/Dock,
   configurable shortcuts, device frames, voice-over, iOS device capture,
   menu bar sources, quick export, Finder document opening, GIF delta frames.
+- 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
+  fixes from a full code review (preview audio lifecycle, timeline clamps,
+  area bounds, voice-over/editor lifecycle, quit and restart behaviour).
