@@ -145,8 +145,8 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
 pub fn bench_preview(project: &Path, size: (u32, u32), frames: u32) -> Result<f64> {
     let gpu = Gpu::headless()?;
     let mut renderer = egui_wgpu::Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
-    let ed = Editor::open(project, gpu.clone())?;
-    let mut preview = ed.preview;
+    let mut ed = Editor::open(project, gpu.clone())?;
+    let preview = &mut ed.preview;
     let step = 1000.0 / 60.0;
     // Warm up (first decode, pipeline creation).
     preview.render(&mut renderer, 0.0, size);

@@ -52,6 +52,19 @@ impl Tab {
     ];
 }
 
+/// Leaving the editor any way (back to the library, opening another project,
+/// quitting) finishes a voice-over in progress and saves.
+impl Drop for Editor {
+    fn drop(&mut self) {
+        if self.voice.is_some() {
+            self.stop_voiceover();
+        }
+        if self.dirty_at.is_some() {
+            self.save();
+        }
+    }
+}
+
 /// Inspector actions that must run after its draft is committed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Deferred {
@@ -122,7 +135,7 @@ impl Editor {
         }
         let preview = Preview::new(gpu, path.to_path_buf(), &project, &rec);
         let mut audio = AudioPreview::new();
-        audio.rebuild(&project, &rec, path);
+        audio.rebuild_now(&project, &rec, path);
         Ok(Editor {
             package,
             project,
@@ -190,6 +203,18 @@ impl Editor {
         }
         self.playhead = self.playhead.min(self.duration());
         self.dirty_at = Some(Instant::now());
+        // Undo/redo can remove the selected item; don't leave the inspector blank.
+        let tl = &self.project.timeline;
+        let exists = match self.selection {
+            Selection::None => true,
+            Selection::Slice(id) => tl.slices.iter().any(|s| s.id == id),
+            Selection::Zoom(id) => tl.zooms.iter().any(|z| z.id == id),
+            Selection::Layout(id) => tl.layouts.iter().any(|l| l.id == id),
+            Selection::Mask(id) => tl.masks.iter().any(|m| m.id == id),
+        };
+        if !exists {
+            self.selection = Selection::None;
+        }
     }
 
     pub fn undo(&mut self) {
@@ -223,6 +248,12 @@ impl Editor {
     }
 
     pub fn toggle_play(&mut self) {
+        // Pausing while narrating ends the voice-over instead of letting the
+        // narration drift from the picture.
+        if self.voice.is_some() {
+            self.stop_voiceover();
+            return;
+        }
         if self.playing.is_some() {
             self.playing = None;
             self.audio.pause();
@@ -236,6 +267,9 @@ impl Editor {
     }
 
     pub fn seek(&mut self, ms: f64) {
+        if self.voice.is_some() {
+            self.stop_voiceover();
+        }
         self.playhead = ms.clamp(0.0, self.duration());
         if self.playing.is_some() {
             self.playing = Some((Instant::now(), self.playhead));
@@ -776,12 +810,13 @@ impl Editor {
             }
             if self.rec.meta.camera.is_some() && ui.button("＋ Layout").clicked() {
                 let src = self.source_at_playhead();
+                let dur_src = self.rec.meta.duration_ms;
                 self.edit(|p| {
                     let id = p.timeline.new_id();
                     p.timeline.layouts.push(crate::project::model::LayoutRange {
                         id,
                         start: src,
-                        end: src + 3000.0,
+                        end: (src + 3000.0).min(dur_src).max(src),
                         kind: crate::project::model::LayoutKind::CameraOnly,
                         ..Default::default()
                     });

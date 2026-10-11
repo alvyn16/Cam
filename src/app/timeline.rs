@@ -42,6 +42,13 @@ fn mask_color() -> Color32 {
     Color32::from_rgb(0xec, 0x48, 0x99)
 }
 
+/// `v.clamp(lo, hi)`, or `keep` when the range is empty (an item already
+/// shorter than the minimum length can't be resized further; `clamp` would
+/// panic).
+fn clamp_or(v: f64, lo: f64, hi: f64, keep: f64) -> f64 {
+    if lo <= hi { v.clamp(lo, hi) } else { keep }
+}
+
 /// Greedy lane assignment so overlapping ranges don't cover each other.
 fn lanes(ranges: &[(f64, f64)]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..ranges.len()).collect();
@@ -351,10 +358,10 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                             // Dragging a left edge past its current source start
                             // extends into the cut region before it.
                             let target = if pos.x < x_of(map.to_playback_nearest(s.start)) - 1.0 { s.start - (x_of(map.to_playback_nearest(s.start)) - pos.x) as f64 / px_per_ms as f64 * s.speed } else { raw };
-                            s.start = target.clamp(lo, s.end - 200.0);
+                            s.start = clamp_or(target, lo, s.end - 200.0, s.start);
                         } else {
                             let target = if pos.x > x_of(map.to_playback_nearest(s.end)) + 1.0 { s.end + (pos.x - x_of(map.to_playback_nearest(s.end))) as f64 / px_per_ms as f64 * s.speed } else { raw };
-                            s.end = target.clamp(s.start + 200.0, hi);
+                            s.end = clamp_or(target, s.start + 200.0, hi, s.end);
                         }
                     }
                     ed.commit(draft);
@@ -369,8 +376,8 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                                 z.start = (orig.0 + delta).clamp(0.0, (dur_src - len).max(0.0));
                                 z.end = z.start + len;
                             }
-                            Part::Left => z.start = (orig.0 + delta).clamp(0.0, orig.1 - Zoom::MIN_LEN_MS / 2.0),
-                            Part::Right => z.end = (orig.1 + delta).clamp(orig.0 + Zoom::MIN_LEN_MS / 2.0, dur_src),
+                            Part::Left => z.start = clamp_or(orig.0 + delta, 0.0, orig.1 - Zoom::MIN_LEN_MS / 2.0, orig.0),
+                            Part::Right => z.end = clamp_or(orig.1 + delta, orig.0 + Zoom::MIN_LEN_MS / 2.0, dur_src, orig.1),
                         }
                     }
                     ed.commit(draft);
@@ -385,8 +392,8 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                                 m.start = (orig.0 + delta).clamp(0.0, (dur_src - len).max(0.0));
                                 m.end = m.start + len;
                             }
-                            Part::Left => m.start = (orig.0 + delta).clamp(0.0, orig.1 - Mask::MIN_LEN_MS),
-                            Part::Right => m.end = (orig.1 + delta).clamp(orig.0 + Mask::MIN_LEN_MS, dur_src),
+                            Part::Left => m.start = clamp_or(orig.0 + delta, 0.0, orig.1 - Mask::MIN_LEN_MS, orig.0),
+                            Part::Right => m.end = clamp_or(orig.1 + delta, orig.0 + Mask::MIN_LEN_MS, dur_src, orig.1),
                         }
                     }
                     ed.commit(draft);
@@ -401,8 +408,8 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                                 l.start = (orig.0 + delta).clamp(0.0, (dur_src - len).max(0.0));
                                 l.end = l.start + len;
                             }
-                            Part::Left => l.start = (orig.0 + delta).clamp(0.0, orig.1 - 300.0),
-                            Part::Right => l.end = (orig.1 + delta).clamp(orig.0 + 300.0, dur_src),
+                            Part::Left => l.start = clamp_or(orig.0 + delta, 0.0, orig.1 - 300.0, orig.0),
+                            Part::Right => l.end = clamp_or(orig.1 + delta, orig.0 + 300.0, dur_src, orig.1),
                         }
                     }
                     ed.commit(draft);
@@ -446,6 +453,12 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clamp_or_never_panics() {
+        assert_eq!(super::clamp_or(5.0, 0.0, 3.0, 9.0), 3.0);
+        assert_eq!(super::clamp_or(5.0, 4.0, 3.0, 9.0), 9.0);
+    }
+
     #[test]
     fn overlapping_ranges_get_separate_lanes() {
         assert_eq!(super::lanes(&[(0.0, 5.0), (1.0, 2.0), (5.0, 6.0), (1.5, 7.0)]), vec![0, 1, 0, 2]);

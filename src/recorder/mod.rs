@@ -184,7 +184,6 @@ impl Recorder {
             None => project::new_package_path(&opts.dir, &stamp),
         };
         let package = Package::new(&path);
-        std::fs::create_dir_all(package.recording_dir())?;
 
         // Resolve the target: what to capture, at what size, where it is.
         let (cap_target, kind, bounds, size, window, app_name) = match &opts.target {
@@ -205,6 +204,9 @@ impl Recorder {
                 let ds = screen::displays()?;
                 let d = ds.into_iter().find(|d| d.id == *display || *display == 0).context("display not found")?;
                 let db = display_bounds(d.id);
+                // Keep the area on the display (a saved area may be from a bigger one).
+                let rect = &rect.intersect(&Rect::new(0.0, 0.0, d.points.0 as f64, d.points.1 as f64));
+                anyhow::ensure!(rect.w >= 8.0 && rect.h >= 8.0, "the selected area is outside this display");
                 let scale = d.pixels.0 as f64 / d.points.0 as f64;
                 let px = (even(rect.w * scale), even(rect.h * scale));
                 let cg = objc2_core_foundation::CGRect::new(
@@ -224,6 +226,8 @@ impl Recorder {
             }
         };
         let scale = size.0 as f64 / bounds.w.max(1.0);
+        // Only now (the target resolved) create the package folder.
+        std::fs::create_dir_all(package.recording_dir())?;
         if let Target::Device { id } = &opts.target {
             let device = CameraRec::start_ios(id, &package.rec("screen.mov"), size).inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&package.root);
@@ -269,7 +273,10 @@ impl Recorder {
             hide_desktop_icons: opts.hide_desktop_icons,
             hide_dock: opts.hide_dock,
         };
-        crate::capture::record::check_permissions(&cap).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Err(e) = crate::capture::record::check_permissions(&cap) {
+            let _ = std::fs::remove_dir_all(&package.root);
+            anyhow::bail!("{e}");
+        }
         let input = InputLogger::start(package.rec("cursors"), window, opts.keys);
         let session = match Session::start(&cap, cap_target, true, None) {
             Ok(s) => s,
@@ -404,6 +411,11 @@ impl Recorder {
         let _ = std::fs::remove_dir_all(&self.package.root);
     }
 
+    /// True unless this is an iOS device recording (which has no audio).
+    fn has_audio_tracks(&self) -> bool {
+        self.kind != SourceKind::Device
+    }
+
     fn elapsed_with(&self, t0: Option<f64>) -> f64 {
         t0.map_or(0.0, |t0| {
             let now = secs(host_now());
@@ -530,8 +542,9 @@ impl Recorder {
                 fps: 30.0,
                 offset_ms: cam_t0.map_or(0.0, |c| (c - t0) * 1000.0),
             }),
-            system_audio: self.opts.system_audio.then(|| AudioTrack { file: "screen.mov".into(), track: 0 }),
-            mic: self.opts.mic.is_some().then(|| AudioTrack {
+            // Device recordings carry no audio tracks.
+            system_audio: (self.opts.system_audio && self.has_audio_tracks()).then(|| AudioTrack { file: "screen.mov".into(), track: 0 }),
+            mic: (self.opts.mic.is_some() && self.has_audio_tracks()).then(|| AudioTrack {
                 file: "screen.mov".into(),
                 track: if self.opts.system_audio { 1 } else { 0 },
             }),

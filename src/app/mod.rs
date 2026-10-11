@@ -439,20 +439,32 @@ impl App {
         self.finishing = true;
         let done = self.finished.clone();
         std::thread::spawn(move || {
-            let res = objc2::rc::autoreleasepool(|_| r.stop()).map_err(|e| format!("{e:#}"));
+            // Always report back, even if finalising panics, so the UI can't
+            // stay on "Saving…" forever.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| objc2::rc::autoreleasepool(|_| r.stop())))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("saving the recording crashed")))
+                .map_err(|e| format!("{e:#}"));
             *done.lock().unwrap() = Some(res);
             wake();
         });
     }
 
-    fn cancel_recording(&mut self) {
-        if let Some(rec) = self.recording.take()
-            && let Some(r) = rec.rec
-        {
-            std::thread::spawn(move || objc2::rc::autoreleasepool(|_| r.cancel()));
+    /// Discard the current recording (if any). `restarting` keeps the main
+    /// window hidden and finishes the cancel before a new one starts.
+    fn cancel_recording(&mut self, restarting: bool) {
+        let Some(rec) = self.recording.take() else { return };
+        if let Some(r) = rec.rec {
+            if restarting {
+                objc2::rc::autoreleasepool(|_| r.cancel());
+            } else {
+                std::thread::spawn(move || objc2::rc::autoreleasepool(|_| r.cancel()));
+            }
         }
-        self.widget = None;
-        push(Cmd::ShowWindow);
+        // Restarting keeps the recording widget up for the new take.
+        if !restarting {
+            self.widget = None;
+            push(Cmd::ShowWindow);
+        }
     }
 
     fn handle(&mut self, el: &ActiveEventLoop, c: Cmd) {
@@ -470,10 +482,12 @@ impl App {
                 }
             }
             Cmd::Restart => {
-                self.cancel_recording();
-                self.start_recording(el);
+                if self.recording.is_some() {
+                    self.cancel_recording(true);
+                    self.start_recording(el);
+                }
             }
-            Cmd::Cancel => self.cancel_recording(),
+            Cmd::Cancel => self.cancel_recording(false),
             Cmd::ShowWindow => self.show_main(el),
             Cmd::OpenFolder => macos::open_folder(&self.settings.dir()),
             Cmd::Open(p) => self.open_project(el, p),
@@ -504,8 +518,12 @@ impl App {
                 let (id, ..) = macos::display_frame(display);
                 let s = &self.settings;
                 // Start from the saved area when it was on this display.
+                // Start from the saved area, trimmed to this display.
+                let (_, _, _, dw, dh) = macos::display_frame(display);
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(dw as f32, dh as f32));
                 let rect = (s.source == SourceKind::Area && s.area[2] > 8.0 && s.area[3] > 8.0)
-                    .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)));
+                    .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)).intersect(screen))
+                    .filter(|r| r.width() > 8.0 && r.height() > 8.0);
                 self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false };
                 if self.overlay.is_none() {
                     let w = self.open_overlay(el, display);
@@ -524,7 +542,8 @@ impl App {
                 if self.recording.is_some() {
                     self.stop_recording();
                 }
-                while self.finishing && self.finished.lock().unwrap().is_none() {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 el.exit();
@@ -825,7 +844,9 @@ impl App {
                 AreaDrag::New(start) | AreaDrag::Corner(start) => Rect::from_two_pos(start, p),
                 AreaDrag::Move(off) => {
                     let r = a.rect.unwrap_or(Rect::NOTHING);
-                    let min = (p - off).clamp(full.min, full.max - r.size());
+                    // A rect larger than the display can't move; keep it inside.
+                    let hi = (full.max - r.size()).max(full.min);
+                    let min = (p - off).clamp(full.min, hi);
                     Rect::from_min_size(min, r.size())
                 }
             });
@@ -1111,7 +1132,8 @@ impl ApplicationHandler for App {
                 eprintln!("glide: saving the recording on quit failed: {e:#}");
             }
         }
-        while self.finishing && self.finished.lock().unwrap().is_none() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         if self.selftest.is_none() {
@@ -1157,6 +1179,7 @@ pub fn run(open: Option<PathBuf>) -> Result<()> {
     theme::set_accent(theme::system_accent());
     // Let connected iPhones/iPads appear as recordable devices.
     crate::capture::camera::enable_screen_capture_devices();
+    std::thread::spawn(player::sweep_stale);
     let el = EventLoop::new()?;
     let _ = PROXY.set(Mutex::new(el.create_proxy()));
     macos::install_open_handler();
