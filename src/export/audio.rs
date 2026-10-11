@@ -158,6 +158,14 @@ fn cleaned(dir: &Path, file: &str, track: usize, raw: Vec<Stereo>) -> Vec<Stereo
         bytes.extend_from_slice(&s[1].to_le_bytes());
     }
     if std::fs::create_dir_all(cache.parent().unwrap()).is_ok() {
+        // Drop caches of this track made by older versions.
+        let suffix = format!("-{file}-{track}.f32");
+        for e in std::fs::read_dir(cache.parent().unwrap()).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("voice-") && name.ends_with(&suffix) && e.path() != cache {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
         let tmp = cache.with_extension("tmp");
         if std::fs::write(&tmp, &bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &cache);
