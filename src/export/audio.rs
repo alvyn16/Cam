@@ -138,7 +138,9 @@ pub fn agc(buf: &mut [Stereo], floor: f32) {
 /// (`<package>/cache/`), so preview rebuilds after edits don't redo it.
 fn cleaned(dir: &Path, file: &str, track: usize, raw: Vec<Stereo>) -> Vec<Stereo> {
     let src = dir.join("recording").join(file);
-    let cache = dir.join("cache").join(format!("voice-{file}-{track}.f32"));
+    // Bump when clean_voice changes so old caches aren't reused.
+    const VERSION: u32 = 2;
+    let cache = dir.join("cache").join(format!("voice-v{VERSION}-{file}-{track}.f32"));
     let fresh = |c: &Path| {
         let (Ok(a), Ok(b)) = (std::fs::metadata(c), std::fs::metadata(&src)) else { return false };
         a.modified().ok() >= b.modified().ok() && a.len() == (raw.len() * 8) as u64
