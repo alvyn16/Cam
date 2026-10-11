@@ -137,6 +137,30 @@ pub fn save_desktop_wallpaper(dest: &std::path::Path) -> anyhow::Result<()> {
 unsafe extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> objc2_core_foundation::CGRect;
+    fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGEventGetLocation(event: *const std::ffi::c_void) -> objc2_core_foundation::CGPoint;
+    fn CGGetDisplaysWithPoint(point: objc2_core_foundation::CGPoint, max: u32, displays: *mut u32, count: *mut u32) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+/// The display under the mouse pointer (0 when unknown = main display).
+pub fn display_under_pointer() -> u32 {
+    // SAFETY: a null-source CGEvent just reports the pointer location; it is
+    // released after use.
+    unsafe {
+        let e = CGEventCreate(std::ptr::null());
+        if e.is_null() {
+            return 0;
+        }
+        let p = CGEventGetLocation(e);
+        CFRelease(e);
+        let (mut id, mut n) = (0u32, 0u32);
+        if CGGetDisplaysWithPoint(p, 1, &mut id, &mut n) == 0 && n == 1 { id } else { 0 }
+    }
 }
 
 /// A display's frame in global points (top-left origin of the main display);

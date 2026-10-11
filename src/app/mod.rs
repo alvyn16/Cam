@@ -522,14 +522,15 @@ impl App {
                 if self.recording.is_some() {
                     return;
                 }
-                let display = self.settings.display;
-                let (id, ..) = macos::display_frame(display);
+                // Pick on the display under the pointer.
+                let display = macos::display_under_pointer();
+                let (id, _, _, dw, dh) = macos::display_frame(display);
                 let s = &self.settings;
-                // Start from the saved area when it was on this display.
-                // Start from the saved area, trimmed to this display.
-                let (_, _, _, dw, dh) = macos::display_frame(display);
+                // Start from the saved area when it was on this display,
+                // trimmed to it.
+                let same_display = macos::display_frame(s.display).0 == id;
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(dw as f32, dh as f32));
-                let rect = (s.source == SourceKind::Area && s.area[2] > 8.0 && s.area[3] > 8.0)
+                let rect = (same_display && s.source == SourceKind::Area && s.area[2] > 8.0 && s.area[3] > 8.0)
                     .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)).intersect(screen))
                     .filter(|r| r.width() > 8.0 && r.height() > 8.0);
                 self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false, windows: None };
@@ -547,7 +548,8 @@ impl App {
                 if self.recording.is_some() {
                     return;
                 }
-                let display = self.settings.display;
+                // Pick on the display under the pointer.
+                let display = macos::display_under_pointer();
                 let (id, ..) = macos::display_frame(display);
                 let windows = Some(WindowMode { list: winpick::list(id), ..Default::default() });
                 self.area = AreaPick { rect: None, drag: None, record_after, display: id, closed: false, windows };
