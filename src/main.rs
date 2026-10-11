@@ -136,6 +136,9 @@ enum Cmd {
     /// Save the current desktop picture as PNG (what "Desktop wallpaper" uses).
     #[command(hide = true)]
     Wallpaper { output: PathBuf },
+    /// Run an audio file through voice isolation (writes 48 kHz WAV).
+    #[command(hide = true)]
+    Denoise { input: PathBuf, output: PathBuf },
     /// Transcribe a project's microphone track into captions.
     Transcribe { project: PathBuf },
     /// List displays, windows, cameras and microphones.
@@ -177,6 +180,15 @@ fn main() -> Result<()> {
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
         Some(Cmd::Gui { project }) => glide::app::run(project),
+        Some(Cmd::Denoise { input, output }) => {
+            let audio = glide::media::read_audio(&input, 0)?;
+            let t = Instant::now();
+            let out = glide::export::isolate::isolate_voice(&audio).ok_or_else(|| anyhow::anyhow!("voice isolation unavailable"))?;
+            eprintln!("{:.1} s of audio in {:.2} s", audio.len() as f64 / 48_000.0, t.elapsed().as_secs_f64());
+            glide::app::player::write_wav(&output, &out)?;
+            println!("{}", output.display());
+            Ok(())
+        }
         Some(Cmd::Wallpaper { output }) => {
             glide::app::macos::save_desktop_wallpaper(&output)?;
             println!("{}", output.display());

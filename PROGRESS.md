@@ -27,7 +27,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R2 | Window recording | ☑ | Window bounds logged over time; cursor stays aligned when the window moves. |
 | R3 | Area recording | ☑ | Drag-to-select picker (move/resize, Return/Esc), size presets, exact values. |
 | R4 | System audio | ☑ | Own track (stems). |
-| R5 | Microphone | ◐ | Own track; "Enhance voice" (high-pass, gate, levelling) in the editor. No capture-time AGC. |
+| R5 | Microphone | ◐ | Own track; "Enhance voice" (ML voice isolation + levelling) in the editor. No capture-time AGC. |
 | R6 | Camera | ◐ | Separate 720p file, bubble/layouts in the editor. Not exercised live: Camera permission not granted on this Mac. |
 | R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Untested: no iPhone/iPad was connected. |
 | R8 | Input logging | ☑ | 120 Hz mouse + buttons, cursor images with hotspots, keystrokes (needs Input Monitoring). |
@@ -48,7 +48,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | O1 | Shortcut overlay | ☑ | |
 | O2 | Captions | ◐ | Apple Speech on device, word timing, editable lines. Needs Speech Recognition permission (run from Glide.app). No whisper.cpp option. |
 | A1–A2 | Mix, background music | ☑ | Per-slice volumes, mutes, master volume, looped music with fade. |
-| A3 | Enhance microphone | ◐ | DSP clean-up, not an ML denoiser. |
+| A3 | Enhance microphone | ☑ | Apple's on-device ML voice isolation (AUSoundIsolation) run offline, then levelled: noise floor −45 → −90 dB on a test clip, ~60× real time. DSP fallback. |
 | E1–E3 | MP4, resolution, frame rate | ☑ | Hardware H.264/HEVC, quality presets by bits per pixel. |
 | E4 | GIF | ☑ | Parallel NeuQuant palettes, delta frames (only changed tiles, transparent elsewhere), duplicate merging, loop option. |
 | E5 | Targets | ✗ | File, clipboard, reveal in Finder. No upload/share links (no accounts). |

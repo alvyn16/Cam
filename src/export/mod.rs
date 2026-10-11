@@ -5,6 +5,7 @@
 //! encoder, frames N+1..N+3 are already rendering.
 
 pub mod audio;
+pub mod isolate;
 pub mod gif;
 
 use std::collections::VecDeque;

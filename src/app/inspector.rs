@@ -418,6 +418,9 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         if ed.rec.meta.mic.is_some() {
             toggle_row(ui, "Mute microphone", &mut a.mute_mic);
             toggle_row(ui, "Enhance voice", &mut a.enhance_mic);
+            if a.enhance_mic {
+                caption(ui, "On-device voice isolation removes background noise.");
+            }
         }
         if ed.rec.meta.system_audio.is_some() {
             toggle_row(ui, "Mute system audio", &mut a.mute_system);

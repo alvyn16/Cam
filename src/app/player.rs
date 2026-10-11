@@ -23,7 +23,7 @@ pub struct AudioPreview {
     playing: bool,
 }
 
-fn write_wav(path: &Path, samples: &[[f32; 2]]) -> std::io::Result<()> {
+pub fn write_wav(path: &Path, samples: &[[f32; 2]]) -> std::io::Result<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     let data_len = (samples.len() * 4) as u32;
     f.write_all(b"RIFF")?;

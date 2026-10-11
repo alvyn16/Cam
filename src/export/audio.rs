@@ -80,7 +80,11 @@ pub fn enhance_voice(buf: &mut [Stereo]) {
         s[0] *= gain;
         s[1] *= gain;
     }
-    // Level: aim for -18 dBFS RMS on voiced parts, never above 4x.
+    level_voice(buf, floor);
+}
+
+/// Level speech to about -18 dBFS RMS on voiced parts, never above 4x.
+fn level_voice(buf: &mut [Stereo], floor: f32) {
     let voiced: Vec<f32> = buf.iter().map(|s| (s[0] * s[0] + s[1] * s[1]) / 2.0).filter(|v| *v > floor * floor).collect();
     if !voiced.is_empty() {
         let rms = (voiced.iter().sum::<f32>() / voiced.len() as f32).sqrt();
@@ -89,6 +93,19 @@ pub fn enhance_voice(buf: &mut [Stereo]) {
             s[0] *= g;
             s[1] *= g;
         }
+    }
+}
+
+/// "Enhance voice": Apple's on-device voice isolation (removes background
+/// noise and room tone) plus levelling; the simple DSP chain if isolation
+/// isn't available.
+pub fn clean_voice(buf: &mut Vec<Stereo>) {
+    match super::isolate::isolate_voice(buf) {
+        Some(isolated) => {
+            *buf = isolated;
+            level_voice(buf, 0.006);
+        }
+        None => enhance_voice(buf),
     }
 }
 
@@ -159,7 +176,7 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
             && let Some(mut mic) = load(&rd, &rec.meta.mic)
         {
             if style.enhance_mic {
-                enhance_voice(&mut mic);
+                clean_voice(&mut mic);
             }
             retime(&mic, map, |i| slices.get(i).map_or(1.0, |s| s.mic_volume as f32), &mut out);
             any = true;
@@ -167,7 +184,7 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
         for vo in &project.timeline.voiceovers {
             let Some(mut buf) = crate::media::read_audio(&rd.join(&vo.file), 0).ok().filter(|b| !b.is_empty()) else { continue };
             if style.enhance_mic {
-                enhance_voice(&mut buf);
+                clean_voice(&mut buf);
             }
             let at = (map.to_playback_nearest(vo.start) / 1000.0 * RATE) as usize;
             let g = vo.volume as f32;
