@@ -40,7 +40,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | S1 | Backgrounds | ☑ | Generated wallpapers, gradients, colour, imported image, current desktop picture, blur. |
 | S2–S7 | Padding, roundness, shadow, inset, aspect ratio, crop | ☑ | |
 | S8 | Device frames | ☑ | Generated laptop, phone, tablet frames (no artwork reused). |
-| K1–K5 | Camera bubble, shape, shrink while zoomed, layouts, auto-hide | ◐ | Implemented and rendered from test footage; live camera capture unverified (permission). |
+| K1–K5 | Camera bubble, shape, shrink while zoomed, layouts, auto-hide | ◐ | Bubble, circle/aspect shapes and camera-only layout verified with a generated camera clip on a real recording; live camera capture unverified (permission). |
 | T1–T7 | Slices, trim, split/delete, speed, zoom track, layout track, undo/redo/scrub/loop | ☑ | |
 | T8 | Typing speed-up | ☑ | Detects typing runs in the key log; one click to 2–4×. |
 | T9 | Masks | ☑ | Blur, pixelate, highlight; drawn on the preview; follow zoom. |
