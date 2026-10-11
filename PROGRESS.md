@@ -43,7 +43,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | K1–K5 | Camera bubble, shape, shrink while zoomed, layouts, auto-hide | ◐ | Bubble, circle/aspect shapes and camera-only layout verified with a generated camera clip on a real recording; live camera capture unverified (permission). |
 | T1–T7 | Slices, trim, split/delete, speed, zoom track, layout track, undo/redo/scrub/loop | ☑ | |
 | T8 | Typing speed-up | ☑ | Detects typing runs in the key log; one click to 2–4×. |
-| T9 | Masks | ☑ | Blur, pixelate, highlight; drawn on the preview; follow zoom. |
+| T9 | Masks | ☑ | Blur, pixelate, highlight; drawn on the preview; follow zoom. "Data may be visible": blur/pixelate masks are re-checked in the background (SSIM + histogram on 64×64 patches every 100 ms, one shared decode pass) and ranges where the covered content moved are flagged on the timeline; one click cuts them. Verified on a real 5K recording (only the mask over a playing video flagged, three static masks not) and by the UI smoke test. |
 | T10 | Voice-over | ◐ | Recorded with AVAudioRecorder, mixed with ducking (mixing verified with a test file). Live capture needs Microphone permission. |
 | O1 | Shortcut overlay | ☑ | |
 | O2 | Captions | ◐ | Apple Speech on device, word timing, editable lines. Needs Speech Recognition permission (run from Glide.app). No whisper.cpp option. |
@@ -64,9 +64,10 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-11): 4/4 pass.
 
-- `cargo test` (71): engine, project, presets, renderer helpers, masks,
+- `cargo test` (77): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
-  hotkeys, timeline clamping, voice isolation, GIF quantisation, icon, plus a
+  hotkeys, timeline clamping and cuts, voice isolation, masked-content
+  change detection, GIF quantisation, icon, plus a
   headless UI smoke test driving every editor panel.
 - Synthetic package → MP4 and GIF.
 - Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch → area picker opens over
@@ -123,6 +124,7 @@ test media.
   loop playback, caption editing, masks, area picker, hide icons/Dock,
   configurable shortcuts, device frames, voice-over, iOS device capture,
   menu bar sources, quick export, Finder document opening, GIF delta frames.
+- 2026-10-11: "Data may be visible" warnings for masks (`glide check-masks`).
 - 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
   fixes from a full code review (preview audio lifecycle, timeline clamps,
   area bounds, voice-over/editor lifecycle, quit and restart behaviour).

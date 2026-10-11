@@ -150,6 +150,8 @@ enum Cmd {
     },
     /// Transcribe a project's microphone track into captions.
     Transcribe { project: PathBuf },
+    /// List where content under a blur/pixelate mask moves ("data may be visible").
+    CheckMasks { project: PathBuf },
     /// List displays, windows, cameras and microphones.
     Devices,
     /// Show (or request) Screen Recording, Microphone and Camera access.
@@ -233,6 +235,21 @@ fn main() -> Result<()> {
             };
             glide::app::snapshot::render(&shot, &output)?;
             println!("{}", output.display());
+            Ok(())
+        }
+        Some(Cmd::CheckMasks { project }) => {
+            let pkg = Package::new(&project);
+            let (p, rec) = pkg.load()?;
+            let t0 = Instant::now();
+            let found = glide::exposure::scan(&pkg.rec(&rec.meta.screen.file), &p.timeline.masks, &mut Default::default(), &|| false)?;
+            let hiding = p.timeline.masks.iter().filter(|m| glide::exposure::hides(m.kind)).count();
+            println!("{hiding} hiding masks checked in {:.2} s", t0.elapsed().as_secs_f64());
+            for e in &found {
+                println!("mask {}: content moved {:.1}–{:.1} s", e.mask, e.start / 1000.0, e.end / 1000.0);
+            }
+            if found.is_empty() {
+                println!("no content moves under masks");
+            }
             Ok(())
         }
         Some(Cmd::Transcribe { project }) => {

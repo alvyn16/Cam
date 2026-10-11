@@ -70,6 +70,42 @@ pub fn speed_up(tl: &mut Timeline, ranges: &[(f64, f64)], speed: f64) -> usize {
     n
 }
 
+/// Remove the source range `s..e` from the edit, trimming or splitting the
+/// slices it touches (leftover pieces under 100 ms go too). `duration` is
+/// the recording length, used when the edit has no slices yet. Never
+/// removes everything; returns whether anything was cut.
+pub fn cut(tl: &mut Timeline, duration: f64, s: f64, e: f64) -> bool {
+    const MIN_PIECE_MS: f64 = 100.0;
+    if tl.slices.is_empty() {
+        let id = tl.new_id();
+        tl.slices.push(Slice { id, start: 0.0, end: duration, ..Default::default() });
+    }
+    let mut out = Vec::with_capacity(tl.slices.len() + 1);
+    let mut changed = false;
+    for sl in tl.slices.clone() {
+        if sl.end <= s || sl.start >= e {
+            out.push(sl);
+            continue;
+        }
+        changed = true;
+        let left = Slice { end: s, ..sl };
+        let keep_left = left.end - left.start >= MIN_PIECE_MS;
+        if keep_left {
+            out.push(left);
+        }
+        let right = Slice { start: e, ..sl };
+        if right.end - right.start >= MIN_PIECE_MS {
+            let id = if keep_left { tl.new_id() } else { sl.id };
+            out.push(Slice { id, ..right });
+        }
+    }
+    if !changed || out.is_empty() {
+        return false;
+    }
+    tl.slices = out;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +140,21 @@ mod tests {
         assert_eq!(n, 1);
         let spans: Vec<_> = tl.slices.iter().map(|s| (s.start, s.end, s.speed)).collect();
         assert_eq!(spans, vec![(0.0, 2000.0, 1.0), (2000.0, 5000.0, 3.0), (5000.0, 10_000.0, 1.0)]);
+    }
+
+    #[test]
+    fn cut_removes_a_range() {
+        let mut tl = Timeline::default();
+        assert!(cut(&mut tl, 10_000.0, 1400.0, 2600.0));
+        let spans: Vec<_> = tl.slices.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(spans, vec![(0.0, 1400.0), (2600.0, 10_000.0)]);
+        // Overlapping an edge trims; a range ending past the next slice's
+        // start trims that one too.
+        assert!(cut(&mut tl, 10_000.0, 1350.0, 3000.0));
+        let spans: Vec<_> = tl.slices.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(spans, vec![(0.0, 1350.0), (3000.0, 10_000.0)]);
+        // Never cuts everything.
+        assert!(!cut(&mut tl, 10_000.0, 0.0, 10_000.0));
+        assert_eq!(tl.slices.len(), 2);
     }
 }

@@ -74,6 +74,34 @@ fn editor_and_home_render_every_panel() {
     ed.export.open = true;
     t += 0.016;
     frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+    ed.export.open = false;
+
+    // A blur over the first sidebar item: the synthetic UI moves the
+    // selection away at 1.5 s, so "data may be visible" is flagged there and
+    // cutting it removes that part of the recording.
+    let (ws, hs) = (1280.0 * 1080.0 / 800.0, 1080.0);
+    ed.edit(|p| {
+        let id = p.timeline.new_id();
+        let rect = glide::engine::geom::Rect::new(15.0 / ws, 75.0 / hs, 210.0 / ws, 32.0 / hs);
+        p.timeline.masks.push(glide::project::model::Mask { id, start: 200.0, end: 2900.0, rect, ..Default::default() });
+    });
+    let t0 = std::time::Instant::now();
+    ed.tick();
+    while (ed.mask_watch.busy() || ed.mask_watch.found.is_empty()) && t0.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(50));
+        ed.tick();
+    }
+    let found = ed.mask_watch.found.clone();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!((found[0].start - 1500.0).abs() <= 100.0 && found[0].end >= 2800.0, "{found:?}");
+    assert!(glide::app::timeline::extra_height(&ed) > 0.0);
+    t += 0.016;
+    frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+    ed.cut_exposure(found[0]);
+    assert!(ed.project.timeline.slices.iter().all(|s| s.end <= found[0].start || s.start >= found[0].end), "{:?}", ed.project.timeline.slices);
+    assert_eq!(glide::app::timeline::extra_height(&ed), 0.0);
+    t += 0.016;
+    frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
     ed.save();
     assert!(!back);
 

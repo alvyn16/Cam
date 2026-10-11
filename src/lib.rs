@@ -14,4 +14,5 @@ pub mod media;
 pub mod export;
 pub mod recorder;
 pub mod transcribe;
+pub mod exposure;
 pub mod app;

@@ -4,6 +4,7 @@
 //! editor's renderer.
 
 pub mod editor;
+pub mod maskwatch;
 pub mod home;
 pub mod hotkey;
 pub mod inspector;

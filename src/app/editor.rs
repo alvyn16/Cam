@@ -62,6 +62,7 @@ impl Drop for Editor {
         if self.dirty_at.is_some() {
             self.save();
         }
+        self.mask_watch.cancel();
     }
 }
 
@@ -124,6 +125,8 @@ pub struct Editor {
     /// Opened straight after recording: offer a one-click export.
     pub fresh: bool,
     copy_when_exported: bool,
+    /// Where content under blur/pixelate masks moves ("data may be visible").
+    pub mask_watch: super::maskwatch::MaskWatch,
 }
 
 impl Editor {
@@ -134,6 +137,7 @@ impl Editor {
             package.save_project(&project)?;
         }
         let preview = Preview::new(gpu, path.to_path_buf(), &project, &rec);
+        let mask_watch = super::maskwatch::MaskWatch::new(package.rec(&rec.meta.screen.file));
         let mut audio = AudioPreview::new();
         audio.rebuild_now(&project, &rec, path);
         Ok(Editor {
@@ -162,6 +166,7 @@ impl Editor {
             deferred: None,
             fresh: false,
             copy_when_exported: false,
+            mask_watch,
         })
     }
 
@@ -293,6 +298,22 @@ impl Editor {
             }
             crate::engine::typing::split_at(&mut p.timeline, src);
         });
+    }
+
+    /// Cut a range where content under a mask moved out of the edit.
+    pub fn cut_exposure(&mut self, e: crate::exposure::Exposure) {
+        let duration = self.preview.scene.map.source_end();
+        let pad = crate::exposure::CUT_PAD_MS;
+        let mut cut = false;
+        self.edit(|p| cut = crate::engine::typing::cut(&mut p.timeline, duration, e.start - pad, e.end + pad));
+        self.status = Some(if cut {
+            format!("Cut {:.1} s where masked content was visible", (e.end - e.start + 2.0 * pad) / 1000.0)
+        } else {
+            "Couldn't cut that part (it's the whole clip)".into()
+        });
+        if cut {
+            self.selection = Selection::Mask(e.mask);
+        }
     }
 
     pub fn delete_selection(&mut self) {
@@ -501,6 +522,7 @@ impl Editor {
             }
         }
         self.audio.tick();
+        let exposures_changed = self.mask_watch.update(&self.project.timeline.masks);
         if self.dirty_at.is_some_and(|t| t.elapsed() > Duration::from_millis(800)) {
             self.save();
         }
@@ -536,7 +558,7 @@ impl Editor {
                 Err(_) => self.status = Some("Transcription crashed".into()),
             }
         }
-        self.playing.is_some() || self.export.running.is_some() || self.transcribing.is_some() || self.voice.is_some()
+        self.playing.is_some() || self.export.running.is_some() || self.transcribing.is_some() || self.voice.is_some() || exposures_changed
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -697,7 +719,7 @@ impl Editor {
 
         // Timeline.
         egui::Panel::bottom("timeline")
-            .exact_size(if self.rec.meta.camera.is_some() { 284.0 } else { 236.0 })
+            .exact_size(if self.rec.meta.camera.is_some() { 284.0 } else { 236.0 } + timeline::extra_height(self))
             .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 self.transport(ui);

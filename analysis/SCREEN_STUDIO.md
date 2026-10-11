@@ -206,7 +206,7 @@ Status legend: ☐ not started · ◐ partial · ☑ done (verified). The *Statu
 | T6 | Layout track | Camera layout ranges. |
 | T7 | Undo/redo, timeline zoom, scrubbing with playhead, play/pause, loop. |
 | T8 | Typing speed-up suggestions | Suggests speeding up typing sections. |
-| T9 | Masks | Highlight/blur regions over time (with a tracker helper). |
+| T9 | Masks | Highlight/blur regions over time. The `dynamic-mask-tracker` helper does not move masks: it is a content-change detector ("detectMaskedContentShift"). Given the video and each mask's time range and bounds, it compares the masked region every 100 ms (`samplingRate`) against the frame at the mask's start, drawn into a 64×64 bitmap, using a similarity threshold of 0.88 and a histogram threshold of 0.85, and merges changes less than 200 ms apart into `contentChanges` ranges. The editor intersects them with the kept slices and shows "Data may be visible" bars (shield icon, label hidden under 128 px) above the masks; clicking one cuts that fragment (split 100 ms before and after, remove the middle) and selects the mask. |
 | T10 | Voice-overs | Record narration over the timeline. Can mute the original. |
 
 ### Overlays and audio

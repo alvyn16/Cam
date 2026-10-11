@@ -78,6 +78,17 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
             _ => 20,
         };
         std::thread::sleep(std::time::Duration::from_millis(wait));
+        // Let background mask checks finish so their warnings show.
+        if i == 4
+            && let Some(ed) = &mut editor
+        {
+            let t0 = std::time::Instant::now();
+            ed.tick();
+            while ed.mask_watch.busy() && t0.elapsed().as_secs() < 30 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                ed.tick();
+            }
+        }
         let out = ctx.run_ui(input, |ui| match &mut editor {
             Some(ed) => {
                 let mut back = false;

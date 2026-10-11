@@ -12,6 +12,25 @@ const RULER_H: f32 = 18.0;
 const TRACK_H: f32 = 40.0;
 const GAP: f32 = 6.0;
 const EDGE: f32 = 7.0;
+/// Row of "data may be visible" warnings above the masks (only when any).
+const WARN_H: f32 = 20.0;
+
+/// Ranges where content under a mask moved, in playback ms (cut parts
+/// don't show).
+fn warnings(ed: &Editor) -> Vec<(crate::exposure::Exposure, f64, f64)> {
+    let map = &ed.preview.scene.map;
+    ed.mask_watch
+        .found
+        .iter()
+        .map(|e| (*e, map.to_playback_nearest(e.start), map.to_playback_nearest(e.end)))
+        .filter(|(_, a, b)| b - a >= 1.0)
+        .collect()
+}
+
+/// Extra height the timeline needs right now.
+pub fn extra_height(ed: &Editor) -> f32 {
+    if warnings(ed).is_empty() { 0.0 } else { WARN_H + GAP }
+}
 
 #[derive(Clone, Copy)]
 enum Drag {
@@ -71,7 +90,9 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
     let p = pal(ui);
     let has_cam = ed.rec.meta.camera.is_some();
     let tracks = if has_cam { 4 } else { 3 };
-    let height = RULER_H + tracks as f32 * (TRACK_H + GAP) + 4.0;
+    let warns = warnings(ed);
+    let extra = if warns.is_empty() { 0.0 } else { WARN_H + GAP };
+    let height = RULER_H + tracks as f32 * (TRACK_H + GAP) + 4.0 + extra;
     let dur = ed.duration().max(1.0);
     let width = (dur as f32 / 1000.0 * ed.px_per_sec).max(ui.available_width() - 4.0);
     let drag_id = ui.id().with("timeline-drag");
@@ -94,7 +115,10 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             t += step_s;
         }
 
-        let track = |i: usize| Rect::from_min_size(pos2(rect.left(), rect.top() + RULER_H + 2.0 + i as f32 * (TRACK_H + GAP)), vec2(width, TRACK_H));
+        let track = |i: usize| {
+            let below_warnings = if i >= 2 { extra } else { 0.0 };
+            Rect::from_min_size(pos2(rect.left(), rect.top() + RULER_H + 2.0 + i as f32 * (TRACK_H + GAP) + below_warnings), vec2(width, TRACK_H))
+        };
         let clip_row = track(0);
         let zoom_row = track(1);
         let mask_row = track(2);
@@ -261,6 +285,35 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                 }
             }
         }
+        // "Data may be visible": content under a blur/pixelate mask moved.
+        let warn_row = Rect::from_min_size(pos2(rect.left(), zoom_row.bottom() + GAP), vec2(width, WARN_H));
+        let mut warning_clicked = None;
+        for (i, (e, a, b)) in warns.iter().enumerate() {
+            let r = Rect::from_min_max(pos2(x_of(*a) + 1.0, warn_row.top()), pos2((x_of(*b) - 1.0).max(x_of(*a) + 20.0), warn_row.bottom()));
+            let resp = ui.interact(r, ui.id().with(("exposure", i)), Sense::click()).on_hover_text(
+                "The content under this mask moved here, so what it was hiding may show. Click to cut this part.",
+            );
+            let amber = Color32::from_rgb(0xff, 0x9f, 0x0a);
+            painter.rect_filled(r, CornerRadius::same(5), amber.gamma_multiply(if resp.hovered() { 0.95 } else { 0.75 }));
+            // Warning sign: a triangle with "!".
+            let c = pos2(r.left() + 11.0, r.center().y);
+            let tri = vec![pos2(c.x, c.y - 6.5), pos2(c.x + 7.0, c.y + 5.5), pos2(c.x - 7.0, c.y + 5.5)];
+            painter.add(egui::Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
+            painter.text(pos2(c.x, c.y + 1.5), egui::Align2::CENTER_CENTER, "!", theme::semibold(9.0), amber);
+            if r.width() >= 128.0 {
+                painter.text(pos2(r.left() + 22.0, r.center().y), egui::Align2::LEFT_CENTER, "Data may be visible", theme::semibold(11.0), Color32::WHITE);
+            }
+            if resp.clicked() {
+                warning_clicked = Some(*e);
+            }
+            if resp.hovered() {
+                hover_cursor = Some(egui::CursorIcon::PointingHand);
+            }
+        }
+        if let Some(e) = warning_clicked {
+            ed.cut_exposure(e);
+        }
+
         // Double-click empty mask track to add a mask there.
         if bg.double_clicked()
             && let Some(pos) = pointer
