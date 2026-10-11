@@ -328,7 +328,7 @@ impl App {
     fn recorder_options(&self) -> recorder::Options {
         let s = &self.settings;
         if self.selftest.is_some() {
-            return recorder::Options { target: Target::Pattern, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()) };
+            return recorder::Options { target: Target::Pattern, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()), ..Default::default() };
         }
         let target = match s.source {
             SourceKind::Display => Target::Display { id: s.display },
@@ -350,6 +350,8 @@ impl App {
             keys: s.keys,
             dir: s.dir(),
             name: None,
+            hide_desktop_icons: s.hide_desktop_icons,
+            hide_dock: s.hide_dock,
         }
     }
 

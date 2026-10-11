@@ -111,6 +111,9 @@ pub fn find_window(sel: &str) -> Result<WindowInfo> {
         .ok_or_else(|| anyhow!("no on-screen window matches {sel:?} (see `rec-rs devices`)"))
 }
 
+/// CGWindowLevel of the Dock (kCGDockWindowLevel).
+const DOCK_LAYER: isize = 20;
+
 pub enum Target {
     /// A display, optionally cropped to a region (points, top-left origin).
     Display(DisplayInfo, Option<objc2_core_foundation::CGRect>),
@@ -141,6 +144,8 @@ pub struct ScreenConfig {
     pub system_audio: bool,
     /// None = no mic; Some(None) = default mic; Some(Some(id)) = specific device.
     pub mic: Option<Option<String>>,
+    pub hide_desktop_icons: bool,
+    pub hide_dock: bool,
 }
 
 pub struct Ivars {
@@ -230,28 +235,35 @@ impl ScreenCapture {
                     if let Some(r) = region {
                         conf.setSourceRect(*r);
                     }
-                    // Exclude rec's own windows (the GUI preview), which
-                    // would otherwise be recorded as a hall of mirrors.
+                    // Exclude our own windows (recording widget, editor), and
+                    // optionally the desktop icons and the Dock, by window so
+                    // the wallpaper (also owned by the Dock) stays.
                     let me = std::process::id() as i32;
-                    let own = shareable_content()
-                        .ok()
-                        .and_then(|c| c.applications().iter().find(|a| a.processID() == me));
+                    let content = shareable_content().ok();
+                    let excluded: Vec<Retained<SCWindow>> = content
+                        .as_ref()
+                        .map(|c| {
+                            c.windows()
+                                .iter()
+                                .filter(|w| {
+                                    let Some(app) = w.owningApplication() else { return false };
+                                    let bundle = app.bundleIdentifier().to_string();
+                                    let layer = w.windowLayer();
+                                    app.processID() == me
+                                        || (cfg.hide_desktop_icons && bundle == "com.apple.finder" && layer < 0)
+                                        || (cfg.hide_dock && bundle == "com.apple.dock" && layer == DOCK_LAYER)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     if std::env::var_os("REC_DEBUG").is_some() {
-                        eprintln!("rec: debug: excluding own app from capture: {}", own.is_some());
+                        eprintln!("glide: debug: excluding {} windows from capture", excluded.len());
                     }
-                    match own {
-                        Some(app) => SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
-                            SCContentFilter::alloc(),
-                            &d.display,
-                            &NSArray::from_retained_slice(&[app]),
-                            &NSArray::new(),
-                        ),
-                        None => SCContentFilter::initWithDisplay_excludingWindows(
-                            SCContentFilter::alloc(),
-                            &d.display,
-                            &NSArray::new(),
-                        ),
-                    }
+                    SCContentFilter::initWithDisplay_excludingWindows(
+                        SCContentFilter::alloc(),
+                        &d.display,
+                        &NSArray::from_retained_slice(&excluded),
+                    )
                 }
                 Target::Window(w) => {
                     SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w.window)

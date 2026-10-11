@@ -49,6 +49,8 @@ pub struct Options {
     pub dir: PathBuf,
     /// Package file name stem (default: "Recording <date>").
     pub name: Option<String>,
+    pub hide_desktop_icons: bool,
+    pub hide_dock: bool,
 }
 
 impl Default for Options {
@@ -62,6 +64,8 @@ impl Default for Options {
             keys: true,
             dir: project::projects_dir(),
             name: None,
+            hide_desktop_icons: false,
+            hide_dock: false,
         }
     }
 }
@@ -217,6 +221,8 @@ impl Recorder {
             gains_db: [0.0, 0.0],
             mic_backend: MicBackend::Sck,
             scene: CapScene::Screen,
+            hide_desktop_icons: opts.hide_desktop_icons,
+            hide_dock: opts.hide_dock,
         };
         crate::capture::record::check_permissions(&cap).map_err(|e| anyhow::anyhow!("{e}"))?;
         let input = InputLogger::start(package.rec("cursors"), window, opts.keys);

@@ -89,6 +89,10 @@ pub struct Options {
     pub mic_backend: MicBackend,
     /// Initial scene (only Screen without a webcam).
     pub scene: Scene,
+    /// Leave Finder's desktop icons out of display captures.
+    pub hide_desktop_icons: bool,
+    /// Leave the Dock out of display captures.
+    pub hide_dock: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -235,6 +239,8 @@ impl Session {
                     clicks: o.clicks,
                     system_audio: o.system_audio,
                     mic: sck_mic,
+                    hide_desktop_icons: o.hide_desktop_icons,
+                    hide_dock: o.hide_dock,
                 };
                 self.screen = Some(ScreenCapture::start(&cfg, self.shared.clone())?);
             }

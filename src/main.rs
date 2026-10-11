@@ -87,6 +87,12 @@ enum Cmd {
         dir: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
+        /// Leave Finder's desktop icons out of the recording.
+        #[arg(long)]
+        hide_icons: bool,
+        /// Leave the Dock out of the recording.
+        #[arg(long)]
+        hide_dock: bool,
     },
     /// Open the app (the default with no subcommand).
     Gui {
@@ -156,8 +162,8 @@ fn main() -> Result<()> {
             export_cmd(project, synthetic, output, format, height, fps, quality, codec)
         }
         Some(Cmd::Synth { output, duration, width, height }) => synth(output, duration, width, height),
-        Some(Cmd::Record { display, window, area, pattern, mic, no_system_audio, camera, duration, fps, dir, name }) => {
-            record(display, window, area, pattern, mic, !no_system_audio, camera, duration, fps, dir, name)
+        Some(Cmd::Record { display, window, area, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
+            record(display, window, area, pattern, mic, !no_system_audio, camera, duration, fps, dir, name, (hide_icons, hide_dock))
         }
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
@@ -346,6 +352,7 @@ fn record(
     fps: u32,
     dir: Option<PathBuf>,
     name: Option<String>,
+    (hide_desktop_icons, hide_dock): (bool, bool),
 ) -> Result<()> {
     use glide::recorder::{Options, Recorder, Target};
     let target = if pattern {
@@ -367,6 +374,8 @@ fn record(
         fps,
         dir: dir.unwrap_or_else(project::projects_dir),
         name,
+        hide_desktop_icons,
+        hide_dock,
         ..Default::default()
     };
     unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as usize) };

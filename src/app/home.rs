@@ -39,6 +39,8 @@ pub struct Settings {
     pub countdown: bool,
     pub fps: u32,
     pub projects_dir: Option<PathBuf>,
+    pub hide_desktop_icons: bool,
+    pub hide_dock: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +59,8 @@ impl Default for Settings {
             countdown: true,
             fps: 60,
             projects_dir: None,
+            hide_desktop_icons: false,
+            hide_dock: false,
         }
     }
 }
@@ -321,6 +325,10 @@ pub fn ui(
                 }
                 toggle_row(ui, "Record key presses", &mut s.keys);
                 toggle_row(ui, "3 s countdown", &mut s.countdown);
+                if s.source != SourceKind::Window {
+                    toggle_row(ui, "Hide desktop icons", &mut s.hide_desktop_icons);
+                    toggle_row(ui, "Hide Dock", &mut s.hide_dock);
+                }
                 row(ui, "Frame rate", |ui| {
                     segmented(ui, &mut s.fps, &[(60, "60"), (30, "30")]);
                 });
