@@ -364,6 +364,10 @@ impl App {
                 display: s.display,
                 rect: crate::engine::geom::Rect::new(s.area[0], s.area[1], s.area[2], s.area[3]),
             },
+            SourceKind::Device => match &s.ios_device {
+                Some(id) => Target::Device { id: id.clone() },
+                None => Target::Display { id: s.display },
+            },
         };
         recorder::Options {
             target,
@@ -1104,6 +1108,8 @@ impl ApplicationHandler for App {
 /// Run the app (blocks until quit). `open` = a project to open at launch.
 pub fn run(open: Option<PathBuf>) -> Result<()> {
     theme::set_accent(theme::system_accent());
+    // Let connected iPhones/iPads appear as recordable devices.
+    crate::capture::camera::enable_screen_capture_devices();
     let el = EventLoop::new()?;
     let _ = PROXY.set(Mutex::new(el.create_proxy()));
     let mut app = App::new(open);

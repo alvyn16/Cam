@@ -49,6 +49,63 @@ fn describe(d: &AVCaptureDevice) -> Device {
     unsafe { Device { id: d.uniqueID().to_string(), name: d.localizedName().to_string() } }
 }
 
+#[repr(C)]
+struct CmioPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+#[link(name = "CoreMediaIO", kind = "framework")]
+unsafe extern "C" {
+    fn CMIOObjectSetPropertyData(
+        object: u32,
+        address: *const CmioPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const std::ffi::c_void,
+        data_size: u32,
+        data: *const std::ffi::c_void,
+    ) -> i32;
+}
+
+/// Let USB-connected iPhones and iPads show up as capture devices (their
+/// screens become "muxed" AVCaptureDevices a moment later).
+pub fn enable_screen_capture_devices() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let address = CmioPropertyAddress {
+            selector: u32::from_be_bytes(*b"yes "), // kCMIOHardwarePropertyAllowScreenCaptureDevices
+            scope: u32::from_be_bytes(*b"glob"),
+            element: 0,
+        };
+        let allow: u32 = 1;
+        // SAFETY: documented CoreMediaIO system-object property, plain data.
+        unsafe {
+            CMIOObjectSetPropertyData(1, &address, 0, std::ptr::null(), 4, &allow as *const u32 as *const std::ffi::c_void);
+        }
+    });
+}
+
+fn ios_raw() -> Vec<Retained<AVCaptureDevice>> {
+    enable_screen_capture_devices();
+    unsafe { discover(&[AVCaptureDeviceTypeExternal], AVMediaTypeMuxed.unwrap()) }
+}
+
+/// Connected iPhones/iPads whose screens can be recorded.
+pub fn ios_devices() -> Vec<Device> {
+    ios_raw().iter().map(|d| describe(d)).collect()
+}
+
+/// An iOS device's current screen size in pixels.
+pub fn ios_dimensions(id: &str) -> Option<(u32, u32)> {
+    let dev = ios_raw().into_iter().find(|d| unsafe { d.uniqueID().to_string() } == id)?;
+    unsafe {
+        let desc = dev.activeFormat().formatDescription();
+        let dims = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
+        (dims.width > 0 && dims.height > 0).then_some((dims.width as u32, dims.height as u32))
+    }
+}
+
 pub fn cameras() -> Vec<Device> {
     cameras_raw().iter().map(|d| describe(d)).collect()
 }
@@ -124,6 +181,15 @@ impl Camera {
         Self::start_with(sel, shared, false)
     }
 
+    /// Record a connected iOS device's screen as the sink's main video.
+    pub fn start_ios(id: &str, shared: Arc<Shared>) -> Result<Self> {
+        let dev = ios_raw()
+            .into_iter()
+            .find(|d| unsafe { d.uniqueID().to_string() } == id)
+            .ok_or_else(|| anyhow!("the iPhone/iPad is no longer connected"))?;
+        Self::run(dev, shared, true, false)
+    }
+
     /// Like `start`; `as_screen` routes frames to the sink's main video.
     pub fn start_with(sel: Option<&str>, shared: Arc<Shared>, as_screen: bool) -> Result<Self> {
         let cams = cameras_raw();
@@ -144,14 +210,18 @@ impl Camera {
                 })
             }
         }
-        .ok_or_else(|| anyhow!("no camera found (see `rec-rs devices`)"))?;
+        .ok_or_else(|| anyhow!("no camera found (see `glide devices`)"))?;
+        Self::run(dev, shared, as_screen, true)
+    }
+
+    fn run(dev: Retained<AVCaptureDevice>, shared: Arc<Shared>, as_screen: bool, preset_720: bool) -> Result<Self> {
         unsafe {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
-            if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
+            if preset_720 && session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
                 session.setSessionPreset(AVCaptureSessionPreset1280x720);
-            } else {
+            } else if session.canSetSessionPreset(AVCaptureSessionPresetHigh) {
                 session.setSessionPreset(AVCaptureSessionPresetHigh);
             }
             let input = AVCaptureDeviceInput::deviceInputWithDevice_error(&dev)

@@ -20,6 +20,8 @@ pub enum SourceKind {
     Display,
     Window,
     Area,
+    /// A USB-connected iPhone or iPad.
+    Device,
 }
 
 /// Recording preferences, remembered between launches.
@@ -43,6 +45,8 @@ pub struct Settings {
     pub hide_desktop_icons: bool,
     pub hide_dock: bool,
     pub hotkeys: Hotkeys,
+    /// iPhone/iPad unique id.
+    pub ios_device: Option<String>,
 }
 
 /// Global shortcuts (None = unbound).
@@ -90,6 +94,7 @@ impl Default for Settings {
             hide_desktop_icons: false,
             hide_dock: false,
             hotkeys: Hotkeys::default(),
+            ios_device: None,
         }
     }
 }
@@ -125,6 +130,7 @@ pub struct Devices {
     pub windows: Vec<(u32, String)>,
     pub cameras: Vec<Device>,
     pub mics: Vec<Device>,
+    pub ios: Vec<Device>,
 }
 
 impl Devices {
@@ -144,6 +150,7 @@ impl Devices {
                 .unwrap_or_default(),
             cameras: camera::cameras().into_iter().map(|d| Device { id: d.id, name: d.name }).collect(),
             mics: camera::microphones().into_iter().map(|d| Device { id: d.id, name: d.name }).collect(),
+            ios: camera::ios_devices().into_iter().map(|d| Device { id: d.id, name: d.name }).collect(),
         }
     }
 }
@@ -332,7 +339,7 @@ pub fn ui(
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.label(RichText::new("New recording").font(theme::semibold(17.0)));
                 ui.add_space(10.0);
-                segmented(ui, &mut s.source, &[(SourceKind::Display, "Display"), (SourceKind::Window, "Window"), (SourceKind::Area, "Area")]);
+                segmented(ui, &mut s.source, &[(SourceKind::Display, "Display"), (SourceKind::Window, "Window"), (SourceKind::Area, "Area"), (SourceKind::Device, "iPhone")]);
                 ui.add_space(8.0);
                 match s.source {
                     SourceKind::Display => {
@@ -352,6 +359,24 @@ pub fn ui(
                             }
                         });
                         if ui.small_button("Refresh windows").clicked() {
+                            *dev = Devices::load();
+                        }
+                    }
+                    SourceKind::Device => {
+                        if dev.ios.is_empty() {
+                            caption(ui, "Connect an iPhone or iPad with a cable, unlock it and trust this Mac.");
+                        } else {
+                            if s.ios_device.as_ref().is_none_or(|id| !dev.ios.iter().any(|d| &d.id == id)) {
+                                s.ios_device = dev.ios.first().map(|d| d.id.clone());
+                            }
+                            let label = s.ios_device.as_ref().and_then(|id| dev.ios.iter().find(|d| &d.id == id)).map_or("", |d| d.name.as_str()).to_string();
+                            egui::ComboBox::from_id_salt("ios").width(290.0).selected_text(label).show_ui(ui, |ui| {
+                                for d in &dev.ios {
+                                    ui.selectable_value(&mut s.ios_device, Some(d.id.clone()), &d.name);
+                                }
+                            });
+                        }
+                        if ui.small_button("Refresh").clicked() {
                             *dev = Devices::load();
                         }
                     }
@@ -405,7 +430,7 @@ pub fn ui(
                 }
                 toggle_row(ui, "Record key presses", &mut s.keys);
                 toggle_row(ui, "3 s countdown", &mut s.countdown);
-                if s.source != SourceKind::Window {
+                if matches!(s.source, SourceKind::Display | SourceKind::Area) {
                     toggle_row(ui, "Hide desktop icons", &mut s.hide_desktop_icons);
                     toggle_row(ui, "Hide Dock", &mut s.hide_dock);
                 }

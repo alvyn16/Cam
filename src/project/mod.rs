@@ -26,7 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::engine::zoom;
-use model::{Project, Slice};
+use model::{DeviceFrame, Project, Slice};
 use recording::{Recording, RecordingMeta, SourceKind};
 
 pub const EXTENSION: &str = "glide";
@@ -105,6 +105,12 @@ pub fn new_project(name: &str, rec: &Recording) -> Project {
         // Full-screen recordings fill the frame; windows and areas float.
         p.style.padding = 0.0;
         p.style.corner_radius = 0.0;
+    }
+    if rec.meta.kind == SourceKind::Device {
+        // iPhone/iPad screens get a device frame; there's no cursor to follow.
+        let (w, h) = (rec.meta.screen.width, rec.meta.screen.height);
+        p.style.device = if h > w { DeviceFrame::Phone } else { DeviceFrame::Tablet };
+        p.style.padding = 8.0;
     }
     let id = p.timeline.new_id();
     p.timeline.slices.push(Slice { id, start: 0.0, end: rec.meta.duration_ms, ..Default::default() });

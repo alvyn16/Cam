@@ -32,6 +32,8 @@ pub enum Target {
     Area { display: u32, rect: Rect },
     /// Generated test pattern (no permission needed).
     Pattern,
+    /// A USB-connected iPhone or iPad screen (unique id from `glide devices`).
+    Device { id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -81,10 +83,21 @@ struct CameraRec {
 impl CameraRec {
     fn start(sel: Option<&str>, path: &std::path::Path) -> Result<Self> {
         let spec = VideoSpec { width: 1280, height: 720, fps: 30, codec: CapCodec::H264, bitrate: 8_000_000, pixel_format: PIX_BGRA };
-        let sink = Sink::new(Some(path), &spec, false, false, AudioLayout::Stems, [0.0; 2], None, CapScene::Screen, None)?;
+        Self::start_spec(path, &spec, |shared| Camera::start_with(sel, shared, true))
+    }
+
+    /// An iOS device's screen at its native size.
+    fn start_ios(id: &str, path: &std::path::Path, size: (usize, usize)) -> Result<Self> {
+        let bitrate = ((size.0 * size.1) as f64 * 60.0 * 0.08) as u64;
+        let spec = VideoSpec { width: size.0, height: size.1, fps: 60, codec: CapCodec::Hevc, bitrate: bitrate.max(4_000_000), pixel_format: PIX_BGRA };
+        Self::start_spec(path, &spec, |shared| Camera::start_ios(id, shared))
+    }
+
+    fn start_spec(path: &std::path::Path, spec: &VideoSpec, open: impl FnOnce(Arc<Shared>) -> Result<Camera>) -> Result<Self> {
+        let sink = Sink::new(Some(path), spec, false, false, AudioLayout::Stems, [0.0; 2], None, CapScene::Screen, None)?;
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
-        let cam = Camera::start_with(sel, shared.clone(), true)?;
+        let cam = open(shared.clone())?;
         let (ps, pstop) = (shared.clone(), stop.clone());
         let pacer = std::thread::spawn(move || {
             while !pstop.load(Ordering::SeqCst) {
@@ -100,6 +113,10 @@ impl CameraRec {
         let mut t = None;
         self.shared.with(|s| t = s.t0_secs());
         t
+    }
+
+    fn error(&self) -> Option<String> {
+        self.shared.error.lock().unwrap().clone()
     }
 
     fn pause(&self, now: f64) {
@@ -133,6 +150,8 @@ pub struct Recorder {
     pub package: Package,
     session: Option<Session>,
     camera: Option<CameraRec>,
+    /// An iOS device recorded as the main video (instead of `session`).
+    device: Option<CameraRec>,
     input: Option<InputLogger>,
     kind: SourceKind,
     /// Captured region in global points at the start.
@@ -170,6 +189,11 @@ impl Recorder {
         // Resolve the target: what to capture, at what size, where it is.
         let (cap_target, kind, bounds, size, window, app_name) = match &opts.target {
             Target::Pattern => (None, SourceKind::Display, Rect::new(0.0, 0.0, 1440.0, 900.0), (2880, 1800), None, None),
+            Target::Device { id } => {
+                let (w, h) = crate::capture::camera::ios_dimensions(id).context("iPhone/iPad not found — connect it with a cable and unlock it")?;
+                let px = (even(w as f64), even(h as f64));
+                (None, SourceKind::Device, Rect::new(0.0, 0.0, px.0 as f64, px.1 as f64), px, None, None)
+            }
             Target::Display { id } => {
                 let ds = screen::displays()?;
                 let d = ds.into_iter().find(|d| d.id == *id || *id == 0).context("display not found")?;
@@ -200,6 +224,27 @@ impl Recorder {
             }
         };
         let scale = size.0 as f64 / bounds.w.max(1.0);
+        if let Target::Device { id } = &opts.target {
+            let device = CameraRec::start_ios(id, &package.rec("screen.mov"), size).inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&package.root);
+            })?;
+            return Ok(Recorder {
+                package,
+                session: None,
+                camera: None,
+                device: Some(device),
+                input: None,
+                kind,
+                bounds,
+                scale,
+                size,
+                window,
+                pauses: vec![],
+                started: Instant::now(),
+                opts,
+                app_name: Some("iPhone".into()),
+            });
+        }
         // High-quality HEVC: generous bits so re-encoding on export stays clean.
         let bitrate = ((size.0 * size.1) as f64 * opts.fps as f64 * 0.08) as u64;
         let cap = CapOptions {
@@ -248,6 +293,7 @@ impl Recorder {
             package,
             session: Some(session),
             camera,
+            device: None,
             input: Some(input),
             kind,
             bounds,
@@ -265,16 +311,24 @@ impl Recorder {
         self.pauses.last().is_some_and(|p| p.1.is_none())
     }
 
-    fn sess(&self) -> &Session {
-        self.session.as_ref().expect("session")
+    fn paused_secs(&self, now: f64) -> f64 {
+        self.pauses.iter().map(|&(a, b)| b.unwrap_or(now) - a).sum()
     }
 
     pub fn pause(&mut self) {
-        if self.is_paused() || !self.sess().has_frames() {
+        if self.is_paused() || !self.has_frames() {
             return;
         }
         let now = secs(host_now());
-        if self.sess().pause() {
+        let paused = match (&self.session, &self.device) {
+            (Some(s), _) => s.pause(),
+            (None, Some(d)) => {
+                d.pause(now);
+                true
+            }
+            _ => false,
+        };
+        if paused {
             if let Some(c) = &self.camera {
                 c.pause(now);
             }
@@ -287,7 +341,15 @@ impl Recorder {
             return;
         }
         let now = secs(host_now());
-        if self.sess().resume() {
+        let resumed = match (&self.session, &self.device) {
+            (Some(s), _) => s.resume(),
+            (None, Some(d)) => {
+                d.resume(now);
+                true
+            }
+            _ => false,
+        };
+        if resumed {
             if let Some(c) = &self.camera {
                 c.resume(now);
             }
@@ -299,15 +361,30 @@ impl Recorder {
 
     /// Recorded seconds (excluding pauses).
     pub fn elapsed(&self) -> f64 {
-        self.sess().recorded_secs()
+        match (&self.session, &self.device) {
+            (Some(s), _) => s.recorded_secs(),
+            (None, Some(d)) => d.t0().map_or(0.0, |t0| {
+                let now = secs(host_now());
+                (now - t0 - self.paused_secs(now)).max(0.0)
+            }),
+            _ => 0.0,
+        }
     }
 
     pub fn error(&self) -> Option<String> {
-        if self.sess().failed() { self.sess().error() } else { None }
+        match (&self.session, &self.device) {
+            (Some(s), _) => s.failed().then(|| s.error()).flatten(),
+            (None, Some(d)) => d.error(),
+            _ => None,
+        }
     }
 
     pub fn has_frames(&self) -> bool {
-        self.sess().has_frames()
+        match (&self.session, &self.device) {
+            (Some(s), _) => s.has_frames(),
+            (None, Some(d)) => d.t0().is_some(),
+            _ => false,
+        }
     }
 
     /// Discard the recording.
@@ -318,10 +395,20 @@ impl Recorder {
         if let Some(c) = self.camera.take() {
             let _ = c.finish();
         }
+        if let Some(d) = self.device.take() {
+            let _ = d.finish();
+        }
         if let Some(s) = self.session.take() {
             let _ = s.finish();
         }
         let _ = std::fs::remove_dir_all(&self.package.root);
+    }
+
+    fn elapsed_with(&self, t0: Option<f64>) -> f64 {
+        t0.map_or(0.0, |t0| {
+            let now = secs(host_now());
+            (now - t0 - self.paused_secs(now)).max(0.0)
+        })
     }
 
     /// Recording time (ms) of a host time, or None if it falls in a pause.
@@ -349,6 +436,17 @@ impl Recorder {
             && let Err(e) = c.finish()
         {
             eprintln!("glide: camera file: {e}");
+        }
+        if let Some(d) = self.device.take() {
+            let t0 = d.t0();
+            let duration_ms = self.elapsed_with(t0) * 1000.0;
+            d.finish().context("finalizing device recording")?;
+            let Some(t0) = t0 else {
+                let _ = std::fs::remove_dir_all(&self.package.root);
+                bail!("no frames came from the device (is it unlocked?)");
+            };
+            self.write_package(InputLog::default(), t0, duration_ms, None)?;
+            return Ok(self.package.root.clone());
         }
         let session = self.session.take().expect("session");
         let t0 = session.t0_secs();

@@ -15,6 +15,8 @@ pub enum SourceKind {
     Display,
     Window,
     Area,
+    /// A USB-connected iPhone or iPad screen.
+    Device,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

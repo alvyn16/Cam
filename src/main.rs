@@ -68,6 +68,9 @@ enum Cmd {
         /// Area as x,y,w,h in points on the display.
         #[arg(long)]
         area: Option<String>,
+        /// Record a USB-connected iPhone/iPad (id from `glide devices`).
+        #[arg(long)]
+        device: Option<String>,
         /// Record a generated test pattern instead of the screen.
         #[arg(long)]
         pattern: bool,
@@ -162,8 +165,8 @@ fn main() -> Result<()> {
             export_cmd(project, synthetic, output, format, height, fps, quality, codec)
         }
         Some(Cmd::Synth { output, duration, width, height }) => synth(output, duration, width, height),
-        Some(Cmd::Record { display, window, area, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
-            record(display, window, area, pattern, mic, !no_system_audio, camera, duration, fps, dir, name, (hide_icons, hide_dock))
+        Some(Cmd::Record { display, window, area, device, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
+            record(display, window, area, device, pattern, mic, !no_system_audio, camera, duration, fps, dir, name, (hide_icons, hide_dock))
         }
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
@@ -344,6 +347,7 @@ fn record(
     display: Option<u32>,
     window: Option<u32>,
     area: Option<String>,
+    device: Option<String>,
     pattern: bool,
     mic: bool,
     system_audio: bool,
@@ -357,6 +361,15 @@ fn record(
     use glide::recorder::{Options, Recorder, Target};
     let target = if pattern {
         Target::Pattern
+    } else if let Some(id) = device {
+        glide::capture::camera::enable_screen_capture_devices();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let found = glide::capture::camera::ios_devices();
+        let d = found
+            .iter()
+            .find(|d| d.id == id || d.name.to_lowercase().contains(&id.to_lowercase()))
+            .ok_or_else(|| anyhow::anyhow!("no iPhone/iPad matches {id:?} (see `glide devices`)"))?;
+        Target::Device { id: d.id.clone() }
     } else if let Some(id) = window {
         Target::Window { id }
     } else if let Some(a) = area {
@@ -431,6 +444,13 @@ fn devices() -> Result<()> {
     println!("Microphones:");
     for m in camera::microphones() {
         println!("  {}  ({})", m.name, m.id);
+    }
+    // iOS devices appear shortly after screen-capture devices are enabled.
+    camera::enable_screen_capture_devices();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    println!("iPhone / iPad:");
+    for d in camera::ios_devices() {
+        println!("  {}  ({})", d.name, d.id);
     }
     Ok(())
 }
