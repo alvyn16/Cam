@@ -381,7 +381,15 @@ impl Renderer {
             self.background = Some(style.background.clone());
             let img = match &style.background {
                 Background::Wallpaper { id } => Some(art::wallpaper(id, 1920, 1200)),
-                Background::Image { path } => Image::from_png(Path::new(path)).ok(),
+                Background::Image { path } => {
+                    // Relative paths live inside the package (imported images).
+                    let p = Path::new(path);
+                    let full = match package_dir {
+                        Some(dir) if p.is_relative() => dir.join(p),
+                        _ => p.to_path_buf(),
+                    };
+                    Image::from_png(&full).ok()
+                }
                 _ => None,
             };
             if let Some(img) = img {

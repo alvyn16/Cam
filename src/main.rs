@@ -117,6 +117,9 @@ enum Cmd {
         #[arg(long)]
         png: Option<u32>,
     },
+    /// Save the current desktop picture as PNG (what "Desktop wallpaper" uses).
+    #[command(hide = true)]
+    Wallpaper { output: PathBuf },
     /// Transcribe a project's microphone track into captions.
     Transcribe { project: PathBuf },
     /// List displays, windows, cameras and microphones.
@@ -158,6 +161,11 @@ fn main() -> Result<()> {
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
         Some(Cmd::Gui { project }) => glide::app::run(project),
+        Some(Cmd::Wallpaper { output }) => {
+            glide::app::macos::save_desktop_wallpaper(&output)?;
+            println!("{}", output.display());
+            Ok(())
+        }
         Some(Cmd::Icon { output, png }) => {
             match png {
                 Some(size) => image::save_buffer(&output, &glide::render::icon::render(size), size, size, image::ExtendedColorType::Rgba8)?,

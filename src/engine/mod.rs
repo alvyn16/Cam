@@ -12,4 +12,5 @@ pub mod scene;
 pub mod sizes;
 pub mod spring;
 pub mod timemap;
+pub mod typing;
 pub mod zoom;

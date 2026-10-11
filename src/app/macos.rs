@@ -107,3 +107,28 @@ pub fn trash(path: &std::path::Path) {
         eprintln!("glide: couldn't trash {}: {}", path.display(), e.localizedDescription());
     }
 }
+
+/// Save the main display's current desktop picture as a PNG at `dest`
+/// (desktop pictures are often HEIC, which the renderer doesn't decode).
+pub fn save_desktop_wallpaper(dest: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::anyhow;
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSScreen, NSWorkspace};
+    let mtm = objc2::MainThreadMarker::new().ok_or_else(|| anyhow!("not on the main thread"))?;
+    let screen = NSScreen::mainScreen(mtm).ok_or_else(|| anyhow!("no screen"))?;
+    let url = NSWorkspace::sharedWorkspace()
+        .desktopImageURLForScreen(&screen)
+        .ok_or_else(|| anyhow!("macOS didn't report a desktop picture"))?;
+    let image = NSImage::initWithContentsOfURL(NSImage::alloc(), &url)
+        .ok_or_else(|| anyhow!("the desktop picture isn't an image (dynamic or video wallpapers aren't supported)"))?;
+    let tiff = image.TIFFRepresentation().ok_or_else(|| anyhow!("couldn't read the desktop picture"))?;
+    let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or_else(|| anyhow!("couldn't decode the desktop picture"))?;
+    let props = objc2_foundation::NSDictionary::new();
+    let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props) }
+        .ok_or_else(|| anyhow!("couldn't encode the desktop picture"))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, png.to_vec())?;
+    Ok(())
+}

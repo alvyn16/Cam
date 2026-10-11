@@ -95,6 +95,8 @@ pub struct Editor {
     pub close_requested: bool,
     /// Background transcription (word count or error).
     pub transcribing: Option<std::thread::JoinHandle<Result<usize, String>>>,
+    preset_name: String,
+    pub looping: bool,
 }
 
 impl Editor {
@@ -127,6 +129,8 @@ impl Editor {
             thumbs: None,
             close_requested: false,
             transcribing: None,
+            preset_name: String::new(),
+            looping: false,
         })
     }
 
@@ -233,14 +237,7 @@ impl Editor {
                 let id = p.timeline.new_id();
                 p.timeline.slices.push(Slice { id, start: 0.0, end: map.source_end(), ..Default::default() });
             }
-            if let Some(i) = p.timeline.slices.iter().position(|s| src > s.start + 100.0 && src < s.end - 100.0) {
-                let id = p.timeline.new_id();
-                let mut right = p.timeline.slices[i];
-                right.id = id;
-                right.start = src;
-                p.timeline.slices[i].end = src;
-                p.timeline.slices.insert(i + 1, right);
-            }
+            crate::engine::typing::split_at(&mut p.timeline, src);
         });
     }
 
@@ -299,9 +296,15 @@ impl Editor {
         if let Some((t0, from)) = self.playing {
             self.playhead = from + t0.elapsed().as_secs_f64() * 1000.0;
             if self.playhead >= self.duration() {
-                self.playhead = self.duration();
-                self.playing = None;
-                self.audio.pause();
+                if self.looping {
+                    self.playhead = 0.0;
+                    self.playing = Some((Instant::now(), 0.0));
+                    self.audio.play(0.0);
+                } else {
+                    self.playhead = self.duration();
+                    self.playing = None;
+                    self.audio.pause();
+                }
             }
         }
         self.audio.tick();
@@ -352,6 +355,9 @@ impl Editor {
         } else if pressed(egui::Key::Z) && !cmd {
             self.add_zoom();
         }
+        if !cmd && pressed(egui::Key::L) {
+            self.looping = !self.looping;
+        }
         if cmd && pressed(egui::Key::E) {
             self.export.open = true;
         }
@@ -377,6 +383,71 @@ impl Editor {
         }
     }
 
+    fn presets_menu(&mut self, ui: &mut Ui) {
+        use crate::project::presets;
+        ui.menu_button("Presets", |ui| {
+            ui.set_min_width(220.0);
+            let list = presets::list();
+            let default = presets::default_name();
+            if list.is_empty() {
+                ui.label(RichText::new("No presets yet").color(pal(ui).secondary));
+            }
+            for p in &list {
+                let label = if default.as_deref() == Some(p.name.as_str()) { format!("{}  (default)", p.name) } else { p.name.clone() };
+                if ui.button(label).on_hover_text("Apply this style").clicked() {
+                    match presets::load(p) {
+                        Ok(style) => {
+                            self.edit(|d| presets::apply(&mut d.style, &style));
+                            self.status = Some(format!("Applied preset “{}”", p.name));
+                        }
+                        Err(e) => self.status = Some(format!("Couldn't load preset: {e:#}")),
+                    }
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new("Save current style as").color(pal(ui).secondary));
+            ui.horizontal(|ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Preset name").desired_width(140.0));
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() || enter)
+                    && !self.preset_name.trim().is_empty()
+                {
+                    match presets::save(&self.preset_name, &self.project.style, Some(&self.package.root)) {
+                        Ok(p) => self.status = Some(format!("Saved preset “{}”", p.name)),
+                        Err(e) => self.status = Some(format!("Couldn't save preset: {e:#}")),
+                    }
+                    self.preset_name.clear();
+                }
+            });
+            if !list.is_empty() {
+                ui.separator();
+                ui.menu_button("Default for new recordings", |ui| {
+                    if ui.selectable_label(default.is_none(), "None").clicked() {
+                        let _ = presets::set_default(None);
+                        ui.close();
+                    }
+                    for p in &list {
+                        if ui.selectable_label(default.as_deref() == Some(p.name.as_str()), &p.name).clicked() {
+                            let _ = presets::set_default(Some(&p.name));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Delete preset", |ui| {
+                    for p in &list {
+                        if ui.button(&p.name).clicked() {
+                            if let Err(e) = presets::delete(p) {
+                                self.status = Some(format!("Couldn't delete preset: {e:#}"));
+                            }
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// Draw the editor. `back` is set when the user leaves for the library.
     pub fn ui(&mut self, ui: &mut Ui, egui_renderer: &mut egui_wgpu::Renderer, back: &mut bool) {
         let ctx = ui.ctx().clone();
@@ -400,6 +471,8 @@ impl Editor {
                             self.export.open = true;
                         }
                         ui.add_space(6.0);
+                        self.presets_menu(ui);
+                        ui.add_space(4.0);
                         if widgets::icon_button(ui, widgets::Icon::Redo, !self.redo.is_empty()).on_hover_text("Redo ⇧⌘Z").clicked() {
                             self.redo();
                         }
@@ -488,6 +561,9 @@ impl Editor {
                 self.toggle_play();
             }
             ui.label(RichText::new(format!("{} / {}", fmt_time(self.playhead), fmt_time(self.duration()))).monospace());
+            if ui.selectable_label(self.looping, "Loop").on_hover_text("Loop playback (L)").clicked() {
+                self.looping = !self.looping;
+            }
             ui.separator();
             if ui.button("✂ Split").on_hover_text("Split at playhead (S)").clicked() {
                 self.split();

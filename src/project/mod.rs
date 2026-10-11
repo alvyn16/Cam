@@ -15,6 +15,7 @@
 //! ```
 
 pub mod model;
+pub mod presets;
 pub mod recording;
 
 use std::fs;
@@ -74,6 +75,18 @@ impl Package {
             Err(_) => new_project(&self.name(), &rec),
         };
         Ok((project, rec))
+    }
+
+    /// Copy a file into the package's `assets/` folder; returns the path
+    /// relative to the package, so projects stay self-contained.
+    pub fn import_asset(&self, src: &Path, stem: &str) -> Result<String> {
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin").to_ascii_lowercase();
+        let dir = self.root.join("assets");
+        std::fs::create_dir_all(&dir)?;
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let name = format!("{stem}-{ms}.{ext}");
+        std::fs::copy(src, dir.join(&name)).with_context(|| format!("copying {}", src.display()))?;
+        Ok(format!("assets/{name}"))
     }
 
     pub fn save_project(&self, p: &Project) -> Result<()> {

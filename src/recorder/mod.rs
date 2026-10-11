@@ -439,7 +439,14 @@ impl Recorder {
         project::write_json(&pkg.rec("keys.json"), &keys)?;
         project::write_json(&pkg.rec("cursors.json"), &cursors)?;
         let rec = pkg.load_recording()?;
-        let proj = project::new_project(&pkg.name(), &rec);
+        let mut proj = project::new_project(&pkg.name(), &rec);
+        // The user's default style preset, if any; auto zooms take its zoom level.
+        if let Some(style) = project::presets::default_style() {
+            project::presets::apply(&mut proj.style, &style);
+            for z in &mut proj.timeline.zooms {
+                z.scale = proj.style.default_zoom;
+            }
+        }
         pkg.save_project(&proj)?;
         Ok(())
     }

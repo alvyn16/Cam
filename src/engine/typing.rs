@@ -1,0 +1,108 @@
+//! Typing speed-up suggestions: find stretches of the recording where the
+//! user was typing (plain key presses, no ⌘/⌃ shortcuts, short gaps) so the
+//! editor can offer to play them faster.
+
+use crate::project::model::{Slice, Timeline};
+use crate::project::recording::{KeyEvent, mods};
+
+/// Gap between presses that still counts as one typing run.
+pub const MAX_GAP_MS: f64 = 1500.0;
+/// Shortest run worth speeding up.
+pub const MIN_LEN_MS: f64 = 2500.0;
+pub const MIN_KEYS: usize = 8;
+/// Leave a little real-time context around each run.
+pub const MARGIN_MS: f64 = 150.0;
+
+/// Source-time ranges of typing runs.
+pub fn ranges(keys: &[KeyEvent]) -> Vec<(f64, f64)> {
+    let mut out = vec![];
+    let mut run: Option<(f64, f64, usize)> = None;
+    let typing = keys.iter().filter(|k| k.down && k.mods & (mods::CMD | mods::CTRL) == 0);
+    for k in typing {
+        run = match run {
+            Some((s, e, n)) if k.t - e <= MAX_GAP_MS => Some((s, k.t, n + 1)),
+            Some((s, e, n)) => {
+                if e - s >= MIN_LEN_MS && n >= MIN_KEYS {
+                    out.push((s, e));
+                }
+                Some((k.t, k.t, 1))
+            }
+            None => Some((k.t, k.t, 1)),
+        };
+    }
+    if let Some((s, e, n)) = run
+        && e - s >= MIN_LEN_MS
+        && n >= MIN_KEYS
+    {
+        out.push((s, e));
+    }
+    out.into_iter().map(|(s, e)| (s + MARGIN_MS, e - MARGIN_MS)).filter(|(s, e)| e > s).collect()
+}
+
+/// Split slices at a source time (at least 100 ms from slice edges).
+/// Returns false when no slice could be split there.
+pub fn split_at(tl: &mut Timeline, t: f64) -> bool {
+    let Some(i) = tl.slices.iter().position(|s| t > s.start + 100.0 && t < s.end - 100.0) else {
+        return false;
+    };
+    let id = tl.new_id();
+    let right = Slice { id, start: t, ..tl.slices[i] };
+    tl.slices[i].end = t;
+    tl.slices.insert(i + 1, right);
+    true
+}
+
+/// Play the given source ranges at `speed`: split at their edges and set the
+/// speed of every slice inside. Returns how many slices changed.
+pub fn speed_up(tl: &mut Timeline, ranges: &[(f64, f64)], speed: f64) -> usize {
+    for &(s, e) in ranges {
+        split_at(tl, s);
+        split_at(tl, e);
+    }
+    let mut n = 0;
+    for slice in &mut tl.slices {
+        let mid = (slice.start + slice.end) * 0.5;
+        if ranges.iter().any(|&(s, e)| mid > s && mid < e && slice.start >= s - 1.0 && slice.end <= e + 1.0) {
+            slice.speed = speed;
+            n += 1;
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(t: f64, m: u8) -> KeyEvent {
+        KeyEvent { t, code: 0, key: "A".into(), mods: m, down: true }
+    }
+
+    #[test]
+    fn finds_typing_runs_and_ignores_shortcuts() {
+        let mut keys: Vec<KeyEvent> = (0..20).map(|i| key(1000.0 + i as f64 * 200.0, 0)).collect();
+        // A shortcut burst and an isolated press are not typing.
+        keys.extend((0..10).map(|i| key(10_000.0 + i as f64 * 100.0, mods::CMD)));
+        keys.push(key(20_000.0, 0));
+        let r = ranges(&keys);
+        assert_eq!(r.len(), 1);
+        assert!((r[0].0 - 1150.0).abs() < 1e-9 && (r[0].1 - 4650.0).abs() < 1e-9, "{r:?}");
+    }
+
+    #[test]
+    fn short_bursts_are_ignored() {
+        let keys: Vec<KeyEvent> = (0..5).map(|i| key(i as f64 * 100.0, 0)).collect();
+        assert!(ranges(&keys).is_empty());
+    }
+
+    #[test]
+    fn speed_up_splits_and_sets_speed() {
+        let mut tl = Timeline::default();
+        let id = tl.new_id();
+        tl.slices.push(Slice { id, start: 0.0, end: 10_000.0, speed: 1.0, ..Default::default() });
+        let n = speed_up(&mut tl, &[(2000.0, 5000.0)], 3.0);
+        assert_eq!(n, 1);
+        let spans: Vec<_> = tl.slices.iter().map(|s| (s.start, s.end, s.speed)).collect();
+        assert_eq!(spans, vec![(0.0, 2000.0, 1.0), (2000.0, 5000.0, 3.0), (5000.0, 10_000.0, 1.0)]);
+    }
+}

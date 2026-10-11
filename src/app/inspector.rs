@@ -161,10 +161,21 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                     if ui.button("Choose image…").clicked()
                         && let Some(f) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file()
                     {
-                        *path = f.to_string_lossy().into_owned();
+                        match ed.package.import_asset(&f, "background") {
+                            Ok(rel) => *path = rel,
+                            Err(e) => ed.status = Some(format!("Couldn't import image: {e:#}")),
+                        }
                     }
-                    caption(ui, &std::path::Path::new(path.as_str()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "None".into()));
+                    if ui.button("Desktop wallpaper").on_hover_text("Use your current macOS desktop picture").clicked() {
+                        let tmp = std::env::temp_dir().join(format!("glide-wallpaper-{}.png", std::process::id()));
+                        match super::macos::save_desktop_wallpaper(&tmp).and_then(|_| ed.package.import_asset(&tmp, "wallpaper")) {
+                            Ok(rel) => *path = rel,
+                            Err(e) => ed.status = Some(format!("Couldn't use the desktop wallpaper: {e:#}")),
+                        }
+                        let _ = std::fs::remove_file(&tmp);
+                    }
                 });
+                caption(ui, &std::path::Path::new(path.as_str()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "No image".into()));
             }
         }
         slider(ui, "Blur", &mut s.background_blur, 0.0..=60.0, " px");
@@ -270,6 +281,13 @@ fn cursor(ui: &mut Ui, d: &mut Project, no_data: bool) {
         if let Some(ms) = &mut c.loop_ms {
             slider(ui, "Loop over", ms, 300.0..=5000.0, " ms");
         }
+        let mut freeze = c.freeze_ms > 0.0;
+        if toggle_row(ui, "Freeze at end", &mut freeze) {
+            c.freeze_ms = if freeze { 1000.0 } else { 0.0 };
+        }
+        if c.freeze_ms > 0.0 {
+            slider(ui, "Freeze for", &mut c.freeze_ms, 200.0..=5000.0, " ms");
+        }
     });
     section(ui, "Clicks", |ui| {
         let mut kind = match c.click_effect {
@@ -345,9 +363,37 @@ fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 caption(ui, "Record with the microphone to generate captions.");
             }
         } else {
-            caption(ui, &format!("{} words", ed.rec.transcript.len()));
-            let text: String = ed.rec.transcript.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
-            ui.label(RichText::new(text).size(12.0));
+            caption(ui, &format!("{} words — click a line to fix it", ed.rec.transcript.len()));
+            let lines = crate::engine::captions::lines(&ed.rec.transcript);
+            let mut edited = None;
+            for (i, line) in lines.iter().enumerate() {
+                let id = ui.id().with(("caption-line", i, line.start.to_bits()));
+                let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| line.text());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(widgets::fmt_time(line.start)).size(10.0).color(pal(ui).secondary).monospace());
+                    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(f32::INFINITY).font(egui::FontId::proportional(12.0)));
+                    if r.changed() {
+                        ui.data_mut(|d| d.insert_temp(id, buf.clone()));
+                    }
+                    if r.lost_focus() {
+                        ui.data_mut(|d| d.remove::<String>(id));
+                        if buf != line.text() {
+                            edited = Some((line.clone(), buf.clone()));
+                        }
+                    }
+                });
+            }
+            if let Some((line, text)) = edited {
+                let mut words = ed.rec.transcript.clone();
+                crate::engine::captions::edit_line(&mut words, &line, &text);
+                match crate::project::write_json(&crate::transcribe::transcript_path(&ed.package), &words) {
+                    Ok(()) => {
+                        ed.rec.transcript = words;
+                        ed.preview.set_project(&ed.project, &ed.rec);
+                    }
+                    Err(e) => ed.status = Some(format!("Couldn't save captions: {e:#}")),
+                }
+            }
         }
     });
 }
@@ -425,6 +471,23 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         }
         let n = d.timeline.zooms.len();
         caption(ui, &format!("{n} zoom{}", if n == 1 { "" } else { "s" }));
+    });
+    section(ui, "Typing", |ui| {
+        let runs = crate::engine::typing::ranges(&ed.rec.keys);
+        if runs.is_empty() {
+            caption(ui, if ed.rec.keys.is_empty() { "No key presses were recorded." } else { "No typing sections found." });
+            return;
+        }
+        let secs: f64 = runs.iter().map(|(s, e)| e - s).sum::<f64>() / 1000.0;
+        caption(ui, &format!("{} typing section{} ({secs:.1} s). Speed them up:", runs.len(), if runs.len() == 1 { "" } else { "s" }));
+        ui.horizontal(|ui| {
+            for speed in [2.0, 3.0, 4.0] {
+                if ui.button(format!("{speed}×")).clicked() {
+                    let n = crate::engine::typing::speed_up(&mut d.timeline, &runs, speed);
+                    ed.status = Some(format!("Sped up {n} typing section{} to {speed}×", if n == 1 { "" } else { "s" }));
+                }
+            }
+        });
     });
 }
 
