@@ -361,22 +361,16 @@ fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         if ed.rec.transcript.is_empty() {
             caption(ui, "No transcript yet.");
             if ed.rec.meta.mic.is_some() {
-                if ed.transcribing.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        caption(ui, "Transcribing on device…");
-                    });
-                } else if ui.button("Transcribe microphone").clicked() {
-                    let pkg = ed.package.clone();
-                    ed.transcribing = Some(std::thread::spawn(move || {
-                        objc2::rc::autoreleasepool(|_| crate::transcribe::transcribe_package(&pkg)).map_err(|e| format!("{e:#}"))
-                    }));
-                }
+                transcribe_controls(ui, ed);
             } else {
                 caption(ui, "Record with the microphone to generate captions.");
             }
         } else {
             caption(ui, &format!("{} words — click a line to fix it", ed.rec.transcript.len()));
+            ui.collapsing("Transcribe again", |ui| {
+                caption(ui, "Replaces the current captions, including your edits.");
+                transcribe_controls(ui, ed);
+            });
             let lines = crate::engine::captions::lines(&ed.rec.transcript);
             let mut edited = None;
             for (i, line) in lines.iter().enumerate() {
@@ -409,6 +403,56 @@ fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             }
         }
     });
+}
+
+/// Engine picker and the Transcribe button (or progress while running).
+fn transcribe_controls(ui: &mut Ui, ed: &mut Editor) {
+    use crate::transcribe::Engine;
+    use crate::whisper::Model;
+    use std::sync::atomic::Ordering;
+    if ed.transcribing.is_some() {
+        let p = &ed.transcribe_progress;
+        let pct = p.permille.load(Ordering::Relaxed) as f32 / 10.0;
+        let text = match (ed.caption_engine, p.phase.load(Ordering::Relaxed)) {
+            (Engine::Whisper(m), 0) if !m.is_downloaded() => format!("Downloading Whisper {}… {pct:.0}%", m.name()),
+            (Engine::Whisper(_), _) => format!("Transcribing on device… {pct:.0}%"),
+            (Engine::Apple, _) => "Transcribing on device…".into(),
+        };
+        ui.horizontal(|ui| {
+            ui.spinner();
+            caption(ui, &text);
+        });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        return;
+    }
+    let mut whisper = matches!(ed.caption_engine, Engine::Whisper(_));
+    row(ui, "Engine", |ui| {
+        segmented(ui, &mut whisper, &[(true, "Whisper"), (false, "Apple")]);
+    });
+    match (whisper, ed.caption_engine) {
+        (true, Engine::Apple) => ed.caption_engine = Engine::Whisper(crate::whisper::best_downloaded().unwrap_or(Model::Base)),
+        (false, Engine::Whisper(_)) => ed.caption_engine = Engine::Apple,
+        _ => {}
+    }
+    if let Engine::Whisper(mut model) = ed.caption_engine {
+        let label = |m: Model| {
+            if m.is_downloaded() { format!("{} (downloaded)", m.name()) } else { format!("{} ({} MB download)", m.name(), m.size_mb()) }
+        };
+        row(ui, "Model", |ui| {
+            egui::ComboBox::from_id_salt("whisper-model").selected_text(label(model)).show_ui(ui, |ui| {
+                for m in Model::ALL {
+                    ui.selectable_value(&mut model, m, label(m));
+                }
+            });
+        });
+        ed.caption_engine = Engine::Whisper(model);
+        caption(ui, "Runs on this Mac with Whisper. Larger models are more accurate but slower.");
+    } else {
+        caption(ui, "Uses Apple's on-device speech recognition (asks for Speech Recognition access).");
+    }
+    if ui.button("Transcribe microphone").clicked() {
+        ed.start_transcription();
+    }
 }
 
 fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {

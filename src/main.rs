@@ -152,7 +152,12 @@ enum Cmd {
         height: u32,
     },
     /// Transcribe a project's microphone track into captions.
-    Transcribe { project: PathBuf },
+    Transcribe {
+        project: PathBuf,
+        /// apple, whisper-base, whisper-small or whisper-medium.
+        #[arg(long, default_value = "whisper-base")]
+        engine: String,
+    },
     /// Resize a window (id or name, see `glide devices`) to WxH points before recording it.
     ResizeWindow { window: String, size: String },
     /// List where content under a blur/pixelate mask moves ("data may be visible").
@@ -266,8 +271,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Transcribe { project }) => {
-            let n = glide::transcribe::transcribe_package(&Package::new(&project))?;
+        Some(Cmd::Transcribe { project, engine }) => {
+            let engine = glide::transcribe::Engine::parse(&engine).ok_or_else(|| anyhow::anyhow!("unknown engine {engine:?}"))?;
+            let t0 = Instant::now();
+            let n = glide::transcribe::transcribe_package(&Package::new(&project), engine, &Default::default())?;
+            eprintln!("{} in {:.1} s", engine.label(), t0.elapsed().as_secs_f64());
             println!("{n} words → {}", glide::transcribe::transcript_path(&Package::new(&project)).display());
             Ok(())
         }

@@ -90,6 +90,14 @@ sharing one forward decoding pass.
 | Real 5K display recording, 3 s | 4 (each the full 3 s) | 1.22 s (4.60 s when each mask decoded its own range) |
 | Synthetic 2560×1600, 12 s | 2 over 3.8 s | 0.59 s |
 
+## Captions (Whisper)
+
+`glide transcribe --engine whisper-base` on 7.0 s of synthesized speech
+(`say`): 0.4 s including loading the model (Metal), so about 17× real
+time; all 20 words correct. The first run also downloads the model
+(148 MB, ~8 s here), and the first run of a newly built binary takes
+about 6 s while Metal compiles whisper.cpp's shaders.
+
 ## Idle
 
 With a project open in the editor and nothing playing, the app used 0.00 s

@@ -5,8 +5,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 PROFILE="${PROFILE:-release}"
-# Keep build output outside the repo.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target/screenstudio-rs}"
+. scripts/env.sh
 if [ "$PROFILE" = release ]; then cargo build --release; else cargo build; fi
 BIN="$CARGO_TARGET_DIR/$PROFILE/glide"
 APP=dist/Glide.app

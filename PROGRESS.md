@@ -47,7 +47,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | T9 | Masks | ☑ | Blur, pixelate, highlight; drawn on the preview; follow zoom. "Data may be visible": blur/pixelate masks are re-checked in the background (SSIM + histogram on 64×64 patches every 100 ms, one shared decode pass) and ranges where the covered content moved are flagged on the timeline; one click cuts them. Verified on a real 5K recording (only the mask over a playing video flagged, three static masks not) and by the UI smoke test. |
 | T10 | Voice-over | ◐ | Recorded with AVAudioRecorder, mixed with ducking (mixing verified with a test file). Live capture needs Microphone permission. |
 | O1 | Shortcut overlay | ☑ | |
-| O2 | Captions | ◐ | Apple Speech on device, word timing, editable lines. Needs Speech Recognition permission (run from Glide.app). No whisper.cpp option. |
+| O2 | Captions | ☑ | Whisper (whisper.cpp with Metal; base/small/medium, downloaded on first use) or Apple Speech, both on device, word timings, editable lines. Verified with speech synthesized by `say` attached as a mic track: Whisper base returned all 20 words exactly, 7 s of speech in 0.4 s (plus a test that repeats this whenever the model is present). Apple Speech needs Speech Recognition permission (run from Glide.app) and wasn't exercised live. |
 | A1–A2 | Mix, background music | ☑ | Per-slice volumes, mutes, master volume, looped music with fade. |
 | A3 | Enhance microphone | ☑ | Apple's on-device ML voice isolation (AUSoundIsolation) run offline, then levelled: noise floor −45 → −90 dB on a test clip, ~60× real time. DSP fallback. |
 | E1–E3 | MP4, resolution, frame rate | ☑ | Hardware H.264/HEVC, quality presets by bits per pixel. |
@@ -65,8 +65,9 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-11): 5/5 pass.
 
-- `cargo test` (79): engine, project, presets, renderer helpers, masks,
+- `cargo test` (82): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
+  Whisper transcription of synthesized speech,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
   change detection, window picking, GIF quantisation, icon, plus a
   headless UI smoke test driving every editor panel.
@@ -135,7 +136,8 @@ transcription were exercised only through their code paths and test media.
   menu bar sources, quick export, Finder document opening, GIF delta frames.
 - 2026-10-11: "Data may be visible" warnings for masks (`glide check-masks`);
   resize the recorded window (`glide resize-window`); on-screen window
-  picker; warning when the built-in mic is off with the lid closed.
+  picker; warning when the built-in mic is off with the lid closed; Whisper
+  captions.
 - 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
   fixes from a full code review (preview audio lifecycle, timeline clamps,
   area bounds, voice-over/editor lifecycle, quit and restart behaviour).

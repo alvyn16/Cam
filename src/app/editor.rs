@@ -117,6 +117,9 @@ pub struct Editor {
     pub close_requested: bool,
     /// Background transcription (word count or error).
     pub transcribing: Option<std::thread::JoinHandle<Result<usize, String>>>,
+    /// Engine for "Transcribe microphone" and its download/progress state.
+    pub caption_engine: crate::transcribe::Engine,
+    pub transcribe_progress: std::sync::Arc<crate::whisper::Progress>,
     preset_name: String,
     pub looping: bool,
     /// Voice-over being recorded.
@@ -160,6 +163,8 @@ impl Editor {
             thumbs: None,
             close_requested: false,
             transcribing: None,
+            caption_engine: crate::transcribe::Engine::Whisper(crate::whisper::best_downloaded().unwrap_or(crate::whisper::Model::Base)),
+            transcribe_progress: Default::default(),
             preset_name: String::new(),
             looping: false,
             voice: None,
@@ -314,6 +319,19 @@ impl Editor {
         if cut {
             self.selection = Selection::Mask(e.mask);
         }
+    }
+
+    /// Transcribe the microphone track in the background with the chosen engine.
+    pub fn start_transcription(&mut self) {
+        if self.transcribing.is_some() {
+            return;
+        }
+        let (pkg, engine) = (self.package.clone(), self.caption_engine);
+        let progress = std::sync::Arc::new(crate::whisper::Progress::default());
+        self.transcribe_progress = progress.clone();
+        self.transcribing = Some(std::thread::spawn(move || {
+            objc2::rc::autoreleasepool(|_| crate::transcribe::transcribe_package(&pkg, engine, &progress)).map_err(|e| format!("{e:#}"))
+        }));
     }
 
     pub fn delete_selection(&mut self) {

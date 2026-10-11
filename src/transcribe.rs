@@ -1,6 +1,7 @@
 //! Captions: transcribe the microphone track with Apple's Speech framework
-//! (on-device when the recogniser supports it), producing word timings in
-//! source milliseconds. Results go to `recording/transcript.json`.
+//! (on-device when the recogniser supports it) or Whisper (see `whisper`),
+//! producing word timings in source milliseconds. Results go to
+//! `recording/transcript.json`.
 //!
 //! The audio is downmixed to 16 kHz mono WAV and split into chunks of at most
 //! ~55 s at the quietest point near each boundary, because URL recognition
@@ -30,13 +31,40 @@ const MAX_CHUNK_S: f64 = 55.0;
 /// How far back from the hard limit we look for a quiet split point.
 const SPLIT_WINDOW_S: f64 = 8.0;
 
+/// Speech-to-text engine for captions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// Apple's Speech framework (needs Speech Recognition permission).
+    Apple,
+    Whisper(crate::whisper::Model),
+}
+
+impl Engine {
+    pub fn parse(s: &str) -> Option<Engine> {
+        match s {
+            "apple" => Some(Engine::Apple),
+            _ => crate::whisper::Model::parse(s.strip_prefix("whisper-").unwrap_or(s)).map(Engine::Whisper),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Engine::Apple => "Apple Speech".into(),
+            Engine::Whisper(m) => format!("Whisper {}", m.name()),
+        }
+    }
+}
+
 /// Transcribe a package's microphone track. Returns the number of words.
-pub fn transcribe_package(pkg: &Package) -> Result<usize> {
+pub fn transcribe_package(pkg: &Package, engine: Engine, progress: &std::sync::Arc<crate::whisper::Progress>) -> Result<usize> {
     let rec = pkg.load_recording()?;
     let mic = rec.meta.mic.as_ref().ok_or_else(|| anyhow!("this recording has no microphone track"))?;
     let stereo = crate::media::read_audio(&pkg.rec(&mic.file), mic.track)?;
     let mono = downsample(&stereo);
-    let words = transcribe_samples(&mono)?;
+    let words = match engine {
+        Engine::Apple => transcribe_samples(&mono)?,
+        Engine::Whisper(model) => crate::whisper::transcribe(&mono, model, progress)?,
+    };
     write_json(&pkg.rec("transcript.json"), &words)?;
     Ok(words.len())
 }

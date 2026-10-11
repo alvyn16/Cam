@@ -15,6 +15,7 @@ name = "glide"
 path = "src/main.rs"
 
 [dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
 anyhow = "1.0.104"
 block2 = "0.6"
 clap = { version = "4.6.7", features = ["derive"] }

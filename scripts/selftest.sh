@@ -5,7 +5,7 @@
 # Outputs go to $GLIDE_TEST_DIR (default ~/Movies/glide-tests), never the repo.
 set -eu
 cd "$(dirname "$0")/.."
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target/screenstudio-rs}"
+. scripts/env.sh
 G="$CARGO_TARGET_DIR/release/glide"
 OUT="${GLIDE_TEST_DIR:-$HOME/Movies/glide-tests}/selftest"
 rm -rf "$OUT"; mkdir -p "$OUT"
