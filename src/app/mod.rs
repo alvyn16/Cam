@@ -95,6 +95,20 @@ struct Recording {
 
 type Finished = Result<PathBuf, String>;
 
+/// Scripted run for `GLIDE_GUI_SELFTEST=1` (scripts/selftest.sh): record a
+/// test pattern, stop, open it in the editor, export, check and quit. Never
+/// touches the mouse or needs permissions.
+struct SelfTest {
+    phase: u8,
+    at: Instant,
+    paused_at: Option<Instant>,
+    resumed: bool,
+}
+
+fn log(msg: &str) {
+    eprintln!("selftest: {msg}");
+}
+
 struct App {
     gpu: Option<Gpu>,
     main: Option<Win>,
@@ -112,6 +126,7 @@ struct App {
     last_tick: Instant,
     open_at_launch: Option<PathBuf>,
     permission_note: Option<String>,
+    selftest: Option<SelfTest>,
 }
 
 fn permission_note() -> Option<String> {
@@ -124,7 +139,14 @@ fn permission_note() -> Option<String> {
 
 impl App {
     fn new(open: Option<PathBuf>) -> App {
-        let settings = Settings::load();
+        let selftest = std::env::var_os("GLIDE_GUI_SELFTEST").map(|_| SelfTest { phase: 0, at: Instant::now(), paused_at: None, resumed: false });
+        let mut settings = if selftest.is_some() { Settings::default() } else { Settings::load() };
+        if let Some(dir) = std::env::var_os("GLIDE_OUTPUT_DIR") {
+            settings.projects_dir = Some(PathBuf::from(dir));
+        }
+        if selftest.is_some() {
+            settings.countdown = false;
+        }
         let projects = home::scan_projects(&settings.dir());
         App {
             gpu: None,
@@ -143,6 +165,7 @@ impl App {
             last_tick: Instant::now(),
             open_at_launch: open,
             permission_note: permission_note(),
+            selftest,
         }
     }
 
@@ -223,7 +246,9 @@ impl App {
             w.window.focus_window();
             w.window.request_redraw();
         }
-        macos::activate();
+        if self.selftest.is_none() {
+            macos::activate();
+        }
     }
 
     fn open_project(&mut self, el: &ActiveEventLoop, path: PathBuf) {
@@ -242,6 +267,9 @@ impl App {
 
     fn recorder_options(&self) -> recorder::Options {
         let s = &self.settings;
+        if self.selftest.is_some() {
+            return recorder::Options { target: Target::Pattern, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()) };
+        }
         let target = match s.source {
             SourceKind::Display => Target::Display { id: s.display },
             SourceKind::Window => match s.window {
@@ -270,7 +298,9 @@ impl App {
             return;
         }
         self.error = None;
-        self.settings.save();
+        if self.selftest.is_none() {
+            self.settings.save();
+        }
         if let View::Editor(ed) = &mut self.view {
             ed.save();
         }
@@ -401,6 +431,7 @@ impl App {
                 }
             }
         }
+        self.selftest_step(el);
         let clock = match &self.recording {
             Some(Recording { rec: Some(r), .. }) => crate::capture::record::clock(r.elapsed()),
             Some(Recording { countdown_until: Some(t), .. }) => format!("{}", t.saturating_duration_since(Instant::now()).as_secs() + 1),
@@ -410,6 +441,90 @@ impl App {
         if let Some(m) = &mut self.menubar {
             m.update(&menubar::View { recording: self.recording.is_some(), paused, finishing: self.finishing, clock: &clock });
         }
+    }
+
+    fn selftest_step(&mut self, el: &ActiveEventLoop) {
+        let Some(st) = &mut self.selftest else { return };
+        let since = st.at.elapsed();
+        let fail = |msg: String| {
+            log(&format!("FAIL {msg}"));
+            std::process::exit(1);
+        };
+        if since > Duration::from_secs(120) {
+            fail(format!("timed out in phase {}", st.phase));
+        }
+        match st.phase {
+            0 if since > Duration::from_millis(800) => {
+                log(&format!("launched main_window={} menubar={}", self.main.is_some(), self.menubar.is_some()));
+                st.phase = 1;
+                st.at = Instant::now();
+                push(Cmd::ToggleRecording);
+            }
+            1 => {
+                if let Some(Recording { rec: Some(r), .. }) = &self.recording {
+                    match st.paused_at {
+                        None if r.elapsed() >= 1.0 => {
+                            st.paused_at = Some(Instant::now());
+                            push(Cmd::TogglePause);
+                        }
+                        Some(t) if !st.resumed && t.elapsed() > Duration::from_millis(700) => {
+                            log(&format!("paused={}", r.is_paused()));
+                            if !r.is_paused() {
+                                fail("pause had no effect".into());
+                            }
+                            st.resumed = true;
+                            push(Cmd::TogglePause);
+                        }
+                        _ => {}
+                    }
+                    if st.resumed && r.elapsed() >= 3.0 {
+                        log(&format!("recording widget={} elapsed={:.1}s", self.widget.is_some(), r.elapsed()));
+                        st.phase = 2;
+                        push(Cmd::ToggleRecording);
+                    }
+                }
+                if let Some(e) = &self.error {
+                    fail(e.clone());
+                }
+            }
+            2 => {
+                if let Some(e) = &self.error {
+                    fail(e.clone());
+                }
+                if let View::Editor(ed) = &mut self.view {
+                    log(&format!(
+                        "editor opened {} duration={:.0}ms zooms={} mouse_events={}",
+                        ed.package.root.display(),
+                        ed.duration(),
+                        ed.project.timeline.zooms.len(),
+                        ed.rec.mouse.len()
+                    ));
+                    ed.start_export();
+                    st.phase = 3;
+                }
+            }
+            3 => {
+                if let View::Editor(ed) = &self.view
+                    && let Some(res) = &ed.export.result
+                {
+                    match res {
+                        Ok((path, stats)) => {
+                            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                            log(&format!("exported {} bytes={size} {stats:?}", path.display()));
+                            if size == 0 {
+                                fail("empty export".into());
+                            }
+                            log("PASS");
+                            st.phase = 4;
+                            push(Cmd::Quit);
+                        }
+                        Err(e) => fail(format!("export: {e}")),
+                    }
+                }
+            }
+            _ => {}
+        }
+        let _ = el;
     }
 
     fn draw_main(&mut self, ui: &mut egui::Ui, renderer: &mut egui_wgpu::Renderer) {

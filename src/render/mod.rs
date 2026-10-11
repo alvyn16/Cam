@@ -4,6 +4,7 @@
 
 pub mod art;
 pub mod gpu;
+pub mod icon;
 pub mod interop;
 pub mod text;
 

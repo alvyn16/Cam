@@ -110,6 +110,13 @@ enum Cmd {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Write the app icon as a macOS .iconset folder (or one PNG with --png).
+    #[command(hide = true)]
+    Icon {
+        output: PathBuf,
+        #[arg(long)]
+        png: Option<u32>,
+    },
     /// Transcribe a project's microphone track into captions.
     Transcribe { project: PathBuf },
     /// List displays, windows, cameras and microphones.
@@ -151,6 +158,14 @@ fn main() -> Result<()> {
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
         Some(Cmd::Gui { project }) => glide::app::run(project),
+        Some(Cmd::Icon { output, png }) => {
+            match png {
+                Some(size) => image::save_buffer(&output, &glide::render::icon::render(size), size, size, image::ExtendedColorType::Rgba8)?,
+                None => glide::render::icon::write_iconset(&output)?,
+            }
+            println!("{}", output.display());
+            Ok(())
+        }
         Some(Cmd::Snapshot { project, tab, zoom, export_sheet, light, at, output }) => {
             use glide::app::editor::Tab;
             let tab = tab.map(|t| {

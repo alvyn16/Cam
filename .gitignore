@@ -5,3 +5,4 @@ target/
 *.gif
 /recordings/
 .env
+/dist/

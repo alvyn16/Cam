@@ -274,7 +274,7 @@ impl Editor {
         self.selection = Selection::Zoom(new_id);
     }
 
-    fn start_export(&mut self) {
+    pub fn start_export(&mut self) {
         let settings = self.project.export;
         let output = export::default_output(&self.package.root, &settings);
         let job = Job {
