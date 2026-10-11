@@ -25,7 +25,10 @@ else
   ko "synthetic export"
 fi
 
-if GLIDE_GUI_SELFTEST=1 GLIDE_OUTPUT_DIR="$OUT/gui" "$G" gui >"$OUT/gui.log" 2>&1 && grep -q 'selftest: PASS' "$OUT/gui.log"; then
+code=0
+GLIDE_GUI_SELFTEST=1 GLIDE_OUTPUT_DIR="$OUT/gui" "$G" gui >"$OUT/gui.log" 2>&1 || code=$?
+echo "exit status $code" >>"$OUT/gui.log"
+if [ "$code" -eq 0 ] && grep -q 'selftest: PASS' "$OUT/gui.log"; then
   ok "gui app ($(grep -o 'elapsed=[0-9.]*s' "$OUT/gui.log"), $(grep -o 'frames: [0-9]*' "$OUT/gui.log"))"
 else
   ko "gui app"

@@ -91,13 +91,16 @@ struct Win {
     repaint_at: Option<Instant>,
     /// Clear to transparent and skip titlebar chrome (area picker).
     overlay: bool,
+    /// The display an overlay covers (0 for other windows).
+    display: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Main,
     Widget,
-    Overlay,
+    /// The picker overlay on this display.
+    Overlay(u32),
 }
 
 /// Area picker state, in overlay-window points (= display points).
@@ -160,7 +163,8 @@ struct App {
     gpu: Option<Gpu>,
     main: Option<Win>,
     widget: Option<Win>,
-    overlay: Option<Win>,
+    /// Picker overlays, one per display.
+    overlays: Vec<Win>,
     area: AreaPick,
     view: View,
     settings: Settings,
@@ -201,7 +205,7 @@ impl App {
             gpu: None,
             main: None,
             widget: None,
-            overlay: None,
+            overlays: vec![],
             area: AreaPick::default(),
             view: View::Home,
             devices: Devices::load(),
@@ -237,7 +241,7 @@ impl App {
 
     /// Borderless transparent window covering a display (area picker).
     fn open_overlay(&mut self, el: &ActiveEventLoop, display: u32) -> Win {
-        let (_, x, y, w, h) = macos::display_frame(display);
+        let (id, x, y, w, h) = macos::display_frame(display);
         let attrs = Window::default_attributes()
             .with_title("Select Area")
             .with_decorations(false)
@@ -246,7 +250,27 @@ impl App {
             .with_position(winit::dpi::LogicalPosition::new(x, y))
             .with_inner_size(winit::dpi::LogicalSize::new(w, h))
             .with_window_level(WindowLevel::AlwaysOnTop);
-        self.make_window(el, attrs, true)
+        let mut win = self.make_window(el, attrs, true);
+        win.display = id;
+        win
+    }
+
+    /// Cover every display with a picker overlay (once) and focus the one
+    /// on `display`.
+    fn open_overlays(&mut self, el: &ActiveEventLoop, display: u32) {
+        if self.overlays.is_empty() {
+            for d in macos::display_ids() {
+                let w = self.open_overlay(el, d);
+                self.overlays.push(w);
+            }
+        }
+        for w in &self.overlays {
+            if w.display == display {
+                w.window.focus_window();
+            }
+            w.window.request_redraw();
+        }
+        macos::activate();
     }
 
     fn make_window(&mut self, el: &ActiveEventLoop, attrs: winit::window::WindowAttributes, overlay: bool) -> Win {
@@ -311,7 +335,7 @@ impl App {
             macos::inset_traffic_lights(&window, x, y);
         }
         window.request_redraw();
-        Win { window, surface, config, egui, ctx, renderer, repaint_at: None, overlay }
+        Win { window, surface, config, egui, ctx, renderer, repaint_at: None, overlay, display: 0 }
     }
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
@@ -534,15 +558,7 @@ impl App {
                     .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)).intersect(screen))
                     .filter(|r| r.width() > 8.0 && r.height() > 8.0);
                 self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false, windows: None };
-                if self.overlay.is_none() {
-                    let w = self.open_overlay(el, display);
-                    self.overlay = Some(w);
-                }
-                if let Some(w) = &self.overlay {
-                    w.window.focus_window();
-                    w.window.request_redraw();
-                }
-                macos::activate();
+                self.open_overlays(el, id);
             }
             Cmd::SelectWindow(record_after) => {
                 if self.recording.is_some() {
@@ -551,17 +567,9 @@ impl App {
                 // Pick on the display under the pointer.
                 let display = macos::display_under_pointer();
                 let (id, ..) = macos::display_frame(display);
-                let windows = Some(WindowMode { list: winpick::list(id), ..Default::default() });
+                let windows = Some(WindowMode { list: winpick::list_all(), ..Default::default() });
                 self.area = AreaPick { rect: None, drag: None, record_after, display: id, closed: false, windows };
-                if self.overlay.is_none() {
-                    let w = self.open_overlay(el, display);
-                    self.overlay = Some(w);
-                }
-                if let Some(w) = &self.overlay {
-                    w.window.focus_window();
-                    w.window.request_redraw();
-                }
-                macos::activate();
+                self.open_overlays(el, id);
             }
             Cmd::Quit => {
                 if let View::Editor(ed) = &mut self.view {
@@ -643,12 +651,12 @@ impl App {
                 push(Cmd::SelectArea(false));
             }
             10 if since > Duration::from_millis(600) => {
-                let Some(w) = &self.overlay else {
+                let Some(w) = self.overlays.iter().find(|w| w.display == self.area.display) else {
                     fail("area picker did not open".into());
                     return;
                 };
                 let size = w.window.inner_size();
-                log(&format!("area picker open {}x{} px", size.width, size.height));
+                log(&format!("area picker open {}x{} px, {} displays covered", size.width, size.height, self.overlays.len()));
                 if let (Some(dir), Some(num)) = (std::env::var_os("GLIDE_SELFTEST_SHOTS"), macos::window_number(&w.window)) {
                     let out = PathBuf::from(dir).join("area-picker.png");
                     let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
@@ -660,8 +668,8 @@ impl App {
             }
             11 if since > Duration::from_millis(300) => {
                 let a = self.settings.area;
-                log(&format!("area saved source={:?} area={:?} overlay_closed={}", self.settings.source, a, self.overlay.is_none()));
-                if self.settings.source != SourceKind::Area || a != [200.0, 150.0, 640.0, 400.0] || self.overlay.is_some() {
+                log(&format!("area saved source={:?} area={:?} overlay_closed={}", self.settings.source, a, self.overlays.is_empty()));
+                if self.settings.source != SourceKind::Area || a != [200.0, 150.0, 640.0, 400.0] || !self.overlays.is_empty() {
                     fail("area picker result".into());
                 }
                 st.phase = 12;
@@ -669,31 +677,36 @@ impl App {
                 push(Cmd::SelectWindow(false));
             }
             12 if since > Duration::from_millis(800) => {
-                let (Some(w), Some(wm)) = (&self.overlay, &mut self.area.windows) else {
+                let (Some(w), Some(wm)) = (self.overlays.first(), &mut self.area.windows) else {
                     fail("window picker did not open".into());
                     return;
                 };
                 // Highlight the frontmost window first (as a click would), then
                 // check again after it has been drawn.
                 if wm.selected.is_none() && !wm.list.is_empty() {
-                    wm.selected = wm.list.first().map(|w| w.entry.id);
-                    w.window.request_redraw();
+                    wm.selected = wm.list.iter().find(|x| x.display == w.display).or(wm.list.first()).map(|x| x.entry.id);
+                    for o in &self.overlays {
+                        o.window.request_redraw();
+                    }
                     st.at = Instant::now();
                     return;
                 }
-                log(&format!("window picker open with {} windows, selected {:?}", wm.list.len(), wm.selected));
-                if let (Some(dir), Some(num)) = (std::env::var_os("GLIDE_SELFTEST_SHOTS"), macos::window_number(&w.window)) {
-                    let out = PathBuf::from(dir).join("window-picker.png");
-                    let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
-                    log(&format!("window picker screenshot {} ok={ok}", out.display()));
+                log(&format!("window picker open on {} displays with {} windows, selected {:?}", self.overlays.len(), wm.list.len(), wm.selected));
+                if let Some(dir) = std::env::var_os("GLIDE_SELFTEST_SHOTS") {
+                    for o in &self.overlays {
+                        let Some(num) = macos::window_number(&o.window) else { continue };
+                        let out = PathBuf::from(&dir).join(format!("window-picker-{}.png", o.display));
+                        let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
+                        log(&format!("window picker screenshot {} ok={ok}", out.display()));
+                    }
                 }
                 st.phase = 13;
                 st.at = Instant::now();
                 self.finish_window(None);
             }
             13 if since > Duration::from_millis(300) => {
-                log(&format!("window picker cancelled overlay_closed={} source={:?}", self.overlay.is_none(), self.settings.source));
-                if self.overlay.is_some() || self.settings.source != SourceKind::Area {
+                log(&format!("window picker cancelled overlay_closed={} source={:?}", self.overlays.is_empty(), self.settings.source));
+                if !self.overlays.is_empty() || self.settings.source != SourceKind::Area {
                     fail("window picker cancel".into());
                 }
                 st.phase = 1;
@@ -891,15 +904,37 @@ impl App {
     }
 
     /// Area picker: dim the display, drag a rect, confirm with Return.
-    fn draw_overlay(&mut self, ui: &mut egui::Ui) {
+    /// Picker overlay on `display`: the area picker, or the window picker.
+    fn draw_overlay(&mut self, ui: &mut egui::Ui, display: u32) {
         use egui::{Align2, FontId, Pos2, Rect, Stroke, pos2};
         if self.area.windows.is_some() {
-            self.draw_window_picker(ui);
+            self.draw_window_picker(ui, display);
             return;
         }
         let full = ui.max_rect();
         let resp = ui.interact(full, ui.id().with("area"), Sense::click_and_drag());
         let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+        // The area lives on one display; dragging on another moves it there.
+        if resp.drag_started() && self.area.display != display {
+            self.area.display = display;
+            self.area.rect = None;
+            for w in &self.overlays {
+                w.window.request_redraw();
+            }
+        }
+        if self.area.display != display {
+            ui.painter().rect_filled(full, 0.0, Color32::from_black_alpha(120));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            let hint = "Drag to select an area  ·  Esc to cancel";
+            let galley = ui.painter().layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
+            let bg = Rect::from_center_size(pos2(full.center().x, full.top() + 60.0), galley.size() + vec2(28.0, 14.0));
+            ui.painter().rect_filled(bg, egui::CornerRadius::same(10), Color32::from_black_alpha(170));
+            ui.painter().galley(bg.center() - galley.size() / 2.0, galley, Color32::WHITE);
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.finish_area(None);
+            }
+            return;
+        }
         let a = &mut self.area;
         let corners = |r: Rect| [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()];
         if resp.drag_started()
@@ -999,22 +1034,28 @@ impl App {
     /// Window picker: the windows on this display are outlined; the one under
     /// the pointer (or the clicked one) is highlighted with its name, size,
     /// Resize menu and buttons to use it or adjust an area from it.
-    fn draw_window_picker(&mut self, ui: &mut egui::Ui) {
+    fn draw_window_picker(&mut self, ui: &mut egui::Ui, display: u32) {
         use egui::{Align2, FontId, Rect, Stroke, pos2};
         let full = ui.max_rect();
         let resp = ui.interact(full, ui.id().with("windows"), Sense::click());
         let pointer = ui.input(|i| i.pointer.hover_pos());
-        let (record_after, display) = (self.area.record_after, self.area.display);
+        let record_after = self.area.record_after;
         let Some(wm) = self.area.windows.as_mut() else { return };
-        let hovered = pointer.and_then(|p| winpick::under(&wm.list, p)).map(|w| w.entry.id);
+        // This overlay shows the windows on its own display.
+        let mine: Vec<winpick::PickWindow> = wm.list.iter().filter(|w| w.display == display).cloned().collect();
+        let hovered = pointer.and_then(|p| winpick::under(&mine, p)).map(|w| w.entry.id);
         if resp.secondary_clicked() {
             wm.menu_for = hovered;
         }
         if resp.clicked() {
             wm.selected = hovered;
+            // The previous selection may be drawn on another display.
+            for w in &self.overlays {
+                w.window.request_redraw();
+            }
         }
-        let focus = wm.selected.or(hovered).and_then(|id| wm.list.iter().find(|w| w.entry.id == id)).cloned();
-        let visible: Vec<Rect> = wm.list.iter().filter(|w| !winpick::is_ignored(w.entry.id)).map(|w| w.rect).collect();
+        let focus = wm.selected.or(hovered).and_then(|id| mine.iter().find(|w| w.entry.id == id)).cloned();
+        let visible: Vec<Rect> = mine.iter().filter(|w| !winpick::is_ignored(w.entry.id)).map(|w| w.rect).collect();
 
         let painter = ui.painter().clone();
         let dim = Color32::from_black_alpha(110);
@@ -1123,11 +1164,15 @@ impl App {
         let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
 
         if refresh && let Some(wm) = &mut self.area.windows {
-            wm.list = winpick::list(display);
+            wm.list = winpick::list_all();
         }
         if let Some(r) = adjust {
             self.area.windows = None;
+            self.area.display = display;
             self.area.rect = Some(r);
+            for w in &self.overlays {
+                w.window.request_redraw();
+            }
         } else if whole_display {
             self.settings.source = SourceKind::Display;
             self.settings.display = display;
@@ -1144,7 +1189,7 @@ impl App {
     fn finish_window(&mut self, id: Option<u32>) {
         self.area.closed = true;
         self.area.windows = None;
-        self.overlay = None;
+        self.overlays.clear();
         match id {
             Some(id) => {
                 self.settings.source = SourceKind::Window;
@@ -1166,7 +1211,7 @@ impl App {
     /// Close the area picker; with a rect, save it (and record if asked).
     fn finish_area(&mut self, rect: Option<egui::Rect>) {
         self.area.closed = true;
-        self.overlay = None;
+        self.overlays.clear();
         match rect {
             Some(r) => {
                 self.settings.source = SourceKind::Area;
@@ -1187,25 +1232,43 @@ impl App {
             Some(Which::Main)
         } else if is(&self.widget) {
             Some(Which::Widget)
-        } else if is(&self.overlay) {
-            Some(Which::Overlay)
         } else {
-            None
+            self.overlays.iter().find(|w| w.window.id() == id).map(|w| Which::Overlay(w.display))
         }
     }
 
-    fn slot(&mut self, which: Which) -> &mut Option<Win> {
+    /// Take a window out for drawing (put back with `put_back`).
+    fn take_window(&mut self, which: Which) -> Option<Win> {
         match which {
-            Which::Main => &mut self.main,
-            Which::Widget => &mut self.widget,
-            Which::Overlay => &mut self.overlay,
+            Which::Main => self.main.take(),
+            Which::Widget => self.widget.take(),
+            Which::Overlay(d) => {
+                let i = self.overlays.iter().position(|w| w.display == d)?;
+                Some(self.overlays.remove(i))
+            }
+        }
+    }
+
+    fn window_mut(&mut self, which: Which) -> Option<&mut Win> {
+        match which {
+            Which::Main => self.main.as_mut(),
+            Which::Widget => self.widget.as_mut(),
+            Which::Overlay(d) => self.overlays.iter_mut().find(|w| w.display == d),
+        }
+    }
+
+    fn put_back(&mut self, which: Which, win: Win) {
+        match which {
+            Which::Main => self.main = Some(win),
+            Which::Widget => self.widget = Some(win),
+            Which::Overlay(_) => self.overlays.push(win),
         }
     }
 
     fn redraw(&mut self, id: WindowId) {
         let Some(which) = self.which(id) else { return };
         let Some(gpu) = self.gpu.clone() else { return };
-        let Some(mut win) = self.slot(which).take() else { return };
+        let Some(mut win) = self.take_window(which) else { return };
         let input = win.egui.take_egui_input(&win.window);
         let ctx = win.ctx.clone();
         let renderer = &mut win.renderer;
@@ -1214,9 +1277,9 @@ impl App {
         let out = ctx.run_ui(input, |ui| match which {
             Which::Main => self.draw_main(ui, renderer),
             Which::Widget => self.draw_widget(ui),
-            Which::Overlay => {
+            Which::Overlay(display) => {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                    self.draw_overlay(ui);
+                    self.draw_overlay(ui, display);
                 });
                 keep = !self.area.closed;
             }
@@ -1285,7 +1348,7 @@ impl App {
             let _ = win.window.drag_window();
         }
         if keep {
-            *self.slot(which) = Some(win);
+            self.put_back(which, win);
         }
     }
 }
@@ -1306,7 +1369,7 @@ impl ApplicationHandler for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
         self.tick(el);
-        for w in [self.main.as_ref(), self.widget.as_ref(), self.overlay.as_ref()].into_iter().flatten() {
+        for w in [self.main.as_ref(), self.widget.as_ref()].into_iter().flatten().chain(&self.overlays) {
             w.window.request_redraw();
         }
     }
@@ -1322,8 +1385,10 @@ impl ApplicationHandler for App {
                     push(Cmd::Quit);
                 }
                 Which::Widget => push(Cmd::Cancel),
-                Which::Overlay => {
-                    self.overlay = None;
+                Which::Overlay(_) => {
+                    self.area.closed = true;
+                    self.area.windows = None;
+                    self.overlays.clear();
                     push(Cmd::ShowWindow);
                 }
             }
@@ -1334,7 +1399,7 @@ impl ApplicationHandler for App {
             return;
         }
         let gpu = self.gpu.clone();
-        let Some(win) = self.slot(which).as_mut() else { return };
+        let Some(win) = self.window_mut(which) else { return };
         let resp = win.egui.on_window_event(&win.window, &event);
         match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -1406,7 +1471,7 @@ impl ApplicationHandler for App {
         if live && let Some(w) = &self.widget {
             w.window.request_redraw();
         }
-        for w in [self.main.as_mut(), self.widget.as_mut(), self.overlay.as_mut()].into_iter().flatten() {
+        for w in [self.main.as_mut(), self.widget.as_mut()].into_iter().flatten().chain(self.overlays.iter_mut()) {
             if let Some(t) = w.repaint_at {
                 if t <= now {
                     w.repaint_at = None;

@@ -102,6 +102,8 @@ scripts/bench.sh                    # performance measurements
 - Capture pipeline, app chrome, menu bar and hotkey code build on
   [rec-rs](https://github.com/michaelshimeles/rec-rs) by Michael Shimeles
   (MIT OR Apache-2.0).
+- Captions use [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT)
+  through whisper-rs; Whisper models (MIT) are downloaded on first use.
 - Behaviour analysis made with REA.
 - Inter typeface by Rasmus Andersson (SIL Open Font License, `assets/fonts/OFL.txt`).
 

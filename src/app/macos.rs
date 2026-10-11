@@ -139,12 +139,24 @@ unsafe extern "C" {
     fn CGDisplayBounds(display: u32) -> objc2_core_foundation::CGRect;
     fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
     fn CGEventGetLocation(event: *const std::ffi::c_void) -> objc2_core_foundation::CGPoint;
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGGetDisplaysWithPoint(point: objc2_core_foundation::CGPoint, max: u32, displays: *mut u32, count: *mut u32) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+/// IDs of the active displays (main display first).
+pub fn display_ids() -> Vec<u32> {
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    // SAFETY: the buffer holds up to 16 ids and n reports how many were set.
+    if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != 0 || n == 0 {
+        return vec![display_frame(0).0];
+    }
+    ids[..n as usize].to_vec()
 }
 
 /// The display under the mouse pointer (0 when unknown = main display).

@@ -16,6 +16,8 @@ pub struct PickWindow {
     pub title: String,
     /// Frame in overlay points (display-relative).
     pub rect: egui::Rect,
+    /// The display (overlay) it is drawn on.
+    pub display: u32,
 }
 
 /// Windows hidden from the picker for the rest of the session.
@@ -33,10 +35,15 @@ pub fn is_ignored(id: u32) -> bool {
     IGNORED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&id))
 }
 
+/// Recordable windows on every display, frontmost first per display.
+pub fn list_all() -> Vec<PickWindow> {
+    macos::display_ids().into_iter().flat_map(list).collect()
+}
+
 /// Recordable windows (not Glide's own) that show on `display`,
 /// frontmost first.
 pub fn list(display: u32) -> Vec<PickWindow> {
-    let (_, dx, dy, dw, dh) = macos::display_frame(display);
+    let (display_id, dx, dy, dw, dh) = macos::display_frame(display);
     let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(dw as f32, dh as f32));
     let Ok(all) = screen::windows() else { return vec![] };
     let me = std::process::id() as i32;
@@ -64,7 +71,7 @@ pub fn list(display: u32) -> Vec<PickWindow> {
             let z = order.iter().position(|&id| id == w.id).unwrap_or(usize::MAX);
             let label = if w.title.is_empty() { w.app.clone() } else { format!("{} — {}", w.app, w.title) };
             let entry = WindowEntry { id: w.id, label, size: w.size, display };
-            Some((z, PickWindow { entry, app: w.app, title: w.title, rect }))
+            Some((z, PickWindow { entry, app: w.app, title: w.title, rect, display: display_id }))
         })
         .collect();
     out.sort_by_key(|(z, _)| *z);
@@ -86,6 +93,7 @@ mod tests {
             app: String::new(),
             title: String::new(),
             rect: egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+            display: 1,
         }
     }
 
