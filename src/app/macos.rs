@@ -132,3 +132,25 @@ pub fn save_desktop_wallpaper(dest: &std::path::Path) -> anyhow::Result<()> {
     std::fs::write(dest, png.to_vec())?;
     Ok(())
 }
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(display: u32) -> objc2_core_foundation::CGRect;
+}
+
+/// A display's frame in global points (top-left origin of the main display);
+/// id 0 means the main display. Returns (id, x, y, w, h).
+pub fn display_frame(id: u32) -> (u32, f64, f64, f64, f64) {
+    // SAFETY: plain CoreGraphics queries.
+    unsafe {
+        let id = if id == 0 { CGMainDisplayID() } else { id };
+        let r = CGDisplayBounds(id);
+        (id, r.origin.x, r.origin.y, r.size.width, r.size.height)
+    }
+}
+
+/// The window's AppKit window number (CGWindowID), for screencapture.
+pub fn window_number(window: &Window) -> Option<isize> {
+    ns_window(window).map(|w| w.windowNumber())
+}

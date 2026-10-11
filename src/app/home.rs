@@ -205,6 +205,7 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
 pub enum Action {
     None,
     Record,
+    SelectArea,
     Open(PathBuf),
     RequestPermissions,
 }
@@ -271,20 +272,27 @@ pub fn ui(
                         }
                     }
                     SourceKind::Area => {
-                        caption(ui, "Region of the main display, in points:");
                         ui.horizontal(|ui| {
-                            for (i, l) in ["x", "y", "w", "h"].iter().enumerate() {
-                                ui.label(*l);
-                                ui.add(egui::DragValue::new(&mut s.area[i]).speed(4.0).range(0.0..=8000.0));
+                            if ui.button("Select area…").on_hover_text("Drag a region on the screen").clicked() {
+                                action = Action::SelectArea;
                             }
+                            caption(ui, &format!("{:.0} × {:.0} at {:.0}, {:.0}", s.area[2], s.area[3], s.area[0], s.area[1]));
                         });
-                        ui.horizontal(|ui| {
-                            for (name, w, h) in [("1280×720", 1280.0, 720.0), ("1920×1080", 1920.0, 1080.0), ("1080×1080", 1080.0, 1080.0)] {
-                                if ui.small_button(name).clicked() {
-                                    s.area[2] = w;
-                                    s.area[3] = h;
+                        egui::CollapsingHeader::new("Exact size").show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (i, l) in ["x", "y", "w", "h"].iter().enumerate() {
+                                    ui.label(*l);
+                                    ui.add(egui::DragValue::new(&mut s.area[i]).speed(4.0).range(0.0..=8000.0));
                                 }
-                            }
+                            });
+                            ui.horizontal(|ui| {
+                                for (name, w, h) in [("1280×720", 1280.0, 720.0), ("1920×1080", 1920.0, 1080.0), ("1080×1080", 1080.0, 1080.0)] {
+                                    if ui.small_button(name).clicked() {
+                                        s.area[2] = w;
+                                        s.area[3] = h;
+                                    }
+                                }
+                            });
                         });
                     }
                 }

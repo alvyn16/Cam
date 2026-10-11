@@ -42,6 +42,8 @@ pub enum Cmd {
     ShowWindow,
     OpenFolder,
     Open(PathBuf),
+    /// Show the area picker; `true` starts recording when confirmed.
+    SelectArea(bool),
     Quit,
 }
 
@@ -80,6 +82,33 @@ struct Win {
     ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
     repaint_at: Option<Instant>,
+    /// Clear to transparent and skip titlebar chrome (area picker).
+    overlay: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Which {
+    Main,
+    Widget,
+    Overlay,
+}
+
+/// Area picker state, in overlay-window points (= display points).
+#[derive(Default)]
+struct AreaPick {
+    rect: Option<egui::Rect>,
+    drag: Option<AreaDrag>,
+    record_after: bool,
+    display: u32,
+    /// Set when the picker is confirmed or cancelled; the window closes.
+    closed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AreaDrag {
+    New(egui::Pos2),
+    Move(egui::Vec2),
+    Corner(egui::Pos2),
 }
 
 enum View {
@@ -113,6 +142,8 @@ struct App {
     gpu: Option<Gpu>,
     main: Option<Win>,
     widget: Option<Win>,
+    overlay: Option<Win>,
+    area: AreaPick,
     view: View,
     settings: Settings,
     devices: Devices,
@@ -152,6 +183,8 @@ impl App {
             gpu: None,
             main: None,
             widget: None,
+            overlay: None,
+            area: AreaPick::default(),
             view: View::Home,
             devices: Devices::load(),
             settings,
@@ -181,6 +214,24 @@ impl App {
         if floating {
             attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop).with_resizable(false);
         }
+        self.make_window(el, attrs, false)
+    }
+
+    /// Borderless transparent window covering a display (area picker).
+    fn open_overlay(&mut self, el: &ActiveEventLoop, display: u32) -> Win {
+        let (_, x, y, w, h) = macos::display_frame(display);
+        let attrs = Window::default_attributes()
+            .with_title("Select Area")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_position(winit::dpi::LogicalPosition::new(x, y))
+            .with_inner_size(winit::dpi::LogicalSize::new(w, h))
+            .with_window_level(WindowLevel::AlwaysOnTop);
+        self.make_window(el, attrs, true)
+    }
+
+    fn make_window(&mut self, el: &ActiveEventLoop, attrs: winit::window::WindowAttributes, overlay: bool) -> Win {
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         let surface = match &self.gpu {
             Some(g) => g.instance.create_surface(window.clone()).expect("surface"),
@@ -214,7 +265,14 @@ impl App {
             height: px.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: if overlay {
+                [wgpu::CompositeAlphaMode::PreMultiplied, wgpu::CompositeAlphaMode::PostMultiplied]
+                    .into_iter()
+                    .find(|m| caps.alpha_modes.contains(m))
+                    .unwrap_or(caps.alpha_modes[0])
+            } else {
+                caps.alpha_modes[0]
+            },
             view_formats: vec![],
             color_space: Default::default(),
         };
@@ -230,10 +288,12 @@ impl App {
             window.theme(),
             Some(g.device.limits().max_texture_dimension_2d as usize),
         );
-        let (x, y) = theme::TRAFFIC_LIGHTS;
-        macos::inset_traffic_lights(&window, x, y);
+        if !overlay {
+            let (x, y) = theme::TRAFFIC_LIGHTS;
+            macos::inset_traffic_lights(&window, x, y);
+        }
         window.request_redraw();
-        Win { window, surface, config, egui, ctx, renderer, repaint_at: None }
+        Win { window, surface, config, egui, ctx, renderer, repaint_at: None, overlay }
     }
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
@@ -385,6 +445,27 @@ impl App {
             Cmd::ShowWindow => self.show_main(el),
             Cmd::OpenFolder => macos::open_folder(&self.settings.dir()),
             Cmd::Open(p) => self.open_project(el, p),
+            Cmd::SelectArea(record_after) => {
+                if self.recording.is_some() {
+                    return;
+                }
+                let display = self.settings.display;
+                let (id, ..) = macos::display_frame(display);
+                let s = &self.settings;
+                // Start from the saved area when it was on this display.
+                let rect = (s.source == SourceKind::Area && s.area[2] > 8.0 && s.area[3] > 8.0)
+                    .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)));
+                self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false };
+                if self.overlay.is_none() {
+                    let w = self.open_overlay(el, display);
+                    self.overlay = Some(w);
+                }
+                if let Some(w) = &self.overlay {
+                    w.window.focus_window();
+                    w.window.request_redraw();
+                }
+                macos::activate();
+            }
             Cmd::Quit => {
                 if let View::Editor(ed) = &mut self.view {
                     ed.save();
@@ -456,6 +537,32 @@ impl App {
         match st.phase {
             0 if since > Duration::from_millis(800) => {
                 log(&format!("launched main_window={} menubar={}", self.main.is_some(), self.menubar.is_some()));
+                st.phase = 10;
+                st.at = Instant::now();
+                push(Cmd::SelectArea(false));
+            }
+            10 if since > Duration::from_millis(600) => {
+                let Some(w) = &self.overlay else {
+                    fail("area picker did not open".into());
+                    return;
+                };
+                let size = w.window.inner_size();
+                log(&format!("area picker open {}x{} px", size.width, size.height));
+                if let (Some(dir), Some(num)) = (std::env::var_os("GLIDE_SELFTEST_SHOTS"), macos::window_number(&w.window)) {
+                    let out = PathBuf::from(dir).join("area-picker.png");
+                    let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
+                    log(&format!("area picker screenshot {} ok={ok}", out.display()));
+                }
+                st.phase = 11;
+                st.at = Instant::now();
+                self.finish_area(Some(egui::Rect::from_min_size(egui::pos2(200.0, 150.0), vec2(640.0, 400.0))));
+            }
+            11 if since > Duration::from_millis(300) => {
+                let a = self.settings.area;
+                log(&format!("area saved source={:?} area={:?} overlay_closed={}", self.settings.source, a, self.overlay.is_none()));
+                if self.settings.source != SourceKind::Area || a != [200.0, 150.0, 640.0, 400.0] || self.overlay.is_some() {
+                    fail("area picker result".into());
+                }
                 st.phase = 1;
                 st.at = Instant::now();
                 push(Cmd::ToggleRecording);
@@ -551,7 +658,10 @@ impl App {
                 let note = self.permission_note.clone();
                 let action = home::ui(ui, &mut self.settings, &mut self.devices, &mut self.projects, &mut self.thumbs, note.as_deref());
                 match action {
+                    // Area recordings confirm the region first.
+                    home::Action::Record if self.settings.source == SourceKind::Area => push(Cmd::SelectArea(true)),
                     home::Action::Record => push(Cmd::ToggleRecording),
+                    home::Action::SelectArea => push(Cmd::SelectArea(false)),
                     home::Action::Open(p) => push(Cmd::Open(p)),
                     home::Action::RequestPermissions => {
                         std::thread::spawn(|| crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60)));
@@ -617,22 +727,162 @@ impl App {
         });
     }
 
-    fn redraw(&mut self, which: WindowId) {
-        let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == which);
-        let is_widget = self.widget.as_ref().is_some_and(|w| w.window.id() == which);
-        if !is_main && !is_widget {
-            return;
+    /// Area picker: dim the display, drag a rect, confirm with Return.
+    fn draw_overlay(&mut self, ui: &mut egui::Ui) {
+        use egui::{Align2, FontId, Pos2, Rect, Stroke, pos2};
+        let full = ui.max_rect();
+        let resp = ui.interact(full, ui.id().with("area"), Sense::click_and_drag());
+        let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+        let a = &mut self.area;
+        let corners = |r: Rect| [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()];
+        if resp.drag_started()
+            && let Some(p) = pointer
+        {
+            a.drag = Some(match a.rect {
+                Some(r) => match corners(r).into_iter().find(|c| c.distance(p) < 12.0) {
+                    // Resize from the opposite (anchored) corner.
+                    Some(c) => AreaDrag::Corner(pos2(r.left() + r.right() - c.x, r.top() + r.bottom() - c.y)),
+                    None if r.contains(p) => AreaDrag::Move(p - r.min),
+                    None => AreaDrag::New(p),
+                },
+                None => AreaDrag::New(p),
+            });
         }
+        if resp.dragged()
+            && let (Some(d), Some(p)) = (a.drag, pointer)
+        {
+            let p = p.clamp(full.min, full.max);
+            a.rect = Some(match d {
+                AreaDrag::New(start) | AreaDrag::Corner(start) => Rect::from_two_pos(start, p),
+                AreaDrag::Move(off) => {
+                    let r = a.rect.unwrap_or(Rect::NOTHING);
+                    let min = (p - off).clamp(full.min, full.max - r.size());
+                    Rect::from_min_size(min, r.size())
+                }
+            });
+        }
+        if resp.drag_stopped() {
+            a.drag = None;
+            if a.rect.is_some_and(|r| r.width() < 16.0 || r.height() < 16.0) {
+                a.rect = None;
+            }
+        }
+
+        // Dim everything outside the selection.
+        let painter = ui.painter();
+        let dim = Color32::from_black_alpha(120);
+        match a.rect {
+            Some(r) => {
+                painter.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, r.top())), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.bottom()), full.max), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.top()), pos2(r.left(), r.bottom())), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(pos2(r.right(), r.top()), pos2(full.max.x, r.bottom())), 0.0, dim);
+                painter.rect_stroke(r, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
+                for c in corners(r) {
+                    painter.circle(c, 5.0, Color32::WHITE, Stroke::new(1.0, theme::accent()));
+                }
+                let label = format!("{:.0} × {:.0}", r.width(), r.height());
+                let at = if r.top() > 30.0 { r.center_top() - vec2(0.0, 10.0) } else { r.center_top() + vec2(0.0, 18.0) };
+                painter.text(at, Align2::CENTER_BOTTOM, label, FontId::proportional(13.0), Color32::WHITE);
+                let hover = pointer.map(|p| (corners(r).iter().any(|c| c.distance(p) < 12.0), r.contains(p)));
+                ui.ctx().set_cursor_icon(match hover {
+                    Some((true, _)) => egui::CursorIcon::ResizeNwSe,
+                    Some((false, true)) => egui::CursorIcon::Move,
+                    _ => egui::CursorIcon::Crosshair,
+                });
+            }
+            None => {
+                painter.rect_filled(full, 0.0, dim);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+        let hint = "Drag to select an area  ·  Return to confirm  ·  Esc to cancel";
+        let hint_pos = pos2(full.center().x, full.top() + 60.0);
+        let galley = painter.layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
+        let bg = Rect::from_center_size(hint_pos, galley.size() + vec2(28.0, 14.0));
+        painter.rect_filled(bg, egui::CornerRadius::same(10), Color32::from_black_alpha(170));
+        painter.galley(bg.center() - galley.size() / 2.0, galley, Color32::WHITE);
+
+        // Buttons under the selection.
+        let mut confirm = ui.input(|i| i.key_pressed(egui::Key::Enter)) && a.rect.is_some();
+        let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if let Some(r) = a.rect
+            && a.drag.is_none()
+        {
+            let y = if r.bottom() + 52.0 < full.bottom() { r.bottom() + 12.0 } else { r.bottom() - 44.0 };
+            let bar = Rect::from_min_size(Pos2::new(r.right() - 220.0, y), vec2(220.0, 32.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+                let primary = if a.record_after { "Record" } else { "Use area" };
+                if widgets::primary(ui, primary).clicked() {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+        let outcome = if confirm { a.rect.map(|r| r.translate(-full.min.to_vec2())) } else { None };
+        if confirm || cancel {
+            self.finish_area(outcome);
+        }
+    }
+
+    /// Close the area picker; with a rect, save it (and record if asked).
+    fn finish_area(&mut self, rect: Option<egui::Rect>) {
+        self.area.closed = true;
+        self.overlay = None;
+        match rect {
+            Some(r) => {
+                self.settings.source = SourceKind::Area;
+                self.settings.display = self.area.display;
+                self.settings.area = [r.left() as f64, r.top() as f64, r.width() as f64, r.height() as f64];
+                if self.selftest.is_none() {
+                    self.settings.save();
+                }
+                push(if self.area.record_after { Cmd::ToggleRecording } else { Cmd::ShowWindow });
+            }
+            None => push(Cmd::ShowWindow),
+        }
+    }
+
+    fn which(&self, id: WindowId) -> Option<Which> {
+        let is = |w: &Option<Win>| w.as_ref().is_some_and(|w| w.window.id() == id);
+        if is(&self.main) {
+            Some(Which::Main)
+        } else if is(&self.widget) {
+            Some(Which::Widget)
+        } else if is(&self.overlay) {
+            Some(Which::Overlay)
+        } else {
+            None
+        }
+    }
+
+    fn slot(&mut self, which: Which) -> &mut Option<Win> {
+        match which {
+            Which::Main => &mut self.main,
+            Which::Widget => &mut self.widget,
+            Which::Overlay => &mut self.overlay,
+        }
+    }
+
+    fn redraw(&mut self, id: WindowId) {
+        let Some(which) = self.which(id) else { return };
         let Some(gpu) = self.gpu.clone() else { return };
-        let mut win = if is_main { self.main.take().unwrap() } else { self.widget.take().unwrap() };
+        let Some(mut win) = self.slot(which).take() else { return };
         let input = win.egui.take_egui_input(&win.window);
         let ctx = win.ctx.clone();
         let renderer = &mut win.renderer;
-        let out = ctx.run_ui(input, |ui| {
-            if is_main {
-                self.draw_main(ui, renderer);
-            } else {
-                self.draw_widget(ui);
+        // The overlay may close itself while drawing; remember that.
+        let mut keep = true;
+        let out = ctx.run_ui(input, |ui| match which {
+            Which::Main => self.draw_main(ui, renderer),
+            Which::Widget => self.draw_widget(ui),
+            Which::Overlay => {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    self.draw_overlay(ui);
+                });
+                keep = !self.area.closed;
             }
         });
         win.egui.handle_platform_output(&win.window, out.platform_output);
@@ -653,8 +903,10 @@ impl App {
             }
         };
         if let Some(frame) = frame {
-            let (x, y) = theme::TRAFFIC_LIGHTS;
-            macos::inset_traffic_lights(&win.window, x, y);
+            if !win.overlay {
+                let (x, y) = theme::TRAFFIC_LIGHTS;
+                macos::inset_traffic_lights(&win.window, x, y);
+            }
             let view = frame.texture.create_view(&Default::default());
             let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [win.config.width, win.config.height], pixels_per_point: ppp };
             let mut enc = gpu.device.create_command_encoder(&Default::default());
@@ -670,7 +922,11 @@ impl App {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                                load: wgpu::LoadOp::Clear(if win.overlay {
+                                    wgpu::Color::TRANSPARENT
+                                } else {
+                                    wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
+                                }),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -692,10 +948,8 @@ impl App {
         if DRAG.swap(false, Ordering::Relaxed) {
             let _ = win.window.drag_window();
         }
-        if is_main {
-            self.main = Some(win);
-        } else {
-            self.widget = Some(win);
+        if keep {
+            *self.slot(which) = Some(win);
         }
     }
 }
@@ -719,32 +973,42 @@ impl ApplicationHandler for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
         self.tick(el);
-        for w in [self.main.as_ref(), self.widget.as_ref()].into_iter().flatten() {
+        for w in [self.main.as_ref(), self.widget.as_ref(), self.overlay.as_ref()].into_iter().flatten() {
             w.window.request_redraw();
         }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == id);
-        let win = if is_main { self.main.as_mut() } else { self.widget.as_mut().filter(|w| w.window.id() == id) };
-        let Some(win) = win else { return };
-        let resp = win.egui.on_window_event(&win.window, &event);
-        match event {
-            WindowEvent::CloseRequested => {
-                if is_main {
+        let Some(which) = self.which(id) else { return };
+        if matches!(event, WindowEvent::CloseRequested) {
+            match which {
+                Which::Main => {
                     if let View::Editor(ed) = &mut self.view {
                         ed.save();
                     }
                     push(Cmd::Quit);
-                } else {
-                    push(Cmd::Cancel);
+                }
+                Which::Widget => push(Cmd::Cancel),
+                Which::Overlay => {
+                    self.overlay = None;
+                    push(Cmd::ShowWindow);
                 }
             }
+            return;
+        }
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.redraw(id);
+            return;
+        }
+        let gpu = self.gpu.clone();
+        let Some(win) = self.slot(which).as_mut() else { return };
+        let resp = win.egui.on_window_event(&win.window, &event);
+        match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 let s = win.window.inner_size();
                 win.config.width = s.width.max(1);
                 win.config.height = s.height.max(1);
-                if let Some(g) = &self.gpu {
+                if let Some(g) = &gpu {
                     win.surface.configure(&g.device, &win.config);
                 }
                 win.window.request_redraw();
@@ -753,9 +1017,6 @@ impl ApplicationHandler for App {
                 theme::set_accent(theme::system_accent());
                 theme::apply(&win.ctx);
                 win.window.request_redraw();
-            }
-            WindowEvent::RedrawRequested => {
-                self.redraw(id);
             }
             WindowEvent::DroppedFile(path) => {
                 if path.extension().and_then(|e| e.to_str()) == Some(crate::project::EXTENSION) {
@@ -790,7 +1051,7 @@ impl ApplicationHandler for App {
         if live && let Some(w) = &self.widget {
             w.window.request_redraw();
         }
-        for w in [self.main.as_mut(), self.widget.as_mut()].into_iter().flatten() {
+        for w in [self.main.as_mut(), self.widget.as_mut(), self.overlay.as_mut()].into_iter().flatten() {
             if let Some(t) = w.repaint_at {
                 if t <= now {
                     w.repaint_at = None;
