@@ -96,6 +96,36 @@ fn level_voice(buf: &mut [Stereo], floor: f32) {
     }
 }
 
+/// `clean_voice` for a file, cached next to the recording as raw f32 stereo
+/// (`<package>/cache/`), so preview rebuilds after edits don't redo it.
+fn cleaned(dir: &Path, file: &str, track: usize, raw: Vec<Stereo>) -> Vec<Stereo> {
+    let src = dir.join("recording").join(file);
+    let cache = dir.join("cache").join(format!("voice-{file}-{track}.f32"));
+    let fresh = |c: &Path| {
+        let (Ok(a), Ok(b)) = (std::fs::metadata(c), std::fs::metadata(&src)) else { return false };
+        a.modified().ok() >= b.modified().ok() && a.len() == (raw.len() * 8) as u64
+    };
+    if fresh(&cache)
+        && let Ok(bytes) = std::fs::read(&cache)
+    {
+        return bytes.chunks_exact(8).map(|c| [f32::from_le_bytes(c[0..4].try_into().unwrap()), f32::from_le_bytes(c[4..8].try_into().unwrap())]).collect();
+    }
+    let mut buf = raw;
+    clean_voice(&mut buf);
+    let mut bytes = Vec::with_capacity(buf.len() * 8);
+    for s in &buf {
+        bytes.extend_from_slice(&s[0].to_le_bytes());
+        bytes.extend_from_slice(&s[1].to_le_bytes());
+    }
+    if std::fs::create_dir_all(cache.parent().unwrap()).is_ok() {
+        let tmp = cache.with_extension("tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache);
+        }
+    }
+    buf
+}
+
 /// "Enhance voice": Apple's on-device voice isolation (removes background
 /// noise and room tone) plus levelling; the simple DSP chain if isolation
 /// isn't available.
@@ -175,8 +205,10 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
         if !style.mute_mic
             && let Some(mut mic) = load(&rd, &rec.meta.mic)
         {
-            if style.enhance_mic {
-                clean_voice(&mut mic);
+            if style.enhance_mic
+                && let Some(t) = &rec.meta.mic
+            {
+                mic = cleaned(dir, &t.file, t.track, mic);
             }
             retime(&mic, map, |i| slices.get(i).map_or(1.0, |s| s.mic_volume as f32), &mut out);
             any = true;
@@ -184,7 +216,7 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
         for vo in &project.timeline.voiceovers {
             let Some(mut buf) = crate::media::read_audio(&rd.join(&vo.file), 0).ok().filter(|b| !b.is_empty()) else { continue };
             if style.enhance_mic {
-                clean_voice(&mut buf);
+                buf = cleaned(dir, &vo.file, 0, buf);
             }
             let at = (map.to_playback_nearest(vo.start) / 1000.0 * RATE) as usize;
             let g = vo.volume as f32;
