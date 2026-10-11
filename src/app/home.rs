@@ -347,6 +347,8 @@ pub enum Action {
     Open(PathBuf),
     RequestPermissions,
     ResizeWindow { id: u32, width: u32, height: u32 },
+    /// Pick a window on screen.
+    SelectWindow,
 }
 
 /// Outcome of the last window resize, shown under the window picker.
@@ -362,7 +364,7 @@ fn size_label((w, h): (u32, u32)) -> String {
 
 /// The chosen window's size with a Resize menu (common sizes, saved sizes,
 /// custom). Returns the size picked this frame.
-fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option<(u32, u32)> {
+pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option<(u32, u32)> {
     use crate::capture::winsize::PRESETS;
     let current = (w.size.0.round() as u32, w.size.1.round() as u32);
     let fits = |(a, b): (u32, u32)| a as f64 <= w.display.0 && b as f64 <= w.display.1 && (a, b) != current;
@@ -425,11 +427,12 @@ fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option<(u3
             ui.add(egui::DragValue::new(&mut c[0]).range(200..=max.0).suffix(" w"));
             ui.label("×");
             ui.add(egui::DragValue::new(&mut c[1]).range(200..=max.1).suffix(" h"));
-            if ui.button("Resize").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // Consume Return/Esc so a surrounding picker doesn't act on them too.
+            if ui.button("Resize").clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
                 picked = Some((c[0], c[1]));
                 done = true;
             }
-            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 done = true;
             }
         });
@@ -514,9 +517,14 @@ pub fn ui(
                         {
                             action = Action::ResizeWindow { id: w.id, width, height };
                         }
-                        if ui.small_button("Refresh windows").clicked() {
-                            *dev = Devices::load();
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Pick on screen…").on_hover_text("Highlight windows on the display and click one").clicked() {
+                                action = Action::SelectWindow;
+                            }
+                            if ui.small_button("Refresh windows").clicked() {
+                                *dev = Devices::load();
+                            }
+                        });
                     }
                     SourceKind::Device => {
                         if dev.ios.is_empty() {

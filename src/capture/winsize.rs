@@ -185,6 +185,40 @@ pub fn display_sizes(windows: &[screen::WindowInfo]) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// On-screen window IDs, frontmost first.
+pub fn front_to_back() -> Vec<u32> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCreate(option: u32, relative_to: u32) -> AxRef;
+    }
+    const ON_SCREEN_ONLY: u32 = 1;
+    // SAFETY: CGWindowListCreate returns a +1 CFArray whose values are
+    // CGWindowIDs stored directly in the pointer slots.
+    unsafe {
+        let list = Owned(CGWindowListCreate(ON_SCREEN_ONLY, 0));
+        if list.0.is_null() {
+            return vec![];
+        }
+        (0..CFArrayGetCount(list.0)).map(|i| CFArrayGetValueAtIndex(list.0, i) as usize as u32).collect()
+    }
+}
+
+/// Bring window `id` and its app to the front.
+pub fn raise(id: u32) -> Result<()> {
+    if !trusted(true) {
+        bail!("Glide needs Accessibility access to bring windows to the front");
+    }
+    let info = screen::windows()?.into_iter().find(|w| w.id == id).context("that window is no longer on screen")?;
+    // SAFETY: SCWindow/SCRunningApplication accessors and plain AX calls.
+    unsafe {
+        let pid = info.window.owningApplication().map(|a| a.processID()).context("window has no owning app")?;
+        let (app, win) = find_ax_window(pid, id, info.window.frame()).context("couldn't find that window through Accessibility")?;
+        AXUIElementPerformAction(win.0, CFRetained::as_ptr(&attr("AXRaise")).as_ptr() as AxRef);
+        AXUIElementSetAttributeValue(app.0, CFRetained::as_ptr(&attr("AXFrontmost")).as_ptr() as AxRef, kCFBooleanTrue);
+    }
+    Ok(())
+}
+
 /// Resize window `id` to `width`×`height` points, moving it if needed so it
 /// stays on its display, and bring it to the front. Returns the size the
 /// app actually accepted (apps can enforce minimum/maximum sizes).

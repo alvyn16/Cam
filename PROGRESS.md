@@ -24,7 +24,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | ID | Feature | Status | Notes |
 |---|---|---|---|
 | R1 | Display recording | ☑ | Native Retina size, display refresh, cursor hidden (re-rendered later). |
-| R2 | Window recording | ☑ | Window bounds logged over time; cursor stays aligned when the window moves. |
+| R2 | Window recording | ☑ | Window bounds logged over time; cursor stays aligned when the window moves. Picked on screen ("Pick on screen…", Record with no window chosen, or the menu bar's Record Window…): windows outlined front to back, the one under the pointer highlighted with name, size, Resize, Use/Record and Adjust area; right-click for Bring to front / Ignore / Reset ignored; Esc cancels. The scripted GUI run opens it, highlights a window, screenshots and cancels it. |
 | R3 | Area recording | ☑ | Drag-to-select picker (move/resize, Return/Esc), size presets, exact values. |
 | R4 | System audio | ☑ | Own track (stems). |
 | R5 | Microphone | ☑ | Own track; "Enhance voice" applies ML voice isolation, levelling and automatic gain control (±9 dB, speech-gated) at export rather than at capture, so the raw track stays untouched. Live capture checked with Microphone granted to the terminal: both capture paths (ScreenCaptureKit and AVCaptureSession) write a 48 kHz mono track in sync with the video. On this Mac it was silent (−91 dB, same with ffmpeg) because the lid is closed and macOS disconnects the built-in mic; Glide now warns about that before recording and in the voice-over panel. |
@@ -65,14 +65,16 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-11): 5/5 pass.
 
-- `cargo test` (78): engine, project, presets, renderer helpers, masks,
+- `cargo test` (79): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
-  change detection, GIF quantisation, icon, plus a
+  change detection, window picking, GIF quantisation, icon, plus a
   headless UI smoke test driving every editor panel.
 - Synthetic package → MP4 and GIF.
 - Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch → area picker opens over
-  the display (screenshotted) and is confirmed → record (test pattern) →
+  the display (screenshotted) and is confirmed → window picker opens with the
+  display's windows, highlights one (screenshotted) and is cancelled → record
+  (test pattern) →
   pause/resume → stop → editor opens the new project → export → quit.
 - Real 5K display recording (Screen Recording granted to the terminal) →
   export.
@@ -132,7 +134,8 @@ transcription were exercised only through their code paths and test media.
   configurable shortcuts, device frames, voice-over, iOS device capture,
   menu bar sources, quick export, Finder document opening, GIF delta frames.
 - 2026-10-11: "Data may be visible" warnings for masks (`glide check-masks`);
-  resize the recorded window (`glide resize-window`).
+  resize the recorded window (`glide resize-window`); on-screen window
+  picker; warning when the built-in mic is off with the lid closed.
 - 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
   fixes from a full code review (preview audio lifecycle, timeline clamps,
   area bounds, voice-over/editor lifecycle, quit and restart behaviour).

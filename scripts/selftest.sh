@@ -44,8 +44,12 @@ if [ "${1:-}" = "--screen" ]; then
   if "$G" permissions 2>/dev/null | grep -q 'Accessibility: *Authorized'; then
     GLIDE_OUTPUT_DIR="$OUT/gui" "$G" gui >"$OUT/resize.log" 2>&1 &
     gpid=$!
-    sleep 4
-    wid=$("$G" devices 2>/dev/null | sed -n 's/^ *\([0-9][0-9]*\)  glide — Glide (.*/\1/p' | head -1)
+    wid=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 1
+      wid=$("$G" devices 2>/dev/null | sed -n 's/^ *\([0-9][0-9]*\)  glide — Glide (.*/\1/p' | head -1)
+      [ -n "$wid" ] && break
+    done
     if [ -n "$wid" ] && "$G" resize-window "$wid" 1024x700 >>"$OUT/resize.log" 2>&1 && grep -q '→ 1024×700' "$OUT/resize.log"; then
       ok "window resize (Accessibility)"
     else

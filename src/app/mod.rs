@@ -17,6 +17,7 @@ pub mod theme;
 pub mod timeline;
 pub mod voiceover;
 pub mod widgets;
+pub mod winpick;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,8 @@ pub enum Cmd {
     Open(PathBuf),
     /// Show the area picker; `true` starts recording when confirmed.
     SelectArea(bool),
+    /// Pick a window on screen (true = record it right away).
+    SelectWindow(bool),
     /// Record a source chosen from the menu bar.
     RecordSource(SourceKind),
     Quit,
@@ -106,6 +109,17 @@ struct AreaPick {
     display: u32,
     /// Set when the picker is confirmed or cancelled; the window closes.
     closed: bool,
+    /// Picking a window instead of dragging an area.
+    windows: Option<WindowMode>,
+}
+
+/// Window-picker state: windows front to back, the clicked one, and the one
+/// a context menu was opened on.
+#[derive(Default)]
+struct WindowMode {
+    list: Vec<winpick::PickWindow>,
+    selected: Option<u32>,
+    menu_for: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -499,15 +513,8 @@ impl App {
                 self.settings.source = kind;
                 match kind {
                     SourceKind::Area => push(Cmd::SelectArea(true)),
-                    // Pick which window in the main window first.
-                    SourceKind::Window => {
-                        if let View::Editor(ed) = &mut self.view {
-                            ed.save();
-                        }
-                        self.view = View::Home;
-                        self.devices = Devices::load();
-                        self.show_main(el);
-                    }
+                    // Pick the window on screen first.
+                    SourceKind::Window => push(Cmd::SelectWindow(true)),
                     _ => push(Cmd::ToggleRecording),
                 }
             }
@@ -525,7 +532,25 @@ impl App {
                 let rect = (s.source == SourceKind::Area && s.area[2] > 8.0 && s.area[3] > 8.0)
                     .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)).intersect(screen))
                     .filter(|r| r.width() > 8.0 && r.height() > 8.0);
-                self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false };
+                self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false, windows: None };
+                if self.overlay.is_none() {
+                    let w = self.open_overlay(el, display);
+                    self.overlay = Some(w);
+                }
+                if let Some(w) = &self.overlay {
+                    w.window.focus_window();
+                    w.window.request_redraw();
+                }
+                macos::activate();
+            }
+            Cmd::SelectWindow(record_after) => {
+                if self.recording.is_some() {
+                    return;
+                }
+                let display = self.settings.display;
+                let (id, ..) = macos::display_frame(display);
+                let windows = Some(WindowMode { list: winpick::list(id), ..Default::default() });
+                self.area = AreaPick { rect: None, drag: None, record_after, display: id, closed: false, windows };
                 if self.overlay.is_none() {
                     let w = self.open_overlay(el, display);
                     self.overlay = Some(w);
@@ -637,6 +662,38 @@ impl App {
                 if self.settings.source != SourceKind::Area || a != [200.0, 150.0, 640.0, 400.0] || self.overlay.is_some() {
                     fail("area picker result".into());
                 }
+                st.phase = 12;
+                st.at = Instant::now();
+                push(Cmd::SelectWindow(false));
+            }
+            12 if since > Duration::from_millis(800) => {
+                let (Some(w), Some(wm)) = (&self.overlay, &mut self.area.windows) else {
+                    fail("window picker did not open".into());
+                    return;
+                };
+                // Highlight the frontmost window first (as a click would), then
+                // check again after it has been drawn.
+                if wm.selected.is_none() && !wm.list.is_empty() {
+                    wm.selected = wm.list.first().map(|w| w.entry.id);
+                    w.window.request_redraw();
+                    st.at = Instant::now();
+                    return;
+                }
+                log(&format!("window picker open with {} windows, selected {:?}", wm.list.len(), wm.selected));
+                if let (Some(dir), Some(num)) = (std::env::var_os("GLIDE_SELFTEST_SHOTS"), macos::window_number(&w.window)) {
+                    let out = PathBuf::from(dir).join("window-picker.png");
+                    let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
+                    log(&format!("window picker screenshot {} ok={ok}", out.display()));
+                }
+                st.phase = 13;
+                st.at = Instant::now();
+                self.finish_window(None);
+            }
+            13 if since > Duration::from_millis(300) => {
+                log(&format!("window picker cancelled overlay_closed={} source={:?}", self.overlay.is_none(), self.settings.source));
+                if self.overlay.is_some() || self.settings.source != SourceKind::Area {
+                    fail("window picker cancel".into());
+                }
                 st.phase = 1;
                 st.at = Instant::now();
                 push(Cmd::ToggleRecording);
@@ -735,6 +792,10 @@ impl App {
                 match action {
                     // Area recordings confirm the region first.
                     home::Action::Record if self.settings.source == SourceKind::Area => push(Cmd::SelectArea(true)),
+                    home::Action::Record if self.settings.source == SourceKind::Window && self.settings.window.is_none() => {
+                        push(Cmd::SelectWindow(true))
+                    }
+                    home::Action::SelectWindow => push(Cmd::SelectWindow(false)),
                     home::Action::Record => push(Cmd::ToggleRecording),
                     home::Action::SelectArea => push(Cmd::SelectArea(false)),
                     home::Action::HotkeysChanged => {
@@ -830,6 +891,10 @@ impl App {
     /// Area picker: dim the display, drag a rect, confirm with Return.
     fn draw_overlay(&mut self, ui: &mut egui::Ui) {
         use egui::{Align2, FontId, Pos2, Rect, Stroke, pos2};
+        if self.area.windows.is_some() {
+            self.draw_window_picker(ui);
+            return;
+        }
         let full = ui.max_rect();
         let resp = ui.interact(full, ui.id().with("area"), Sense::click_and_drag());
         let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
@@ -926,6 +991,173 @@ impl App {
         let outcome = if confirm { a.rect.map(|r| r.translate(-full.min.to_vec2())) } else { None };
         if confirm || cancel {
             self.finish_area(outcome);
+        }
+    }
+
+    /// Window picker: the windows on this display are outlined; the one under
+    /// the pointer (or the clicked one) is highlighted with its name, size,
+    /// Resize menu and buttons to use it or adjust an area from it.
+    fn draw_window_picker(&mut self, ui: &mut egui::Ui) {
+        use egui::{Align2, FontId, Rect, Stroke, pos2};
+        let full = ui.max_rect();
+        let resp = ui.interact(full, ui.id().with("windows"), Sense::click());
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let (record_after, display) = (self.area.record_after, self.area.display);
+        let Some(wm) = self.area.windows.as_mut() else { return };
+        let hovered = pointer.and_then(|p| winpick::under(&wm.list, p)).map(|w| w.entry.id);
+        if resp.secondary_clicked() {
+            wm.menu_for = hovered;
+        }
+        if resp.clicked() {
+            wm.selected = hovered;
+        }
+        let focus = wm.selected.or(hovered).and_then(|id| wm.list.iter().find(|w| w.entry.id == id)).cloned();
+        let visible: Vec<Rect> = wm.list.iter().filter(|w| !winpick::is_ignored(w.entry.id)).map(|w| w.rect).collect();
+
+        let painter = ui.painter().clone();
+        let dim = Color32::from_black_alpha(110);
+        match &focus {
+            Some(f) => {
+                let r = f.rect.intersect(full);
+                painter.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, r.top())), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.bottom()), full.max), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.top()), pos2(r.left(), r.bottom())), 0.0, dim);
+                painter.rect_filled(Rect::from_min_max(pos2(r.right(), r.top()), pos2(full.max.x, r.bottom())), 0.0, dim);
+            }
+            None => {
+                painter.rect_filled(full, 0.0, dim);
+            }
+        }
+        for r in visible.iter().rev() {
+            painter.rect_stroke(*r, 8.0, Stroke::new(1.0, Color32::from_white_alpha(60)), egui::StrokeKind::Inside);
+        }
+        let mut choose = None;
+        let mut adjust = None;
+        let mut refresh = false;
+        let mut whole_display = false;
+        if let Some(f) = &focus {
+            painter.rect_filled(f.rect, 8.0, theme::accent().gamma_multiply(0.12));
+            painter.rect_stroke(f.rect, 8.0, Stroke::new(3.0, theme::accent()), egui::StrokeKind::Inside);
+            let size = vec2(340.0, 150.0);
+            let mut card = Rect::from_center_size(f.rect.intersect(full).center(), size);
+            card = card.translate(vec2(
+                (full.left() + 12.0 - card.left()).max(0.0) + (full.right() - 12.0 - card.right()).min(0.0),
+                (full.top() + 40.0 - card.top()).max(0.0) + (full.bottom() - 12.0 - card.bottom()).min(0.0),
+            ));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                egui::Frame::new().fill(Color32::from_black_alpha(220)).corner_radius(12).inner_margin(14).show(ui, |ui| {
+                    ui.set_width(size.x - 28.0);
+                    ui.label(RichText::new(&f.app).font(theme::semibold(17.0)).color(Color32::WHITE));
+                    if !f.title.is_empty() {
+                        let title: String = f.title.chars().take(48).collect();
+                        ui.label(RichText::new(title).size(12.0).color(Color32::from_white_alpha(170)));
+                    }
+                    ui.add_space(4.0);
+                    if let Some((w, h)) = home::window_size_row(ui, &mut self.settings, &f.entry) {
+                        let note = match crate::capture::winsize::resize(f.entry.id, w as f64, h as f64) {
+                            Ok((gw, gh)) if (gw.round() as u32, gh.round() as u32) != (w, h) => Some(format!("The app limited the window to {gw:.0} × {gh:.0}")),
+                            Ok(_) => None,
+                            Err(e) => Some(format!("{e:#}")),
+                        };
+                        home::set_resize_note(note);
+                        refresh = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if widgets::primary(ui, if record_after { "Record window" } else { "Use window" }).clicked() {
+                            choose = Some(f.entry.id);
+                        }
+                        if ui.button("Adjust area").on_hover_text("Record a region starting from this window's frame").clicked() {
+                            adjust = Some(f.rect.intersect(full));
+                        }
+                    });
+                });
+            });
+        }
+        resp.context_menu(|ui| {
+            let Some(id) = wm.menu_for else {
+                ui.close();
+                return;
+            };
+            if ui.button("Bring to front").clicked() {
+                if let Err(e) = crate::capture::winsize::raise(id) {
+                    home::set_resize_note(Some(format!("{e:#}")));
+                }
+                refresh = true;
+            }
+            if ui.button("Ignore this window").clicked() {
+                winpick::ignore(id);
+                if wm.selected == Some(id) {
+                    wm.selected = None;
+                }
+            }
+            if ui.button("Reset ignored windows").clicked() {
+                winpick::reset_ignored();
+            }
+        });
+        if visible.is_empty() {
+            let r = Rect::from_center_size(full.center(), vec2(320.0, 90.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                egui::Frame::new().fill(Color32::from_black_alpha(220)).corner_radius(12).inner_margin(14).show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("No windows to select").font(theme::semibold(16.0)).color(Color32::WHITE));
+                        if ui.button("Record entire display").clicked() {
+                            whole_display = true;
+                        }
+                    });
+                });
+            });
+        }
+        let hint = "Click a window to choose it  ·  Right-click for more  ·  Esc to cancel";
+        let galley = painter.layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
+        let bg = Rect::from_center_size(pos2(full.center().x, full.top() + 60.0), galley.size() + vec2(28.0, 14.0));
+        painter.rect_filled(bg, egui::CornerRadius::same(10), Color32::from_black_alpha(170));
+        painter.text(bg.center(), Align2::CENTER_CENTER, hint, FontId::proportional(14.0), Color32::WHITE);
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            choose = choose.or(focus.as_ref().map(|f| f.entry.id));
+        }
+        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+        if refresh && let Some(wm) = &mut self.area.windows {
+            wm.list = winpick::list(display);
+        }
+        if let Some(r) = adjust {
+            self.area.windows = None;
+            self.area.rect = Some(r);
+        } else if whole_display {
+            self.settings.source = SourceKind::Display;
+            self.settings.display = display;
+            self.finish_window(None);
+            if record_after {
+                push(Cmd::ToggleRecording);
+            }
+        } else if choose.is_some() || cancel {
+            self.finish_window(choose);
+        }
+    }
+
+    /// Close the window picker; with a window, use it (and record if asked).
+    fn finish_window(&mut self, id: Option<u32>) {
+        self.area.closed = true;
+        self.area.windows = None;
+        self.overlay = None;
+        match id {
+            Some(id) => {
+                self.settings.source = SourceKind::Window;
+                self.settings.window = Some(id);
+                if self.selftest.is_none() {
+                    self.settings.save();
+                }
+                self.devices = Devices::load();
+                push(if self.area.record_after { Cmd::ToggleRecording } else { Cmd::ShowWindow });
+            }
+            None => {
+                if !self.area.record_after || self.settings.source != SourceKind::Display {
+                    push(Cmd::ShowWindow);
+                }
+            }
         }
     }
 

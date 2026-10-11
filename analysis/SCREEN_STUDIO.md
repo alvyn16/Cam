@@ -143,7 +143,7 @@ Status legend: ☐ not started · ◐ partial · ☑ done (verified). The *Statu
 | # | Feature | Screen Studio behaviour |
 |---|---|---|
 | R1 | Display recording | ScreenCaptureKit display capture at native (Retina) resolution and the display refresh rate; system cursor hidden from frames. |
-| R2 | Window recording | Single-window capture. Bounds changes are tracked over time so a moving or resizing window stays framed. |
+| R2 | Window recording | Single-window capture. Bounds changes are tracked over time so a moving or resizing window stays framed. Windows are picked on screen: a cover over the display (fed by the `list-windows` helper at a 200 ms interval) draws each capturable window at its position in z-order; hovering highlights one with its app icon, app name, size/Resize control and a record button; clicking selects it (clicking the cover deselects), Escape cancels. Buttons offer "Adjust recording area" (switch to an area starting from the window's bounds) and, for full-screen windows, "Ignore this window". The context menu has "Bring to front", "Ignore this window" and "Reset ignored windows" (ignored for the session). With no windows: "No windows to select" and "Record entire display". Screenshot tools' own windows are excluded. |
 | R3 | Area recording | Drag-select a region. Recorded as a display capture plus a normalised crop. Saved size and crop presets. |
 | R4 | System audio | Captured separately to its own track (m4a). |
 | R5 | Microphone | Separate track. Auto gain control. Optional speech enhancement (denoise) in the editor. |
