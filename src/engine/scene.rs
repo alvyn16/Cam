@@ -518,7 +518,7 @@ impl Scene {
             .masks
             .iter()
             .filter_map(|m| {
-                let alpha = m.alpha_at(src);
+                let alpha = m.alpha_at(src, self.duration);
                 if alpha <= 0.002 {
                     return None;
                 }

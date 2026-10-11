@@ -527,11 +527,15 @@ impl Mask {
     }
 
     /// Opacity at a source time (0 outside the range, eased at the ends).
-    pub fn alpha_at(&self, t: f64) -> f64 {
+    /// No fade where the range touches the start or end (`duration`) of the
+    /// recording, so a mask covering the first frame is there from frame one.
+    pub fn alpha_at(&self, t: f64, duration: f64) -> f64 {
         if t < self.start || t > self.end {
             return 0.0;
         }
-        let edge = ((t - self.start).min(self.end - t) / Self::FADE_MS).clamp(0.0, 1.0);
+        let from_start = if self.start <= 1.0 { f64::INFINITY } else { t - self.start };
+        let to_end = if self.end >= duration - 1.0 { f64::INFINITY } else { self.end - t };
+        let edge = (from_start.min(to_end) / Self::FADE_MS).clamp(0.0, 1.0);
         edge * edge * (3.0 - 2.0 * edge)
     }
 }

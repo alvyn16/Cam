@@ -154,3 +154,37 @@ pub fn display_frame(id: u32) -> (u32, f64, f64, f64, f64) {
 pub fn window_number(window: &Window) -> Option<isize> {
     ns_window(window).map(|w| w.windowNumber())
 }
+
+/// Called by AppKit when Finder opens documents with Glide (double-click,
+/// Open With, drag onto the Dock icon), at launch or while running.
+extern "C-unwind" fn open_urls(_this: *mut objc2::runtime::AnyObject, _cmd: objc2::runtime::Sel, _app: *mut objc2::runtime::AnyObject, urls: *mut objc2_foundation::NSArray<objc2_foundation::NSURL>) {
+    // SAFETY: AppKit passes a valid NSArray<NSURL> for this selector.
+    let Some(urls) = (unsafe { urls.as_ref() }) else { return };
+    for url in urls.iter() {
+        if let Some(path) = url.path() {
+            let path = std::path::PathBuf::from(path.to_string());
+            if path.extension().and_then(|e| e.to_str()) == Some(crate::project::EXTENSION) {
+                super::push(super::Cmd::Open(path));
+            }
+        }
+    }
+}
+
+/// Teach the app delegate (winit's) `application:openURLs:` so Finder can
+/// open `.glide` projects. Call after the event loop exists, before it runs.
+pub fn install_open_handler() {
+    use objc2::runtime::{AnyClass, Sel};
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else { return };
+    let obj: &objc2::runtime::AnyObject = objc2::runtime::ProtocolObject::as_ref(&delegate);
+    let cls: &AnyClass = obj.class();
+    let sel = objc2::sel!(application:openURLs:);
+    type Imp = extern "C-unwind" fn(*mut objc2::runtime::AnyObject, Sel, *mut objc2::runtime::AnyObject, *mut objc2_foundation::NSArray<objc2_foundation::NSURL>);
+    // SAFETY: adds a method with the documented signature v@:@@ to the
+    // delegate's class; class_addMethod leaves an existing method alone.
+    unsafe {
+        let imp: objc2::runtime::Imp = std::mem::transmute::<Imp, objc2::runtime::Imp>(open_urls);
+        objc2::ffi::class_addMethod(cls as *const AnyClass as *mut AnyClass, sel, imp, c"v@:@@".as_ptr());
+    }
+}

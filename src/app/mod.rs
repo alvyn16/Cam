@@ -1136,6 +1136,7 @@ pub fn run(open: Option<PathBuf>) -> Result<()> {
     crate::capture::camera::enable_screen_capture_devices();
     let el = EventLoop::new()?;
     let _ = PROXY.set(Mutex::new(el.create_proxy()));
+    macos::install_open_handler();
     let mut app = App::new(open);
     el.run_app(&mut app)?;
     Ok(())
