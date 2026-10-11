@@ -27,7 +27,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R2 | Window recording | ☑ | Window bounds logged over time; cursor stays aligned when the window moves. |
 | R3 | Area recording | ☑ | Drag-to-select picker (move/resize, Return/Esc), size presets, exact values. |
 | R4 | System audio | ☑ | Own track (stems). |
-| R5 | Microphone | ◐ | Own track; "Enhance voice" (ML voice isolation + levelling) in the editor. No capture-time AGC. |
+| R5 | Microphone | ☑ | Own track; "Enhance voice" applies ML voice isolation, levelling and automatic gain control (±9 dB, speech-gated) at export rather than at capture, so the raw track stays untouched. |
 | R6 | Camera | ◐ | Separate 720p file, bubble/layouts in the editor. Not exercised live: Camera permission not granted on this Mac. |
 | R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Untested: no iPhone/iPad was connected. |
 | R8 | Input logging | ☑ | 120 Hz mouse + buttons, cursor images with hotspots, keystrokes (needs Input Monitoring). |

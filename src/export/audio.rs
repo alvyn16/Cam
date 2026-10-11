@@ -83,7 +83,8 @@ pub fn enhance_voice(buf: &mut [Stereo]) {
     level_voice(buf, floor);
 }
 
-/// Level speech to about -18 dBFS RMS on voiced parts, never above 4x.
+/// Level speech to about -18 dBFS RMS on voiced parts, never above 4x, then
+/// even out quieter and louder passages with `agc`.
 fn level_voice(buf: &mut [Stereo], floor: f32) {
     let voiced: Vec<f32> = buf.iter().map(|s| (s[0] * s[0] + s[1] * s[1]) / 2.0).filter(|v| *v > floor * floor).collect();
     if !voiced.is_empty() {
@@ -93,6 +94,43 @@ fn level_voice(buf: &mut [Stereo], floor: f32) {
             s[0] *= g;
             s[1] *= g;
         }
+    }
+    agc(buf, floor);
+}
+
+/// Automatic gain control: a slow gain (±9 dB) that pulls each passage of
+/// speech toward the target level. Measured on 50 ms windows; gain only
+/// moves while someone is speaking (rises over ~1 s, falls over ~0.3 s), so
+/// pauses aren't pumped up.
+pub fn agc(buf: &mut [Stereo], floor: f32) {
+    const TARGET: f32 = 0.125;
+    let win = (RATE * 0.05) as usize;
+    if buf.len() < win {
+        return;
+    }
+    let mut gains = Vec::with_capacity(buf.len() / win + 1);
+    let mut gain = 1.0f32;
+    let mut level = TARGET;
+    for chunk in buf.chunks(win) {
+        let rms = (chunk.iter().map(|s| (s[0] * s[0] + s[1] * s[1]) * 0.5).sum::<f32>() / chunk.len() as f32).sqrt();
+        if rms > floor {
+            // Smoothed speech level (~0.5 s), then the gain that would hit the target.
+            level += (rms - level) * 0.1;
+            let want = (TARGET / level.max(1e-6)).clamp(0.35, 2.8);
+            let rate = if want < gain { 0.15 } else { 0.05 };
+            gain += (want - gain) * rate;
+        }
+        gains.push(gain);
+    }
+    // Apply with linear interpolation between window centres.
+    for (i, s) in buf.iter_mut().enumerate() {
+        let x = i as f32 / win as f32 - 0.5;
+        let j = (x.max(0.0) as usize).min(gains.len() - 1);
+        let k = (j + 1).min(gains.len() - 1);
+        let f = (x - j as f32).clamp(0.0, 1.0);
+        let g = gains[j] + (gains[k] - gains[j]) * f;
+        s[0] *= g;
+        s[1] *= g;
     }
 }
 
@@ -303,6 +341,23 @@ mod tests {
         assert!((out[24_000][0] - 48_000.0).abs() < 2.0);
         // Then it advances two source samples per output sample.
         assert!((out[24_010][0] - 48_020.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn agc_evens_out_quiet_and_loud_passages() {
+        // 3 s of quiet "speech" then 3 s loud (a modulated tone), 12 dB apart.
+        let n = (RATE * 3.0) as usize;
+        let tone = |i: usize, a: f32| {
+            let t = i as f32 / RATE as f32;
+            a * (t * 220.0 * std::f32::consts::TAU).sin() * (0.6 + 0.4 * (t * 3.0 * std::f32::consts::TAU).sin())
+        };
+        let mut buf: Vec<Stereo> = (0..2 * n).map(|i| { let v = tone(i, if i < n { 0.05 } else { 0.2 }); [v, v] }).collect();
+        let rms = |b: &[Stereo]| (b.iter().map(|s| s[0] * s[0]).sum::<f32>() / b.len() as f32).sqrt();
+        let before = 20.0 * (rms(&buf[n..]) / rms(&buf[n / 2..n])).log10();
+        agc(&mut buf, 0.006);
+        // Compare the settled second halves of each passage.
+        let after = 20.0 * (rms(&buf[n + n / 2..]) / rms(&buf[n / 2..n])).log10();
+        assert!(before > 11.0 && after < before - 4.0, "loud/quiet gap {before:.1} dB -> {after:.1} dB");
     }
 
     #[test]
