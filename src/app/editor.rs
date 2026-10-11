@@ -52,6 +52,13 @@ impl Tab {
     ];
 }
 
+/// Inspector actions that must run after its draft is committed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Deferred {
+    StartVoice,
+    StopVoice,
+}
+
 pub struct ExportRun {
     progress: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
@@ -98,6 +105,9 @@ pub struct Editor {
     pub transcribing: Option<std::thread::JoinHandle<Result<usize, String>>>,
     preset_name: String,
     pub looping: bool,
+    /// Voice-over being recorded.
+    pub voice: Option<super::voiceover::VoiceRecorder>,
+    pub deferred: Option<Deferred>,
 }
 
 impl Editor {
@@ -132,6 +142,8 @@ impl Editor {
             transcribing: None,
             preset_name: String::new(),
             looping: false,
+            voice: None,
+            deferred: None,
         })
     }
 
@@ -162,7 +174,9 @@ impl Editor {
     }
 
     fn apply(&mut self, mut p: Project) {
-        let audio_changed = p.timeline.slices != self.project.timeline.slices || p.style.audio != self.project.style.audio;
+        let audio_changed = p.timeline.slices != self.project.timeline.slices
+            || p.timeline.voiceovers != self.project.timeline.voiceovers
+            || p.style.audio != self.project.style.audio;
         p.updated_ms = crate::recorder::now_ms();
         self.project = p;
         self.preview.set_project(&self.project, &self.rec);
@@ -271,6 +285,48 @@ impl Editor {
             p.timeline.zooms.push(Zoom { id, start, end, scale: p.style.default_zoom, ..Default::default() });
         });
         self.selection = Selection::Zoom(new_id);
+    }
+
+    /// Record narration from the playhead while the preview plays silently.
+    pub fn start_voiceover(&mut self) {
+        if self.voice.is_some() {
+            return;
+        }
+        if self.playing.is_some() {
+            self.toggle_play();
+        }
+        if self.playhead >= self.duration() - 100.0 {
+            self.playhead = 0.0;
+        }
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let file = format!("voiceover-{ms}.m4a");
+        match super::voiceover::VoiceRecorder::start(&self.package.root, &file, self.source_at_playhead()) {
+            Ok(v) => {
+                self.voice = Some(v);
+                self.looping = false;
+                self.playing = Some((Instant::now(), self.playhead));
+                self.status = Some("Recording voice-over… press Stop when you're done".into());
+            }
+            Err(e) => self.status = Some(format!("{e:#}")),
+        }
+    }
+
+    pub fn stop_voiceover(&mut self) {
+        let Some(v) = self.voice.take() else { return };
+        let (file, start) = (v.file.clone(), v.start_source);
+        let ms = v.stop();
+        self.playing = None;
+        self.audio.pause();
+        if ms < 300.0 {
+            let _ = std::fs::remove_file(self.package.rec(&file));
+            self.status = Some("Voice-over too short; discarded".into());
+            return;
+        }
+        self.edit(|p| {
+            let id = p.timeline.new_id();
+            p.timeline.voiceovers.push(crate::project::model::VoiceOver { id, file, start, duration: ms, volume: 1.0 });
+        });
+        self.status = Some(format!("Added a {:.1} s voice-over", ms / 1000.0));
     }
 
     /// Add a blur mask at the playhead.
@@ -390,7 +446,10 @@ impl Editor {
     pub fn tick(&mut self) -> bool {
         if let Some((t0, from)) = self.playing {
             self.playhead = from + t0.elapsed().as_secs_f64() * 1000.0;
-            if self.playhead >= self.duration() {
+            if self.playhead >= self.duration() && self.voice.is_some() {
+                self.playhead = self.duration();
+                self.stop_voiceover();
+            } else if self.playhead >= self.duration() {
                 if self.looping {
                     self.playhead = 0.0;
                     self.playing = Some((Instant::now(), 0.0));
@@ -431,7 +490,7 @@ impl Editor {
                 Err(_) => self.status = Some("Transcription crashed".into()),
             }
         }
-        self.playing.is_some() || self.export.running.is_some() || self.transcribing.is_some()
+        self.playing.is_some() || self.export.running.is_some() || self.transcribing.is_some() || self.voice.is_some()
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {

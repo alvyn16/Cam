@@ -137,6 +137,16 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             }
         }
 
+        // Voice-overs: thin bars along the bottom of the clip track.
+        for vo in &ed.project.timeline.voiceovers {
+            let a = map.to_playback_nearest(vo.start);
+            let b = (a + vo.duration).min(map.duration());
+            if b > a {
+                let r = Rect::from_min_max(pos2(x_of(a) + 2.0, clip_row.bottom() - 7.0), pos2(x_of(b) - 2.0, clip_row.bottom() - 3.0));
+                painter.rect_filled(r, CornerRadius::same(2), Color32::from_rgb(0x06, 0xb6, 0xd4));
+            }
+        }
+
         // Zoom track.
         let zooms = ed.project.timeline.zooms.clone();
         for z in &zooms {

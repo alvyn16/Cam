@@ -14,6 +14,7 @@ pub mod preview;
 pub mod snapshot;
 pub mod theme;
 pub mod timeline;
+pub mod voiceover;
 pub mod widgets;
 
 use std::path::PathBuf;

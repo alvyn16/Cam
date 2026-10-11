@@ -114,6 +114,29 @@ fn soft_clip(x: f32) -> f32 {
     if x.abs() < 0.9 { x } else { x.signum() * (0.9 + 0.1 * ((x.abs() - 0.9) / 0.1).tanh()) }
 }
 
+/// Gain envelope for the recorded audio: `level` while any voice-over plays
+/// (with 150 ms ramps), 1 elsewhere.
+pub fn duck_envelope(len: usize, spans: &[(usize, usize)], level: f32) -> Vec<f32> {
+    let mut env = vec![1.0f32; len];
+    let ramp = (RATE * 0.15) as usize;
+    for &(a, b) in spans {
+        let lo = a.saturating_sub(ramp);
+        let hi = (b + ramp).min(len);
+        for (j, e) in env.iter_mut().enumerate().take(hi).skip(lo) {
+            let t = if j < a {
+                (a - j) as f32 / ramp as f32
+            } else if j >= b {
+                (j - b) as f32 / ramp as f32
+            } else {
+                0.0
+            };
+            let g = level + (1.0 - level) * t.clamp(0.0, 1.0);
+            *e = e.min(g);
+        }
+    }
+    env
+}
+
 /// Build the export soundtrack. Returns None when there's nothing to hear.
 pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap) -> Option<Vec<Stereo>> {
     let style = &project.style.audio;
@@ -121,6 +144,9 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
     let mut out = vec![[0.0f32; 2]; len];
     let mut any = false;
     let slices = &project.timeline.slices;
+    // Voice-overs, placed at their playback position at normal speed.
+    let mut voice = vec![[0.0f32; 2]; len];
+    let mut spans = vec![];
     if let Some(dir) = dir {
         let rd = dir.join("recording");
         if !style.mute_system
@@ -138,6 +164,33 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
             retime(&mic, map, |i| slices.get(i).map_or(1.0, |s| s.mic_volume as f32), &mut out);
             any = true;
         }
+        for vo in &project.timeline.voiceovers {
+            let Some(mut buf) = crate::media::read_audio(&rd.join(&vo.file), 0).ok().filter(|b| !b.is_empty()) else { continue };
+            if style.enhance_mic {
+                enhance_voice(&mut buf);
+            }
+            let at = (map.to_playback_nearest(vo.start) / 1000.0 * RATE) as usize;
+            let g = vo.volume as f32;
+            for (k, s) in buf.iter().enumerate() {
+                if let Some(o) = voice.get_mut(at + k) {
+                    o[0] += s[0] * g;
+                    o[1] += s[1] * g;
+                }
+            }
+            spans.push((at.min(len), (at + buf.len()).min(len)));
+            any = true;
+        }
+    }
+    if style.duck_under_voiceover && !spans.is_empty() {
+        let env = duck_envelope(len, &spans, style.duck_level as f32);
+        for (o, e) in out.iter_mut().zip(env) {
+            o[0] *= e;
+            o[1] *= e;
+        }
+    }
+    for (o, v) in out.iter_mut().zip(&voice) {
+        o[0] += v[0];
+        o[1] += v[1];
     }
     if let Some(music) = style.music.as_ref().and_then(|p| crate::media::read_audio(Path::new(p), 0).ok()).filter(|m| !m.is_empty()) {
         let g = style.music_volume as f32;
@@ -201,6 +254,16 @@ mod tests {
         assert!((out[24_000][0] - 48_000.0).abs() < 2.0);
         // Then it advances two source samples per output sample.
         assert!((out[24_010][0] - 48_020.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn duck_envelope_ramps_around_spans() {
+        let r = RATE as usize;
+        let env = duck_envelope(4 * r, &[(r, 2 * r)], 0.2);
+        assert_eq!(env[0], 1.0);
+        assert!((env[r + 10] - 0.2).abs() < 1e-6);
+        assert!(env[r - (RATE * 0.075) as usize] > 0.2 && env[r - (RATE * 0.075) as usize] < 1.0);
+        assert_eq!(env[3 * r], 1.0);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use egui::{Color32, CornerRadius, RichText, Sense, Stroke, Ui, vec2};
 
-use super::editor::{Editor, Selection, Tab};
+use super::editor::{Deferred, Editor, Selection, Tab};
 use super::theme::{self, pal};
 use super::widgets::{self, caption, row, section, segmented, slider, toggle_row};
 use crate::engine::geom::v2;
@@ -44,6 +44,12 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             // End of a drag: the next change starts a new undo step.
         }
         ed.commit(draft);
+        // Actions that edit the project themselves run after the draft lands.
+        match ed.deferred.take() {
+            Some(Deferred::StartVoice) => ed.start_voiceover(),
+            Some(Deferred::StopVoice) => ed.stop_voiceover(),
+            None => {}
+        }
     });
 }
 
@@ -434,6 +440,44 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         if let Some(m) = &a.music {
             caption(ui, &std::path::Path::new(m).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
             slider(ui, "Music volume", &mut a.music_volume, 0.0..=1.0, "");
+        }
+    });
+    section(ui, "Voice-over", |ui| {
+        match ed.voice.as_ref().map(|v| v.elapsed()) {
+            Some(elapsed) => {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 5.0, Color32::from_rgb(255, 59, 48));
+                    ui.label(format!("Recording {elapsed:.1} s"));
+                    if ui.button("Stop").clicked() {
+                        ed.deferred = Some(Deferred::StopVoice);
+                    }
+                });
+            }
+            None => {
+                if ui.button("Record from playhead").on_hover_text("Narrate over the video; the preview plays silently").clicked() {
+                    ed.deferred = Some(Deferred::StartVoice);
+                }
+            }
+        }
+        if !d.timeline.voiceovers.is_empty() {
+            toggle_row(ui, "Lower recorded audio", &mut d.style.audio.duck_under_voiceover);
+            if d.style.audio.duck_under_voiceover {
+                slider(ui, "Level under voice", &mut d.style.audio.duck_level, 0.0..=1.0, "");
+            }
+            let mut remove = None;
+            for vo in &mut d.timeline.voiceovers {
+                ui.horizontal(|ui| {
+                    caption(ui, &format!("{} · {:.1} s", widgets::fmt_time(vo.start), vo.duration / 1000.0));
+                    ui.add(egui::Slider::new(&mut vo.volume, 0.0..=2.0).show_value(false));
+                    if ui.small_button("Delete").clicked() {
+                        remove = Some(vo.id);
+                    }
+                });
+            }
+            if let Some(id) = remove {
+                d.timeline.voiceovers.retain(|v| v.id != id);
+            }
         }
     });
 }

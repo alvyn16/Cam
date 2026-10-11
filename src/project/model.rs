@@ -280,6 +280,10 @@ pub struct AudioStyle {
     pub music_volume: f64,
     pub click_sounds: bool,
     pub click_volume: f64,
+    /// Lower the recorded audio while a voice-over plays.
+    pub duck_under_voiceover: bool,
+    /// Level of the recorded audio under a voice-over (0..1).
+    pub duck_level: f64,
 }
 
 impl Default for AudioStyle {
@@ -293,6 +297,8 @@ impl Default for AudioStyle {
             music_volume: 0.05,
             click_sounds: false,
             click_volume: 0.25,
+            duck_under_voiceover: true,
+            duck_level: 0.15,
         }
     }
 }
@@ -530,6 +536,26 @@ impl Mask {
     }
 }
 
+/// Narration recorded in the editor, played at normal speed from a point on
+/// the timeline.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceOver {
+    pub id: u64,
+    /// Audio file inside the package's recording/ folder.
+    pub file: String,
+    /// Where it starts (source ms).
+    pub start: f64,
+    pub duration: f64,
+    pub volume: f64,
+}
+
+impl Default for VoiceOver {
+    fn default() -> Self {
+        VoiceOver { id: 0, file: String::new(), start: 0.0, duration: 0.0, volume: 1.0 }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Timeline {
@@ -537,6 +563,7 @@ pub struct Timeline {
     pub zooms: Vec<Zoom>,
     pub layouts: Vec<LayoutRange>,
     pub masks: Vec<Mask>,
+    pub voiceovers: Vec<VoiceOver>,
     next_id: u64,
 }
 
