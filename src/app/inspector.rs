@@ -461,6 +461,9 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 if ui.button("Record from playhead").on_hover_text("Narrate over the video; the preview plays silently").clicked() {
                     ed.deferred = Some(Deferred::StartVoice);
                 }
+                if crate::capture::camera::builtin_mic_off(None) {
+                    caption(ui, "The lid is closed, so the built-in microphone only records silence. Pick another input in System Settings › Sound.");
+                }
             }
         }
         if !d.timeline.voiceovers.is_empty() {

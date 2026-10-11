@@ -27,7 +27,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R2 | Window recording | ☑ | Window bounds logged over time; cursor stays aligned when the window moves. |
 | R3 | Area recording | ☑ | Drag-to-select picker (move/resize, Return/Esc), size presets, exact values. |
 | R4 | System audio | ☑ | Own track (stems). |
-| R5 | Microphone | ☑ | Own track; "Enhance voice" applies ML voice isolation, levelling and automatic gain control (±9 dB, speech-gated) at export rather than at capture, so the raw track stays untouched. |
+| R5 | Microphone | ☑ | Own track; "Enhance voice" applies ML voice isolation, levelling and automatic gain control (±9 dB, speech-gated) at export rather than at capture, so the raw track stays untouched. Live capture checked with Microphone granted to the terminal: both capture paths (ScreenCaptureKit and AVCaptureSession) write a 48 kHz mono track in sync with the video. On this Mac it was silent (−91 dB, same with ffmpeg) because the lid is closed and macOS disconnects the built-in mic; Glide now warns about that before recording and in the voice-over panel. |
 | R6 | Camera | ◐ | Separate 720p file, bubble/layouts in the editor. Not exercised live: Camera permission not granted on this Mac. |
 | R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Untested: no iPhone/iPad was connected. |
 | R8 | Input logging | ☑ | 120 Hz mouse + buttons, cursor images with hotspots, keystrokes (needs Input Monitoring). |
@@ -111,11 +111,13 @@ with the Apple Development identity so grants survive rebuilds.
 4. Optional end-to-end check from Terminal (uses the terminal's own grants):
    `scripts/selftest.sh --screen` and `scripts/bench.sh`.
 
-Already verified without your input: Screen Recording works from the terminal
-(real 5K recordings and exports above). Microphone, Camera and Speech
-Recognition have not been granted on this Mac, so live mic/camera/voice-over
-capture and transcription were exercised only through their code paths and
-test media.
+Already verified without your input: Screen Recording, Microphone and
+Accessibility work from the terminal (real 5K recordings and exports, a
+live mic track, window resizing above). The MacBook's lid was closed during
+testing, so the built-in microphone delivered silence; to hear real speech
+in a test, open the lid or use an external microphone. Camera and Speech
+Recognition have not been granted on this Mac, so live camera capture and
+transcription were exercised only through their code paths and test media.
 
 ## Log
 

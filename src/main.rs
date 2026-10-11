@@ -532,5 +532,8 @@ fn permissions(request: bool) -> Result<()> {
     println!("Microphone:       {:?}", tcc::mic_status());
     println!("Camera:           {:?}", tcc::camera_status());
     println!("Accessibility:    {} (resizing windows)", if glide::capture::winsize::trusted(false) { "Authorized" } else { "NotDetermined/Denied" });
+    if glide::capture::camera::builtin_mic_off(None) {
+        println!("Note: the lid is closed, so the built-in microphone records silence.");
+    }
     Ok(())
 }

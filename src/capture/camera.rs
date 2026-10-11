@@ -119,6 +119,71 @@ pub fn microphones() -> Vec<Device> {
     }
 }
 
+/// Unique ID of the system's default microphone.
+pub fn default_microphone() -> Option<String> {
+    unsafe { AVCaptureDevice::defaultDeviceWithMediaType(AVMediaTypeAudio.unwrap()).map(|d| d.uniqueID().to_string()) }
+}
+
+/// A MacBook's built-in microphone is disconnected in hardware while the lid
+/// is closed (e.g. on an external display), so it records only silence.
+/// True when `mic_id` (None = default) is that microphone and the lid is shut.
+pub fn builtin_mic_off(mic_id: Option<&str>) -> bool {
+    let id = mic_id.map(str::to_owned).or_else(default_microphone);
+    id.as_deref() == Some("BuiltInMicrophoneDevice") && lid_closed()
+}
+
+/// Is the laptop lid closed (IOPMrootDomain's AppleClamshellState)?
+/// Cached for two seconds so the UI can ask every frame.
+pub fn lid_closed() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = *c
+        && at.elapsed() < Duration::from_secs(2)
+    {
+        return v;
+    }
+    let v = read_clamshell_state();
+    *c = Some((Instant::now(), v));
+    v
+}
+
+fn read_clamshell_state() -> bool {
+    use std::ffi::{c_char, c_void};
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+        fn IORegistryEntryCreateCFProperty(entry: u32, key: *const c_void, allocator: *const c_void, options: u32) -> *const c_void;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFBooleanGetValue(b: *const c_void) -> bool;
+        fn CFGetTypeID(cf: *const c_void) -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFRelease(cf: *const c_void);
+    }
+    // SAFETY: standard IOKit registry lookup; the matching dictionary is
+    // consumed by IOServiceGetMatchingService and every object is released.
+    unsafe {
+        let service = IOServiceGetMatchingService(0, IOServiceMatching(c"IOPMrootDomain".as_ptr()));
+        if service == 0 {
+            return false;
+        }
+        let key = objc2_core_foundation::CFString::from_str("AppleClamshellState");
+        let v = IORegistryEntryCreateCFProperty(service, objc2_core_foundation::CFRetained::as_ptr(&key).as_ptr() as *const c_void, std::ptr::null(), 0);
+        IOObjectRelease(service);
+        if v.is_null() {
+            return false;
+        }
+        let closed = CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
+        CFRelease(v);
+        closed
+    }
+}
+
 /// Resolve a user-supplied mic selector (unique ID, or case-insensitive name
 /// substring) to a unique ID.
 pub fn resolve_mic(sel: &str) -> Result<String> {

@@ -573,6 +573,9 @@ pub fn ui(
                             ui.selectable_value(&mut s.mic_id, Some(m.id.clone()), &m.name);
                         }
                     });
+                    if crate::capture::camera::builtin_mic_off(s.mic_id.as_deref()) {
+                        caption(ui, "The lid is closed, so the built-in microphone only records silence. Choose another microphone.");
+                    }
                 }
                 toggle_row(ui, "Camera", &mut s.camera);
                 if s.camera {
