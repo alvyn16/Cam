@@ -25,6 +25,15 @@ else
   ko "synthetic export"
 fi
 
+# iPhone/iPad recordings (no device needed): portrait → phone frame → MP4.
+if "$G" synth "$OUT/phone.glide" --device --duration 3 --width 1180 --height 2556 >"$OUT/phone.log" 2>&1 \
+   && grep -q '"device": "phone"' "$OUT/phone.glide/project.json" \
+   && "$G" export "$OUT/phone.glide" -o "$OUT/phone.mp4" >>"$OUT/phone.log" 2>&1 && [ -s "$OUT/phone.mp4" ]; then
+  ok "synthetic iPhone recording -> phone frame + mp4"
+else
+  ko "synthetic iPhone recording"
+fi
+
 code=0
 GLIDE_GUI_SELFTEST=1 GLIDE_OUTPUT_DIR="$OUT/gui" "$G" gui >"$OUT/gui.log" 2>&1 || code=$?
 echo "exit status $code" >>"$OUT/gui.log"

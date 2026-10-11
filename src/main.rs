@@ -178,6 +178,9 @@ enum Cmd {
         width: u32,
         #[arg(long, default_value_t = 1600)]
         height: u32,
+        /// Make it an iPhone/iPad recording (portrait sizes get a phone frame).
+        #[arg(long)]
+        device: bool,
     },
 }
 
@@ -194,7 +197,7 @@ fn main() -> Result<()> {
         Some(Cmd::Export { project, synthetic, output, format, height, fps, quality, codec, target_mb }) => {
             export_cmd(project, synthetic, output, format, height, fps, quality, codec, target_mb)
         }
-        Some(Cmd::Synth { output, duration, width, height }) => synth(output, duration, width, height),
+        Some(Cmd::Synth { output, duration, width, height, device }) => synth(output, duration, width, height, device),
         Some(Cmd::Record { display, window, area, device, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
             record(display, window, area, device, pattern, mic, !no_system_audio, camera, duration, fps, dir, name, (hide_icons, hide_dock))
         }
@@ -407,8 +410,9 @@ fn export_cmd(
     Ok(())
 }
 
-fn synth(output: PathBuf, duration: f64, width: u32, height: u32) -> Result<()> {
-    let (frames, zooms) = glide::synth::write_package(&output, duration, width, height)?;
+fn synth(output: PathBuf, duration: f64, width: u32, height: u32, device: bool) -> Result<()> {
+    let write = if device { glide::synth::write_device_package } else { glide::synth::write_package };
+    let (frames, zooms) = write(&output, duration, width, height)?;
     println!("{} ({frames} frames, {zooms} zooms)", output.display());
     Ok(())
 }

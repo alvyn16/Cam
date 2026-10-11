@@ -122,10 +122,24 @@ pub fn recording(w: u32, h: u32, duration_ms: f64) -> Recording {
 /// Write a synthetic `.glide` package (HEVC screen track plus scripted input).
 /// Returns (frames, auto zooms).
 pub fn write_package(output: &std::path::Path, duration: f64, width: u32, height: u32) -> anyhow::Result<(u64, usize)> {
+    write(output, recording(width, height, duration * 1000.0), duration)
+}
+
+/// Like `write_package`, but recorded from an iPhone/iPad: no cursor or
+/// keys (the project gets a device frame).
+pub fn write_device_package(output: &std::path::Path, duration: f64, width: u32, height: u32) -> anyhow::Result<(u64, usize)> {
+    let mut rec = recording(width, height, duration * 1000.0);
+    rec.meta.kind = SourceKind::Device;
+    rec.mouse.clear();
+    rec.keys.clear();
+    rec.cursors.clear();
+    write(output, rec, duration)
+}
+
+fn write(output: &std::path::Path, rec: Recording, duration: f64) -> anyhow::Result<(u64, usize)> {
     use crate::media::writer::{MovieWriter, WriterSpec, fill_bgra};
     use crate::project::{self, Package, model::Codec};
-    let ms = duration * 1000.0;
-    let rec = recording(width, height, ms);
+    let (width, height) = (rec.meta.screen.width, rec.meta.screen.height);
     let pkg = Package::new(output);
     std::fs::create_dir_all(pkg.recording_dir())?;
     let fps = 60u32;

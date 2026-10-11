@@ -29,7 +29,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R4 | System audio | ☑ | Own track (stems). |
 | R5 | Microphone | ☑ | Own track; "Enhance voice" applies ML voice isolation, levelling and automatic gain control (±9 dB, speech-gated) at export rather than at capture, so the raw track stays untouched. Live capture checked with Microphone granted to the terminal: both capture paths (ScreenCaptureKit and AVCaptureSession) write a 48 kHz mono track in sync with the video. On this Mac it was silent (−91 dB, same with ffmpeg) because the lid is closed and macOS disconnects the built-in mic; Glide now warns about that before recording and in the voice-over panel. |
 | R6 | Camera | ◐ | Separate 720p file, bubble/layouts in the editor. Not exercised live: Camera permission not granted on this Mac. |
-| R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Untested: no iPhone/iPad was connected. |
+| R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Everything after capture is tested with a synthetic portrait device recording (`glide synth --device`: phone frame chosen automatically, no cursor, MP4 export) in `scripts/selftest.sh`. Live capture untested: no iPhone/iPad was connected. |
 | R8 | Input logging | ☑ | 120 Hz mouse + buttons, cursor images with hotspots, keystrokes (needs Input Monitoring). |
 | R9 | Countdown, pause/resume, restart, cancel | ☑ | Floating widget; verified by the scripted GUI run. |
 | R10 | Hide desktop icons / Dock | ☑ | Excluded from the capture by window layer; wallpaper kept. Verified on a real recording. |
@@ -63,7 +63,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 ## Verification on this MacBook (M4 Pro, macOS 27)
 
-`scripts/selftest.sh --screen` (2026-10-11): 5/5 pass.
+`scripts/selftest.sh --screen` (2026-10-11): 6/6 pass.
 
 - `cargo test` (82): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
@@ -72,6 +72,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
   change detection, window picking, GIF quantisation, icon, plus a
   headless UI smoke test driving every editor panel.
 - Synthetic package → MP4 and GIF.
+- Synthetic iPhone recording (1180×2556, kind = device) → phone frame → MP4.
 - Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch → area picker opens over
   the display (screenshotted) and is confirmed → window picker opens with the
   display's windows, highlights one (screenshotted) and is cancelled → record
