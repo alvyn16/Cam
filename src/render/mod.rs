@@ -16,7 +16,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::engine::geom::{Rect, Vec2, v2};
 use crate::engine::scene::{CameraLayer, Frame, TextLayer};
-use crate::project::model::{Background, Color, CursorSkin, Style};
+use crate::project::model::{Background, Color, CursorSkin, MaskKind, Style};
 use crate::project::recording::Recording;
 pub use gpu::Gpu;
 
@@ -32,6 +32,8 @@ const MODE_WINDOW: f32 = 2.0;
 const MODE_CIRCLE: f32 = 3.0;
 const MODE_GRADIENT: f32 = 4.0;
 const MODE_COMPOSITE: f32 = 5.0;
+const MODE_MASK: f32 = 6.0;
+const MODE_DIM: f32 = 7.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -531,6 +533,33 @@ impl Renderer {
             }
             let tex = if self.has_screen { TexId::Screen } else { TexId::Dummy };
             layer.push((d, tex));
+        }
+        // Masks move with the window, so they go into the same layer.
+        for m in &frame.masks {
+            match m.kind {
+                MaskKind::Blur | MaskKind::Pixelate => {
+                    if !self.has_screen {
+                        continue;
+                    }
+                    let mut d = Draw::new(MODE_MASK, m.rect, size);
+                    d.shape = r4(m.rect);
+                    d.uv = r4(m.uv);
+                    d.p0 = [m.radius as f32, 0.0, 0.0, m.alpha as f32];
+                    let flags = if m.kind == MaskKind::Pixelate { 4.0 } else { 0.0 };
+                    d.p2 = [m.amount as f32, 0.0, 0.0, flags];
+                    d.p3 = r4(win.uv);
+                    layer.push((d, TexId::Screen));
+                }
+                MaskKind::Highlight => {
+                    let feather = 3.0 * win.scale;
+                    let mut d = Draw::new(MODE_DIM, m.screen, size);
+                    d.shape = r4(m.rect);
+                    d.color = [0.0, 0.0, 0.0, m.amount.clamp(0.0, 1.0) as f32];
+                    d.p0 = [m.radius as f32, m.screen_radius as f32, feather as f32, m.alpha as f32];
+                    d.p3 = r4(m.screen);
+                    layer.push((d, TexId::Dummy));
+                }
+            }
         }
         {
             let mut d = Draw::new(MODE_COMPOSITE, full, size);

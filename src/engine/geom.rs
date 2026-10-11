@@ -134,6 +134,16 @@ impl Rect {
     pub fn diagonal(&self) -> f64 {
         self.w.hypot(self.h)
     }
+    /// Overlap of two rects (zero-sized when they don't touch).
+    pub fn intersect(&self, o: &Rect) -> Rect {
+        let (x0, y0) = (self.x.max(o.x), self.y.max(o.y));
+        let (x1, y1) = ((self.x + self.w).min(o.x + o.w), (self.y + self.h).min(o.y + o.h));
+        Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+    }
+    /// Rect spanning two corner points in any order.
+    pub fn from_points(a: Vec2, b: Vec2) -> Rect {
+        Rect::new(a.x.min(b.x), a.y.min(b.y), (a.x - b.x).abs(), (a.y - b.y).abs())
+    }
 }
 
 /// Map `v` from [a0, a1] to [b0, b1], clamped.

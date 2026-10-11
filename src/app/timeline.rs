@@ -1,11 +1,12 @@
-//! Timeline: ruler, clip track (slices), zoom track and camera layout track.
+//! Timeline: ruler, clip track (slices), zoom track, mask track and camera
+//! layout track.
 //! Everything is drawn in playback time; edits are stored in source time.
 
 use egui::{Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 use super::editor::{Editor, Selection};
 use super::theme::{self, pal};
-use crate::project::model::{LayoutKind, Zoom, ZoomMode};
+use crate::project::model::{LayoutKind, Mask, MaskKind, Zoom, ZoomMode};
 
 const RULER_H: f32 = 18.0;
 const TRACK_H: f32 = 40.0;
@@ -17,6 +18,7 @@ enum Drag {
     SliceEdge { id: u64, left: bool },
     Zoom { id: u64, part: Part, grab_src: f64, orig: (f64, f64) },
     Layout { id: u64, part: Part, grab_src: f64, orig: (f64, f64) },
+    Mask { id: u64, part: Part, grab_src: f64, orig: (f64, f64) },
     Playhead,
 }
 
@@ -36,11 +38,32 @@ fn clip_color() -> Color32 {
 fn layout_color() -> Color32 {
     Color32::from_rgb(0x10, 0xb9, 0x81)
 }
+fn mask_color() -> Color32 {
+    Color32::from_rgb(0xec, 0x48, 0x99)
+}
+
+/// Greedy lane assignment so overlapping ranges don't cover each other.
+fn lanes(ranges: &[(f64, f64)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by(|&a, &b| ranges[a].0.total_cmp(&ranges[b].0));
+    let mut ends: Vec<f64> = vec![];
+    let mut out = vec![0; ranges.len()];
+    for i in order {
+        let (s, e) = ranges[i];
+        let lane = ends.iter().position(|&end| end <= s).unwrap_or_else(|| {
+            ends.push(f64::MIN);
+            ends.len() - 1
+        });
+        ends[lane] = e;
+        out[i] = lane;
+    }
+    out
+}
 
 pub fn ui(ui: &mut Ui, ed: &mut Editor) {
     let p = pal(ui);
     let has_cam = ed.rec.meta.camera.is_some();
-    let tracks = if has_cam { 3 } else { 2 };
+    let tracks = if has_cam { 4 } else { 3 };
     let height = RULER_H + tracks as f32 * (TRACK_H + GAP) + 4.0;
     let dur = ed.duration().max(1.0);
     let width = (dur as f32 / 1000.0 * ed.px_per_sec).max(ui.available_width() - 4.0);
@@ -67,9 +90,10 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
         let track = |i: usize| Rect::from_min_size(pos2(rect.left(), rect.top() + RULER_H + 2.0 + i as f32 * (TRACK_H + GAP)), vec2(width, TRACK_H));
         let clip_row = track(0);
         let zoom_row = track(1);
-        let layout_row = track(2);
+        let mask_row = track(2);
+        let layout_row = track(3);
         let track_bg = if ui.visuals().dark_mode { Color32::from_white_alpha(8) } else { Color32::from_black_alpha(8) };
-        for r in [clip_row, zoom_row].into_iter().chain(has_cam.then_some(layout_row)) {
+        for r in [clip_row, zoom_row, mask_row].into_iter().chain(has_cam.then_some(layout_row)) {
             painter.rect_filled(r, CornerRadius::same(6), track_bg);
         }
 
@@ -174,6 +198,72 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             });
         }
 
+        // Mask track: overlapping masks stack in lanes.
+        let masks = ed.project.timeline.masks.clone();
+        let lanes = lanes(&masks.iter().map(|m| (m.start, m.end)).collect::<Vec<_>>());
+        let lane_count = lanes.iter().copied().max().map_or(1, |n| n + 1) as f32;
+        for (m, lane) in masks.iter().zip(&lanes) {
+            let (a, b) = (map.to_playback_nearest(m.start), map.to_playback_nearest(m.end));
+            if b <= a {
+                continue;
+            }
+            let lane_h = mask_row.height() / lane_count;
+            let top = mask_row.top() + *lane as f32 * lane_h;
+            let r = Rect::from_min_max(pos2(x_of(a) + 1.0, top + 0.5), pos2(x_of(b) - 1.0, top + lane_h - 0.5));
+            let selected = ed.selection == Selection::Mask(m.id);
+            painter.rect_filled(r, CornerRadius::same(6), mask_color().gamma_multiply(if selected { 0.95 } else { 0.7 }));
+            if selected {
+                painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+            let label = match m.kind {
+                MaskKind::Blur => "Blur",
+                MaskKind::Pixelate => "Pixelate",
+                MaskKind::Highlight => "Highlight",
+            };
+            if r.width() > 40.0 {
+                painter.text(r.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, label, theme::semibold(11.0), Color32::WHITE);
+            }
+            if let Some(pos) = pointer
+                && r.expand(2.0).contains(pos)
+            {
+                let part = if (pos.x - r.left()).abs() < EDGE {
+                    Part::Left
+                } else if (pos.x - r.right()).abs() < EDGE {
+                    Part::Right
+                } else {
+                    Part::Body
+                };
+                if part != Part::Body {
+                    hover_cursor = Some(egui::CursorIcon::ResizeHorizontal);
+                }
+                if bg.drag_started() && drag.is_none() {
+                    drag = Some(Drag::Mask { id: m.id, part, grab_src: map.to_source(pb_of(pos.x)), orig: (m.start, m.end) });
+                    ed.selection = Selection::Mask(m.id);
+                } else if bg.clicked() {
+                    ed.selection = Selection::Mask(m.id);
+                }
+            }
+        }
+        // Double-click empty mask track to add a mask there.
+        if bg.double_clicked()
+            && let Some(pos) = pointer
+            && mask_row.contains(pos)
+            && !masks.iter().any(|m| {
+                let (a, b) = (map.to_playback_nearest(m.start), map.to_playback_nearest(m.end));
+                pos.x >= x_of(a) && pos.x <= x_of(b)
+            })
+        {
+            let src = map.to_source(pb_of(pos.x));
+            let end_limit = ed.rec.meta.duration_ms;
+            let mut new_id = 0;
+            ed.edit(|p| {
+                let id = p.timeline.new_id();
+                new_id = id;
+                p.timeline.masks.push(Mask { id, start: src, end: (src + 3000.0).min(end_limit), ..Default::default() });
+            });
+            ed.selection = Selection::Mask(new_id);
+        }
+
         // Layout track.
         if has_cam {
             let layouts = ed.project.timeline.layouts.clone();
@@ -219,13 +309,13 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             && drag.is_none()
             && let Some(pos) = pointer
         {
-            let on_item = clip_row.contains(pos) || (zoom_row.contains(pos) && ed.selection != Selection::None);
+            let on_item = clip_row.contains(pos) || ((zoom_row.contains(pos) || mask_row.contains(pos)) && ed.selection != Selection::None);
             if ruler.contains(pos) || !on_item {
                 ed.seek(pb_of(pos.x));
                 if bg.drag_started() {
                     drag = Some(Drag::Playhead);
                 }
-                if !ruler.contains(pos) && bg.clicked() && !zoom_row.contains(pos) && !clip_row.contains(pos) {
+                if !ruler.contains(pos) && bg.clicked() && !zoom_row.contains(pos) && !mask_row.contains(pos) && !clip_row.contains(pos) {
                     ed.selection = Selection::None;
                 }
             }
@@ -275,6 +365,22 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
                     }
                     ed.commit(draft);
                 }
+                Drag::Mask { id, part, grab_src, orig } => {
+                    let delta = src - grab_src;
+                    let mut draft = ed.project.clone();
+                    if let Some(m) = draft.timeline.masks.iter_mut().find(|m| m.id == id) {
+                        match part {
+                            Part::Body => {
+                                let len = orig.1 - orig.0;
+                                m.start = (orig.0 + delta).clamp(0.0, (dur_src - len).max(0.0));
+                                m.end = m.start + len;
+                            }
+                            Part::Left => m.start = (orig.0 + delta).clamp(0.0, orig.1 - Mask::MIN_LEN_MS),
+                            Part::Right => m.end = (orig.1 + delta).clamp(orig.0 + Mask::MIN_LEN_MS, dur_src),
+                        }
+                    }
+                    ed.commit(draft);
+                }
                 Drag::Layout { id, part, grab_src, orig } => {
                     let delta = src - grab_src;
                     let mut draft = ed.project.clone();
@@ -309,7 +415,7 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
         }
 
         // Track labels and playhead.
-        for (r, name) in [(clip_row, "Clips"), (zoom_row, "Zoom")].into_iter().chain(has_cam.then_some((layout_row, "Camera"))) {
+        for (r, name) in [(clip_row, "Clips"), (zoom_row, "Zoom"), (mask_row, "Masks")].into_iter().chain(has_cam.then_some((layout_row, "Camera"))) {
             if map.links.is_empty() || name != "Clips" {
                 painter.text(r.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, name, egui::FontId::proportional(10.0), p.tertiary);
             }
@@ -326,4 +432,12 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
         }
     });
     let _ = RichText::new("");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn overlapping_ranges_get_separate_lanes() {
+        assert_eq!(super::lanes(&[(0.0, 5.0), (1.0, 2.0), (5.0, 6.0), (1.5, 7.0)]), vec![0, 1, 0, 2]);
+    }
 }

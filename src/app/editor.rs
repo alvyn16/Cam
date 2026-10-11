@@ -26,6 +26,7 @@ pub enum Selection {
     Slice(u64),
     Zoom(u64),
     Layout(u64),
+    Mask(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +252,7 @@ impl Editor {
             }
             Selection::Zoom(id) => p.timeline.zooms.retain(|z| z.id != id),
             Selection::Layout(id) => p.timeline.layouts.retain(|l| l.id != id),
+            Selection::Mask(id) => p.timeline.masks.retain(|m| m.id != id),
             Selection::None => {}
         });
         self.selection = Selection::None;
@@ -269,6 +271,99 @@ impl Editor {
             p.timeline.zooms.push(Zoom { id, start, end, scale: p.style.default_zoom, ..Default::default() });
         });
         self.selection = Selection::Zoom(new_id);
+    }
+
+    /// Add a blur mask at the playhead.
+    pub fn add_mask(&mut self) {
+        let src = self.source_at_playhead();
+        let end_limit = self.rec.meta.duration_ms;
+        let mut new_id = 0;
+        self.edit(|p| {
+            let id = p.timeline.new_id();
+            new_id = id;
+            let start = src.max(0.0);
+            let end = (start + 3000.0).min(end_limit);
+            p.timeline.masks.push(crate::project::model::Mask { id, start, end, ..Default::default() });
+        });
+        self.selection = Selection::Mask(new_id);
+    }
+
+    /// Preview point (egui) → normalised recording coordinates, using the
+    /// last rendered frame's window placement.
+    fn preview_to_recording(&self, preview: egui::Rect, pos: egui::Pos2) -> Option<crate::engine::geom::Vec2> {
+        let f = self.preview.last_frame.as_ref()?;
+        let out = crate::engine::geom::v2(
+            ((pos.x - preview.min.x) / preview.width()) as f64 * f.size.x,
+            ((pos.y - preview.min.y) / preview.height()) as f64 * f.size.y,
+        );
+        let p = self.preview.scene.output_to_screen(out, f.window.rect);
+        let rec = self.preview.scene.sizes.recording;
+        Some(crate::engine::geom::v2((p.x / rec.x).clamp(0.0, 1.0), (p.y / rec.y).clamp(0.0, 1.0)))
+    }
+
+    /// Normalised recording rect → preview rect (egui points).
+    fn recording_to_preview(&self, preview: egui::Rect, r: crate::engine::geom::Rect) -> Option<egui::Rect> {
+        let f = self.preview.last_frame.as_ref()?;
+        let rec = self.preview.scene.sizes.recording;
+        let map = |x: f64, y: f64| {
+            let o = self.preview.scene.screen_to_output(crate::engine::geom::v2(x * rec.x, y * rec.y), f.window.rect);
+            egui::pos2(preview.min.x + (o.x / f.size.x) as f32 * preview.width(), preview.min.y + (o.y / f.size.y) as f32 * preview.height())
+        };
+        Some(egui::Rect::from_two_pos(map(r.x, r.y), map(r.x + r.w, r.y + r.h)))
+    }
+
+    /// Draw or move the selected mask by dragging on the preview.
+    fn mask_on_preview(&mut self, ui: &mut Ui, preview: egui::Rect, resp: &egui::Response, id: u64) {
+        use crate::engine::geom::{Rect as R, v2};
+        let Some(mask) = self.project.timeline.masks.iter().find(|m| m.id == id).copied() else { return };
+        if let Some(r) = self.recording_to_preview(preview, mask.rect) {
+            let r = r.intersect(preview);
+            ui.painter().rect_stroke(r, CornerRadius::same(3), Stroke::new(1.5, theme::accent()), egui::StrokeKind::Outside);
+            for c in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] {
+                ui.painter().circle(c, 3.5, Color32::WHITE, Stroke::new(1.0, theme::accent()));
+            }
+            if resp.hovered() && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            } else if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+        let drag_id = ui.id().with("mask-drag");
+        #[derive(Clone, Copy)]
+        enum MaskDrag {
+            Draw(crate::engine::geom::Vec2),
+            Move(crate::engine::geom::Vec2, R),
+        }
+        let Some(pos) = resp.interact_pointer_pos() else { return };
+        let Some(at) = self.preview_to_recording(preview, pos) else { return };
+        if resp.drag_started() {
+            let inside = mask.rect.contains(at);
+            let d = if inside { MaskDrag::Move(at, mask.rect) } else { MaskDrag::Draw(at) };
+            ui.data_mut(|m| m.insert_temp(drag_id, d));
+        }
+        if resp.dragged()
+            && let Some(d) = ui.data(|m| m.get_temp::<MaskDrag>(drag_id))
+        {
+            let rect = match d {
+                MaskDrag::Draw(a) => R::from_points(a, at),
+                MaskDrag::Move(grab, orig) => {
+                    let x = (orig.x + at.x - grab.x).clamp(0.0, 1.0 - orig.w);
+                    let y = (orig.y + at.y - grab.y).clamp(0.0, 1.0 - orig.h);
+                    R::new(x, y, orig.w, orig.h)
+                }
+            };
+            if rect.w > 0.005 && rect.h > 0.005 {
+                let mut draft = self.project.clone();
+                if let Some(m) = draft.timeline.masks.iter_mut().find(|m| m.id == id) {
+                    m.rect = rect;
+                }
+                self.commit(draft);
+            }
+        }
+        if resp.drag_stopped() {
+            ui.data_mut(|m| m.remove::<MaskDrag>(drag_id));
+        }
+        let _ = v2;
     }
 
     pub fn start_export(&mut self) {
@@ -354,6 +449,9 @@ impl Editor {
             self.split();
         } else if pressed(egui::Key::Z) && !cmd {
             self.add_zoom();
+        }
+        if !cmd && pressed(egui::Key::M) {
+            self.add_mask();
         }
         if !cmd && pressed(egui::Key::L) {
             self.looping = !self.looping;
@@ -494,7 +592,7 @@ impl Editor {
 
         // Timeline.
         egui::Panel::bottom("timeline")
-            .exact_size(232.0)
+            .exact_size(if self.rec.meta.camera.is_some() { 284.0 } else { 236.0 })
             .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 self.transport(ui);
@@ -520,9 +618,12 @@ impl Editor {
                     ui.painter().add(shadow.as_shape(rect, CornerRadius::same(4)));
                     ui.painter().image(id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                 }
-                // Click on the preview while a manual zoom is selected picks its target.
-                let resp = ui.interact(rect, ui.id().with("preview"), Sense::click());
-                if resp.clicked() {
+                // Click on the preview while a manual zoom is selected picks its
+                // target; with a mask selected, dragging draws or moves it.
+                let resp = ui.interact(rect, ui.id().with("preview"), Sense::click_and_drag());
+                if let Selection::Mask(id) = self.selection {
+                    self.mask_on_preview(ui, rect, &resp, id);
+                } else if resp.clicked() {
                     if let (Selection::Zoom(id), Some(pos)) = (self.selection, resp.interact_pointer_pos()) {
                         self.pick_zoom_target(id, (pos - rect.min) / rect.size());
                     } else {
@@ -570,6 +671,9 @@ impl Editor {
             }
             if ui.button("＋ Zoom").on_hover_text("Add zoom at playhead (Z)").clicked() {
                 self.add_zoom();
+            }
+            if ui.button("＋ Mask").on_hover_text("Blur, pixelate or highlight a region (M)").clicked() {
+                self.add_mask();
             }
             if self.rec.meta.camera.is_some() && ui.button("＋ Layout").clicked() {
                 let src = self.source_at_playhead();

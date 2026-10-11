@@ -99,8 +99,9 @@ enum Cmd {
         project: Option<PathBuf>,
         #[arg(long)]
         tab: Option<String>,
-        #[arg(long)]
-        zoom: bool,
+        /// Select the first zoom, mask or slice.
+        #[arg(long, value_parser = ["zoom", "mask", "slice"])]
+        select: Option<String>,
         #[arg(long)]
         export_sheet: bool,
         #[arg(long)]
@@ -174,7 +175,7 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Snapshot { project, tab, zoom, export_sheet, light, at, output }) => {
+        Some(Cmd::Snapshot { project, tab, select, export_sheet, light, at, output }) => {
             use glide::app::editor::Tab;
             let tab = tab.map(|t| {
                 Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
@@ -182,7 +183,7 @@ fn main() -> Result<()> {
             let shot = glide::app::snapshot::Shot {
                 project: project.as_deref(),
                 tab,
-                select_zoom: zoom,
+                select,
                 export_sheet,
                 dark: !light,
                 playhead_ms: at * 1000.0,
@@ -224,6 +225,18 @@ fn frame(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32, style: O
         let (w, h) = (rec.meta.screen.width, rec.meta.screen.height);
         let px = glide::synth::screen_bgra(w, h, f.source_ms);
         r.set_screen(&VideoFrame { width: w, height: h, stride: (w * 4) as usize, bgra: &px });
+    } else if let Some(dir) = &dir {
+        let pkg = Package::new(dir);
+        let mut src = glide::media::FrameSource::open(&pkg.rec(&rec.meta.screen.file))?;
+        if let Some(vf) = src.frame_at(f.source_ms) {
+            vf.with_bgra(|v| r.set_screen(v));
+        }
+        if let Some(cam) = &rec.meta.camera
+            && let Ok(mut c) = glide::media::FrameSource::open(&pkg.rec(&cam.file))
+            && let Some(vf) = c.frame_at(f.source_ms - cam.offset_ms)
+        {
+            vf.with_bgra(|v| r.set_camera(v));
+        }
     }
     let img = r.render_to_image(&f, &proj.style);
     image::save_buffer(&output, &img.rgba, img.width, img.height, image::ExtendedColorType::Rgba8)?;

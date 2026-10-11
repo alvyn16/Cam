@@ -26,6 +26,7 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
             Selection::Zoom(id) => zoom_panel(ui, ed, &mut draft, id),
             Selection::Slice(id) => slice_panel(ui, &mut draft, id),
             Selection::Layout(id) => layout_panel(ui, &mut draft, id),
+            Selection::Mask(id) => mask_panel(ui, ed, &mut draft, id),
             Selection::None => {
                 tabs(ui, &mut ed.tab);
                 match ed.tab {
@@ -559,4 +560,43 @@ fn layout_panel(ui: &mut Ui, d: &mut Project, id: u64) {
             }
         }
     });
+}
+
+fn mask_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
+    use crate::project::model::{Mask, MaskKind};
+    let Some(m) = d.timeline.masks.iter_mut().find(|m| m.id == id) else { return };
+    let mut delete = false;
+    section(ui, "Mask", |ui| {
+        let before = m.kind;
+        segmented(ui, &mut m.kind, &[(MaskKind::Blur, "Blur"), (MaskKind::Pixelate, "Pixelate"), (MaskKind::Highlight, "Highlight")]);
+        if m.kind != before {
+            m.amount = Mask::default_amount(m.kind);
+        }
+        match m.kind {
+            MaskKind::Blur => slider(ui, "Blur", &mut m.amount, 2.0..=60.0, " px"),
+            MaskKind::Pixelate => slider(ui, "Pixel size", &mut m.amount, 4.0..=60.0, " px"),
+            MaskKind::Highlight => slider(ui, "Dim", &mut m.amount, 0.1..=0.95, ""),
+        };
+        slider(ui, "Roundness", &mut m.radius, 0.0..=60.0, " px");
+        caption(ui, "Drag on the preview to draw the region; drag inside it to move.");
+        egui::CollapsingHeader::new("Position").show(ui, |ui| {
+            slider(ui, "Left", &mut m.rect.x, 0.0..=1.0, "");
+            slider(ui, "Top", &mut m.rect.y, 0.0..=1.0, "");
+            slider(ui, "Width", &mut m.rect.w, 0.01..=1.0, "");
+            slider(ui, "Height", &mut m.rect.h, 0.01..=1.0, "");
+        });
+        caption(ui, &format!("{} – {}", widgets::fmt_time(m.start), widgets::fmt_time(m.end)));
+        ui.horizontal(|ui| {
+            if ui.button("Delete mask").clicked() {
+                delete = true;
+            }
+            if ui.button("Done").clicked() {
+                ed.selection = Selection::None;
+            }
+        });
+    });
+    if delete {
+        d.timeline.masks.retain(|m| m.id != id);
+        ed.selection = Selection::None;
+    }
 }

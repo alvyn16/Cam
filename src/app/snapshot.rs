@@ -15,7 +15,8 @@ pub struct Shot<'a> {
     /// Editor for this project, or the home view when None.
     pub project: Option<&'a Path>,
     pub tab: Option<Tab>,
-    pub select_zoom: bool,
+    /// Select the first "zoom", "mask" or "slice".
+    pub select: Option<String>,
     pub export_sheet: bool,
     pub dark: bool,
     pub playhead_ms: f64,
@@ -40,11 +41,13 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         if let Some(t) = shot.tab {
             ed.tab = t;
         }
-        if shot.select_zoom
-            && let Some(z) = ed.project.timeline.zooms.first()
-        {
-            ed.selection = Selection::Zoom(z.id);
-        }
+        let tl = &ed.project.timeline;
+        ed.selection = match shot.select.as_deref() {
+            Some("zoom") => tl.zooms.first().map_or(Selection::None, |z| Selection::Zoom(z.id)),
+            Some("mask") => tl.masks.first().map_or(Selection::None, |m| Selection::Mask(m.id)),
+            Some("slice") => tl.slices.first().map_or(Selection::None, |s| Selection::Slice(s.id)),
+            _ => Selection::None,
+        };
         ed.export.open = shot.export_sheet;
         ed.seek(shot.playhead_ms);
     }

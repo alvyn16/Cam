@@ -14,7 +14,7 @@ use super::sizes::Sizes;
 use super::spring::SpringConfig;
 use super::timemap::TimeMap;
 use super::zoom;
-use crate::project::model::{ClickEffect, Color, LayoutKind, Project, Shadow};
+use crate::project::model::{ClickEffect, Color, LayoutKind, MaskKind, Project, Shadow};
 use crate::project::recording::Recording;
 
 /// Directional or radial blur for a moving layer.
@@ -101,6 +101,23 @@ pub struct TextLayer {
     pub badge: bool,
 }
 
+/// A region effect on the screen (blur, pixelate or highlight).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskLayer {
+    pub kind: MaskKind,
+    /// Region in output px (already clipped to the visible screen).
+    pub rect: Rect,
+    /// The same region in screen-texture uv.
+    pub uv: Rect,
+    pub radius: f64,
+    /// Blur/pixel size in output px, or dim opacity for highlights.
+    pub amount: f64,
+    pub alpha: f64,
+    /// The window's inner (screen) rect and corner radius, for clipping.
+    pub screen: Rect,
+    pub screen_radius: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     /// Output size in pixels.
@@ -116,6 +133,7 @@ pub struct Frame {
     pub camera: Option<CameraLayer>,
     pub camera_full: Option<CameraLayer>,
     pub texts: Vec<TextLayer>,
+    pub masks: Vec<MaskLayer>,
 }
 
 struct Anim {
@@ -243,8 +261,15 @@ impl Scene {
         (Rect::from_min_size(min, body.size() * v[0]).scale_about_origin(k), v[0])
     }
 
+    /// Map an output-pixel point back to screen-video pixels given the window rect.
+    pub fn output_to_screen(&self, p: Vec2, window: Rect) -> Vec2 {
+        let s = &self.sizes;
+        let local = (p - window.min()).div(window.size().div(s.window));
+        local + s.crop.min() - Vec2::splat(s.inset)
+    }
+
     /// Map a screen-video point to output pixels given the window rect.
-    fn screen_to_output(&self, p: Vec2, window: Rect) -> Vec2 {
+    pub fn screen_to_output(&self, p: Vec2, window: Rect) -> Vec2 {
         let s = &self.sizes;
         let local = p - s.crop.min() + Vec2::splat(s.inset);
         window.min() + local.mul(window.size().div(s.window))
@@ -469,6 +494,40 @@ impl Scene {
             }
         }
 
+        // Masks, clipped to the visible (cropped) screen.
+        let screen_rect = Rect::from_min_size(
+            self.screen_to_output(self.sizes.crop.min(), rect),
+            self.sizes.crop.size().mul(rect.size().div(self.sizes.window)),
+        );
+        let zk = k * zoom_scale;
+        let masks = self
+            .project
+            .timeline
+            .masks
+            .iter()
+            .filter_map(|m| {
+                let alpha = m.alpha_at(src);
+                if alpha <= 0.002 {
+                    return None;
+                }
+                let rec_px = Rect::new(m.rect.x * rec.x, m.rect.y * rec.y, m.rect.w * rec.x, m.rect.h * rec.y).intersect(&self.sizes.crop);
+                if rec_px.w <= 0.0 || rec_px.h <= 0.0 {
+                    return None;
+                }
+                let out = Rect::from_points(self.screen_to_output(rec_px.min(), rect), self.screen_to_output(rec_px.max(), rect));
+                Some(MaskLayer {
+                    kind: m.kind,
+                    rect: out,
+                    uv: Rect::new(rec_px.x / rec.x, rec_px.y / rec.y, rec_px.w / rec.x, rec_px.h / rec.y),
+                    radius: m.radius * zk,
+                    amount: if m.kind == MaskKind::Highlight { m.amount } else { m.amount * zk },
+                    alpha,
+                    screen: screen_rect,
+                    screen_radius: window.inner_radius,
+                })
+            })
+            .collect();
+
         Frame {
             size,
             playback_ms: pb,
@@ -481,6 +540,7 @@ impl Scene {
             camera: cam,
             camera_full: cam_full,
             texts,
+            masks,
         }
     }
 }

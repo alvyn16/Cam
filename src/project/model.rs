@@ -459,12 +459,71 @@ impl Default for LayoutRange {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaskKind {
+    /// Soft blur inside the rect (hide private details).
+    #[default]
+    Blur,
+    /// Mosaic inside the rect.
+    Pixelate,
+    /// Dim everything outside the rect (spotlight).
+    Highlight,
+}
+
+/// A region effect over a time range (source ms).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Mask {
+    pub id: u64,
+    pub start: f64,
+    pub end: f64,
+    pub kind: MaskKind,
+    /// Region normalised to the recording (0..1, top-left origin).
+    pub rect: Rect,
+    /// Blur/pixel size in output px at 1080p (Blur, Pixelate) or dim
+    /// opacity 0..1 (Highlight).
+    pub amount: f64,
+    /// Corner radius in output px at 1080p.
+    pub radius: f64,
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Mask { id: 0, start: 0.0, end: 0.0, kind: MaskKind::Blur, rect: Rect::new(0.35, 0.35, 0.3, 0.3), amount: 16.0, radius: 10.0 }
+    }
+}
+
+impl Mask {
+    /// Fade in/out time at the ends of the range.
+    pub const FADE_MS: f64 = 150.0;
+    pub const MIN_LEN_MS: f64 = 300.0;
+
+    pub fn default_amount(kind: MaskKind) -> f64 {
+        match kind {
+            MaskKind::Blur => 16.0,
+            MaskKind::Pixelate => 14.0,
+            MaskKind::Highlight => 0.6,
+        }
+    }
+
+    /// Opacity at a source time (0 outside the range, eased at the ends).
+    pub fn alpha_at(&self, t: f64) -> f64 {
+        if t < self.start || t > self.end {
+            return 0.0;
+        }
+        let edge = ((t - self.start).min(self.end - t) / Self::FADE_MS).clamp(0.0, 1.0);
+        edge * edge * (3.0 - 2.0 * edge)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Timeline {
     pub slices: Vec<Slice>,
     pub zooms: Vec<Zoom>,
     pub layouts: Vec<LayoutRange>,
+    pub masks: Vec<Mask>,
     next_id: u64,
 }
 

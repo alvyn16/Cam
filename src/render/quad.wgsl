@@ -8,6 +8,8 @@ const MODE_WINDOW: u32 = 2u;
 const MODE_CIRCLE: u32 = 3u;
 const MODE_GRADIENT: u32 = 4u;
 const MODE_COMPOSITE: u32 = 5u;
+const MODE_MASK: u32 = 6u;
+const MODE_DIM: u32 = 7u;
 
 const PI: f32 = 3.14159265;
 
@@ -314,6 +316,63 @@ fn mode_composite(local: vec2<f32>) -> vec4<f32> {
     return sample_at(uv, 0.0) * d.p0.w;
 }
 
+// Average of a block of the screen texture (4x4 taps), clamped to the
+// visible crop so cropped-out pixels never leak in.
+fn block_avg(center: vec2<f32>, block: vec2<f32>) -> vec4<f32> {
+    let lo = d.p3.xy;
+    let hi = d.p3.xy + d.p3.zw;
+    var acc = vec4<f32>(0.0);
+    for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+            let o = (vec2<f32>(f32(x), f32(y)) + 0.5) / 4.0 - 0.5;
+            acc += sample_at(clamp(center + o * block, lo, hi), 0.0);
+        }
+    }
+    return acc / 16.0;
+}
+
+// Blur or pixelate the screen inside a rounded rect. The blur is a smooth
+// mosaic: block averages on a grid fixed in texture space, blended with a
+// smoothstep, which is stable while the window moves and zooms.
+fn mode_mask(local: vec2<f32>) -> vec4<f32> {
+    let half = d.shape.zw * 0.5;
+    let cov = coverage(sd_round_rect(local, d.shape.xy + half, half, d.p0.x));
+    if cov <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let dims = vec2<f32>(textureDimensions(tex, 0));
+    let px_per_out = dims.x * d.uv.z / max(d.rect.z, 1.0);
+    let block = vec2<f32>(max(d.p2.x * px_per_out, 2.0)) / dims;
+    let uv = rect_uv(local);
+    var c: vec4<f32>;
+    if (u32(d.p2.w) & 4u) != 0u {
+        c = block_avg((floor(uv / block) + 0.5) * block, block);
+    } else {
+        let g = uv / block - 0.5;
+        let i = floor(g);
+        let f = fract(g);
+        let s = f * f * (3.0 - 2.0 * f);
+        let c00 = block_avg((i + vec2<f32>(0.5, 0.5)) * block, block);
+        let c10 = block_avg((i + vec2<f32>(1.5, 0.5)) * block, block);
+        let c01 = block_avg((i + vec2<f32>(0.5, 1.5)) * block, block);
+        let c11 = block_avg((i + vec2<f32>(1.5, 1.5)) * block, block);
+        c = mix(mix(c00, c10, s.x), mix(c01, c11, s.x), s.y);
+    }
+    return vec4<f32>(c.rgb, 1.0) * cov * d.p0.w;
+}
+
+// Dim the screen outside a rounded rect (spotlight). p3 = screen rect,
+// p0 = (hole radius, screen radius, feather px, opacity).
+fn mode_dim(local: vec2<f32>) -> vec4<f32> {
+    let sh = d.p3.zw * 0.5;
+    let screen = coverage(sd_round_rect(local, d.p3.xy + sh, sh, d.p0.y));
+    let half = d.shape.zw * 0.5;
+    let feather = max(d.p0.z, 1.0);
+    let hole = clamp(0.5 - sd_round_rect(local, d.shape.xy + half, half, d.p0.x) / feather, 0.0, 1.0);
+    let a = d.color.a * d.p0.w * screen * (1.0 - hole);
+    return vec4<f32>(d.color.rgb * a, a);
+}
+
 @fragment
 fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let mode = u32(d.out.z);
@@ -323,6 +382,8 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         case 3u: { return mode_circle(i.local); }
         case 4u: { return mode_gradient(i.local); }
         case 5u: { return mode_composite(i.local); }
+        case 6u: { return mode_mask(i.local); }
+        case 7u: { return mode_dim(i.local); }
         default: { return mode_texture(i.local); }
     }
 }
