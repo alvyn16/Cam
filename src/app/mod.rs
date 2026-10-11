@@ -1096,6 +1096,27 @@ impl ApplicationHandler for App {
         let _ = el;
     }
 
+    /// ⌘Q from the app menu, logout or our own quit: never lose work.
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let View::Editor(ed) = &mut self.view {
+            if ed.voice.is_some() {
+                ed.stop_voiceover();
+            }
+            ed.save();
+        }
+        if let Some(Recording { rec: Some(r), .. }) = self.recording.take() {
+            if let Err(e) = objc2::rc::autoreleasepool(|_| r.stop()) {
+                eprintln!("glide: saving the recording on quit failed: {e:#}");
+            }
+        }
+        while self.finishing && self.finished.lock().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.selftest.is_none() {
+            self.settings.save();
+        }
+    }
+
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if self.last_tick.elapsed() >= Duration::from_millis(100) {
             self.last_tick = Instant::now();
