@@ -107,7 +107,7 @@ pub fn recording(w: u32, h: u32, duration_ms: f64) -> Recording {
             version: 1,
             kind: SourceKind::Window,
             duration_ms,
-            screen: VideoTrack { file: "screen.mov".into(), width: w, height: h, fps: 60.0 },
+            screen: VideoTrack { file: "screen.mov".into(), width: w, height: h, fps: 60.0, offset_ms: 0.0 },
             scale: 2.0,
             bounds: Rect::new(0.0, 0.0, w as f64 / 2.0, h as f64 / 2.0),
             ..Default::default()

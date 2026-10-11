@@ -513,7 +513,7 @@ mod tests {
         Recording {
             meta: RecordingMeta {
                 duration_ms: 10_000.0,
-                screen: VideoTrack { file: "screen.mov".into(), width: 1920, height: 1080, fps: 60.0 },
+                screen: VideoTrack { file: "screen.mov".into(), width: 1920, height: 1080, fps: 60.0, offset_ms: 0.0 },
                 scale: 2.0,
                 ..Default::default()
             },

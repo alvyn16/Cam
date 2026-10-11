@@ -24,6 +24,9 @@ pub struct VideoTrack {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// Recording time of this file's first frame (camera files start a
+    /// little after the screen).
+    pub offset_ms: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

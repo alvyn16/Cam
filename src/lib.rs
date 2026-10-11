@@ -8,3 +8,7 @@ pub mod engine;
 pub mod project;
 pub mod render;
 pub mod synth;
+pub mod capture;
+pub mod util;
+pub mod media;
+pub mod export;
