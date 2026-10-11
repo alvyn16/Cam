@@ -106,7 +106,7 @@ pub(super) fn encode(
             bail!("export cancelled");
         }
         let frame = scene.frame(i as f64 * 1000.0 / s.fps as f64, h as f64);
-        inputs.feed(&mut pump.renderer, frame.source_ms);
+        inputs.feed(&mut pump.renderer, frame.source_ms, None);
         pump.submit(&frame, &job.project.style);
         if pump.full() {
             send_oldest(pump, &mut submitted);

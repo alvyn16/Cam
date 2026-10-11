@@ -15,12 +15,12 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 
-use crate::capture::mixer::RATE;
 use crate::engine::scene::Scene;
-use crate::media::FrameSource;
+use crate::media::{FrameSource, Prefetch};
 use crate::media::writer::{MovieWriter, WriterSpec, fill_bgra};
 use crate::project::model::{ExportFormat, ExportSettings, Project};
 use crate::project::recording::Recording;
+use crate::render::interop::{TextureCache, Wrapped};
 use crate::render::{Gpu, OUTPUT_FORMAT, Renderer, VideoFrame, gpu::padded_row};
 
 /// Frames in flight between render and encode.
@@ -67,6 +67,9 @@ struct Inputs {
     camera: Option<FrameSource>,
     camera_offset: f64,
     synthetic: Option<(u32, u32)>,
+    /// Background decoders keyed by output frame index.
+    pre_screen: Option<Prefetch>,
+    pre_camera: Option<Prefetch>,
 }
 
 impl Inputs {
@@ -74,7 +77,14 @@ impl Inputs {
         match &job.source {
             Source::Synthetic => {
                 let m = &job.recording.meta.screen;
-                Ok(Inputs { screen: None, camera: None, camera_offset: 0.0, synthetic: Some((m.width, m.height)) })
+                Ok(Inputs {
+                    screen: None,
+                    camera: None,
+                    camera_offset: 0.0,
+                    synthetic: Some((m.width, m.height)),
+                    pre_screen: None,
+                    pre_camera: None,
+                })
             }
             Source::Package(dir) => {
                 let rd = dir.join("recording");
@@ -84,13 +94,46 @@ impl Inputs {
                     None => None,
                 };
                 let camera_offset = job.recording.meta.camera.as_ref().map_or(0.0, |c| c.offset_ms);
-                Ok(Inputs { screen, camera, camera_offset, synthetic: None })
+                Ok(Inputs { screen, camera, camera_offset, synthetic: None, pre_screen: None, pre_camera: None })
             }
         }
     }
 
-    /// Upload the media for a source time into the renderer.
-    fn feed(&mut self, r: &mut Renderer, source_ms: f64) {
+    /// Start background decoding for the source time of every output frame.
+    fn prefetch(&mut self, job: &Job, times: &[f64]) {
+        let Source::Package(dir) = &job.source else { return };
+        let rd = dir.join("recording");
+        if self.screen.is_some() {
+            self.pre_screen = Prefetch::spawn(rd.join(&job.recording.meta.screen.file), times.to_vec()).ok();
+        }
+        if let (Some(_), Some(c)) = (&self.camera, &job.recording.meta.camera) {
+            let shifted: Vec<f64> = times.iter().map(|t| t - self.camera_offset).collect();
+            self.pre_camera = Prefetch::spawn(rd.join(&c.file), shifted).ok();
+        }
+    }
+
+    /// Upload the media for output frame `i` (prefetched) or a source time.
+    fn feed_index(&mut self, r: &mut Renderer, i: usize, source_ms: f64, cache: Option<&TextureCache>) {
+        if self.pre_screen.is_none() && self.pre_camera.is_none() {
+            return self.feed(r, source_ms, cache);
+        }
+        if let Some(f) = self.pre_screen.as_ref().and_then(|p| p.get(i)) {
+            match cache.and_then(|c| c.wrap(&f.pb.0, wgpu::TextureUsages::TEXTURE_BINDING)) {
+                Some(w) => r.set_screen_wrapped(w),
+                None => f.with_bgra(|v| r.set_screen(v)),
+            }
+        }
+        if let Some(f) = self.pre_camera.as_ref().and_then(|p| p.get(i)) {
+            match cache.and_then(|c| c.wrap(&f.pb.0, wgpu::TextureUsages::TEXTURE_BINDING)) {
+                Some(w) => r.set_camera_wrapped(w),
+                None => f.with_bgra(|v| r.set_camera(v)),
+            }
+        }
+    }
+
+    /// Upload the media for a source time into the renderer. With a
+    /// texture cache, decoded frames are used in place (zero copy).
+    fn feed(&mut self, r: &mut Renderer, source_ms: f64, cache: Option<&TextureCache>) {
         if let Some((w, h)) = self.synthetic {
             let px = crate::synth::screen_bgra(w, h, source_ms);
             r.set_screen(&VideoFrame { width: w, height: h, stride: (w * 4) as usize, bgra: &px });
@@ -98,12 +141,18 @@ impl Inputs {
         if let Some(s) = &mut self.screen
             && let Some(f) = s.frame_at(source_ms)
         {
-            f.with_bgra(|v| r.set_screen(v));
+            match cache.and_then(|c| c.wrap(&f.pb.0, wgpu::TextureUsages::TEXTURE_BINDING)) {
+                Some(w) => r.set_screen_wrapped(w),
+                None => f.with_bgra(|v| r.set_screen(v)),
+            }
         }
         if let Some(c) = &mut self.camera
             && let Some(f) = c.frame_at(source_ms - self.camera_offset)
         {
-            f.with_bgra(|v| r.set_camera(v));
+            match cache.and_then(|tc| tc.wrap(&f.pb.0, wgpu::TextureUsages::TEXTURE_BINDING)) {
+                Some(w) => r.set_camera_wrapped(w),
+                None => f.with_bgra(|v| r.set_camera(v)),
+            }
         }
     }
 }
@@ -212,6 +261,10 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
     };
     pump.renderer.prepare(&job.project.style, &job.recording, dir);
     let mut inputs = Inputs::open(job)?;
+    if s.format == ExportFormat::Mp4 {
+        let times: Vec<f64> = (0..total).map(|i| scene.map.to_source(i as f64 * 1000.0 / s.fps as f64)).collect();
+        inputs.prefetch(job, &times);
+    }
     if let Some(parent) = job.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -222,38 +275,25 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
                 &job.output,
                 &WriterSpec { width: w, height: h, fps: s.fps, codec: s.codec, bitrate: s.bitrate(w, h), audio: soundtrack.is_some() },
             )?;
-            let mut done = 0u64;
-            let encode = |pump: &mut FramePump, writer: &mut MovieWriter, done: &mut u64| -> Result<()> {
-                let pb = writer.buffer()?;
-                pump.take(|rows, stride| fill_bgra(&pb, rows, w, h, stride));
-                writer.push_frame(&pb)?;
-                *done += 1;
-                if let Some(m) = &soundtrack {
-                    let until = ((*done as f64 / s.fps as f64 + 0.5) * RATE) as usize;
-                    writer.push_audio_until(m, until)?;
-                }
-                Ok(())
+            if let Some(m) = soundtrack {
+                writer.set_soundtrack(Arc::new(m));
+            }
+            let cache = TextureCache::new(&pump.renderer.gpu().device);
+            let result = match &cache {
+                Some(cache) => mp4_zero_copy(job, &mut scene, &mut pump, &mut inputs, cache, &mut writer, total, progress, cancel),
+                None => mp4_readback(job, &mut scene, &mut pump, &mut inputs, &mut writer, total, progress, cancel),
             };
-            for i in 0..total {
-                if cancel.load(Ordering::SeqCst) {
+            match result {
+                Ok(done) => {
+                    writer.finish()?;
+                    Ok(done)
+                }
+                Err(e) => {
                     writer.cancel();
                     let _ = std::fs::remove_file(&job.output);
-                    bail!("export cancelled");
+                    Err(e)
                 }
-                let t = i as f64 * 1000.0 / s.fps as f64;
-                let frame = scene.frame(t, h as f64);
-                inputs.feed(&mut pump.renderer, frame.source_ms);
-                pump.submit(&frame, &job.project.style);
-                if pump.full() {
-                    encode(&mut pump, &mut writer, &mut done)?;
-                }
-                progress(i as f64 / total as f64);
             }
-            while !pump.pending.is_empty() {
-                encode(&mut pump, &mut writer, &mut done)?;
-            }
-            writer.finish(soundtrack.as_deref())?;
-            Ok(done)
         }
         ExportFormat::Gif => gif::encode(job, &mut scene, &mut pump, &mut inputs, total, progress, cancel),
     };
@@ -268,6 +308,118 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
         video_seconds: scene.duration() / 1000.0,
         bytes,
     })
+}
+
+/// Render straight into the encoder's IOSurface pixel buffers.
+#[allow(clippy::too_many_arguments)]
+fn mp4_zero_copy(
+    job: &Job,
+    scene: &mut Scene,
+    pump: &mut FramePump,
+    inputs: &mut Inputs,
+    cache: &TextureCache,
+    writer: &mut MovieWriter,
+    total: u64,
+    progress: ProgressFn,
+    cancel: &AtomicBool,
+) -> Result<u64> {
+    let s = job.settings;
+    let h = pump.h;
+    let gpu = pump.renderer.gpu().clone();
+    let mut inflight: VecDeque<(Wrapped, wgpu::SubmissionIndex)> = VecDeque::new();
+    let mut done = 0u64;
+    let profile = std::env::var_os("GLIDE_PROFILE").is_some();
+    let mut prof = [0.0f64; 5];
+    let mut finish_oldest = |inflight: &mut VecDeque<(Wrapped, wgpu::SubmissionIndex)>, writer: &mut MovieWriter, prof: &mut [f64; 5]| -> Result<()> {
+        if let Some((target, idx)) = inflight.pop_front() {
+            let t = Instant::now();
+            let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None });
+            prof[3] += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            writer.push_frame(&target.pb.0)?;
+            prof[4] += t.elapsed().as_secs_f64();
+            done += 1;
+        }
+        Ok(())
+    };
+    for i in 0..total {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("export cancelled");
+        }
+        let t = Instant::now();
+        let frame = scene.frame(i as f64 * 1000.0 / s.fps as f64, h as f64);
+        prof[0] += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        inputs.feed_index(&mut pump.renderer, i as usize, frame.source_ms, Some(cache));
+        prof[1] += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let pb = writer.buffer()?;
+        let target = cache
+            .wrap(&pb, wgpu::TextureUsages::RENDER_ATTACHMENT)
+            .ok_or_else(|| anyhow::anyhow!("cannot wrap encoder buffer"))?;
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        pump.renderer.render(&frame, &job.project.style, &target.view, &mut enc);
+        let idx = gpu.queue.submit([enc.finish()]);
+        prof[2] += t.elapsed().as_secs_f64();
+        inflight.push_back((target, idx));
+        if inflight.len() >= IN_FLIGHT {
+            finish_oldest(&mut inflight, writer, &mut prof)?;
+        }
+        if i % 120 == 0 {
+            cache.flush();
+        }
+        progress(i as f64 / total as f64);
+    }
+    while !inflight.is_empty() {
+        finish_oldest(&mut inflight, writer, &mut prof)?;
+    }
+    if profile {
+        eprintln!(
+            "\nprofile: scene {:.2}s  decode+upload {:.2}s  render+submit {:.2}s  gpu wait {:.2}s  encoder {:.2}s",
+            prof[0], prof[1], prof[2], prof[3], prof[4]
+        );
+    }
+    Ok(done)
+}
+
+/// Fallback: render, read back through the CPU, copy into pixel buffers.
+#[allow(clippy::too_many_arguments)]
+fn mp4_readback(
+    job: &Job,
+    scene: &mut Scene,
+    pump: &mut FramePump,
+    inputs: &mut Inputs,
+    writer: &mut MovieWriter,
+    total: u64,
+    progress: ProgressFn,
+    cancel: &AtomicBool,
+) -> Result<u64> {
+    let s = job.settings;
+    let (w, h) = (pump.w, pump.h);
+    let mut done = 0u64;
+    let encode = |pump: &mut FramePump, writer: &mut MovieWriter, done: &mut u64| -> Result<()> {
+        let pb = writer.buffer()?;
+        pump.take(|rows, stride| fill_bgra(&pb, rows, w, h, stride));
+        writer.push_frame(&pb)?;
+        *done += 1;
+        Ok(())
+    };
+    for i in 0..total {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("export cancelled");
+        }
+        let frame = scene.frame(i as f64 * 1000.0 / s.fps as f64, h as f64);
+        inputs.feed_index(&mut pump.renderer, i as usize, frame.source_ms, None);
+        pump.submit(&frame, &job.project.style);
+        if pump.full() {
+            encode(pump, writer, &mut done)?;
+        }
+        progress(i as f64 / total as f64);
+    }
+    while !pump.pending.is_empty() {
+        encode(pump, writer, &mut done)?;
+    }
+    Ok(done)
 }
 
 /// Default output path next to the package.

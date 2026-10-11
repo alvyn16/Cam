@@ -270,6 +270,13 @@ impl Session {
         self.shared.error.lock().unwrap().clone()
     }
 
+    /// Host-clock time of the first recorded frame.
+    pub fn t0_secs(&self) -> Option<f64> {
+        let mut t = None;
+        self.shared.with(|s| t = s.t0_secs());
+        t
+    }
+
     pub fn has_frames(&self) -> bool {
         let mut ok = false;
         self.shared.with(|s| ok = s.started());

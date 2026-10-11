@@ -43,6 +43,12 @@ pub struct Frame {
     pub pb: SendBox<CFRetained<CVPixelBuffer>>,
 }
 
+impl Clone for Frame {
+    fn clone(&self) -> Self {
+        Frame { pts_ms: self.pts_ms, pb: SendBox(self.pb.0.clone()) }
+    }
+}
+
 impl Frame {
     pub fn size(&self) -> (u32, u32) {
         (CVPixelBufferGetWidth(&self.pb.0) as u32, CVPixelBufferGetHeight(&self.pb.0) as u32)
@@ -187,6 +193,43 @@ impl FrameSource {
             self.upcoming = self.reader.next_frame();
         }
         self.current.as_ref()
+    }
+}
+
+/// Decodes the frames for a known list of times on a background thread,
+/// so hardware decode overlaps rendering and encoding.
+pub struct Prefetch {
+    rx: std::sync::mpsc::Receiver<(usize, Option<Frame>)>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl Prefetch {
+    pub fn spawn(path: std::path::PathBuf, times: Vec<f64>) -> Result<Self> {
+        // Open eagerly so errors surface here.
+        let mut src = FrameSource::open(&path)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(6);
+        let thread = std::thread::spawn(move || {
+            for (i, t) in times.into_iter().enumerate() {
+                let f = objc2::rc::autoreleasepool(|_| src.frame_at(t).cloned());
+                if tx.send((i, f)).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Prefetch { rx, _thread: thread })
+    }
+
+    /// The frame for output index `i` (indices must be requested in order).
+    pub fn get(&self, i: usize) -> Option<Frame> {
+        loop {
+            let (j, f) = self.rx.recv().ok()?;
+            if j == i {
+                return f;
+            }
+            if j > i {
+                return None;
+            }
+        }
     }
 }
 

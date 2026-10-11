@@ -4,6 +4,7 @@
 
 pub mod art;
 pub mod gpu;
+pub mod interop;
 pub mod text;
 
 use std::collections::HashMap;
@@ -137,6 +138,8 @@ pub struct Renderer {
     text_used: Vec<u64>,
     has_screen: bool,
     has_camera: bool,
+    /// Zero-copy frames still possibly in use by the GPU.
+    keep: std::collections::VecDeque<interop::Wrapped>,
 }
 
 impl Renderer {
@@ -230,6 +233,7 @@ impl Renderer {
             text_used: vec![],
             has_screen: false,
             has_camera: false,
+            keep: std::collections::VecDeque::new(),
         };
         r.upload(TexId::Dummy, &Image { width: 1, height: 1, rgba: vec![0, 0, 0, 0] }, false);
         r
@@ -338,6 +342,26 @@ impl Renderer {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(f.stride as u32), rows_per_image: None },
             wgpu::Extent3d { width: f.width, height: f.height, depth_or_array_layers: 1 },
         );
+    }
+
+    fn set_wrapped(&mut self, id: TexId, w: interop::Wrapped) {
+        let bind = self.make_bind(&w.view);
+        self.textures.insert(id, Tex { texture: w.texture.clone(), bind, size: w.size });
+        self.keep.push_back(w);
+        while self.keep.len() > 8 {
+            self.keep.pop_front();
+        }
+    }
+
+    /// Use an IOSurface-backed frame directly (no copy).
+    pub fn set_screen_wrapped(&mut self, w: interop::Wrapped) {
+        self.set_wrapped(TexId::Screen, w);
+        self.has_screen = true;
+    }
+
+    pub fn set_camera_wrapped(&mut self, w: interop::Wrapped) {
+        self.set_wrapped(TexId::Camera, w);
+        self.has_camera = true;
     }
 
     pub fn set_screen(&mut self, f: &VideoFrame) {

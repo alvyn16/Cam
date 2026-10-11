@@ -1,0 +1,450 @@
+//! Recording into a `.glide` package: the screen (without the cursor) with
+//! system audio and microphone stems, the camera as its own file, and
+//! input events for re-rendering the cursor, zooms and key badges.
+
+pub mod input;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+
+use crate::capture::camera::Camera;
+use crate::capture::compose::{Corner, PipSpec, Scene as CapScene, Shape};
+use crate::capture::record::{MicBackend, Options as CapOptions, Session, Shared};
+use crate::capture::screen;
+use crate::capture::writer::{AudioLayout, Codec as CapCodec, Sink, VideoSpec};
+use crate::engine::geom::Rect;
+use crate::project::recording::{
+    AudioTrack, CursorImage, KeyEvent, MouseEvent, RecordingMeta, SourceKind, VideoTrack,
+};
+use crate::project::{self, Package};
+use crate::util::*;
+use input::{InputLog, InputLogger};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    Display { id: u32 },
+    Window { id: u32 },
+    /// A region of a display, in display-local points (top-left origin).
+    Area { display: u32, rect: Rect },
+    /// Generated test pattern (no permission needed).
+    Pattern,
+}
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub target: Target,
+    pub system_audio: bool,
+    /// None = off; Some(None) = default microphone.
+    pub mic: Option<Option<String>>,
+    /// None = off; Some(None) = default camera.
+    pub camera: Option<Option<String>>,
+    pub fps: u32,
+    /// Log key presses (needs Input Monitoring permission).
+    pub keys: bool,
+    /// Folder for the new package.
+    pub dir: PathBuf,
+    /// Package file name stem (default: "Recording <date>").
+    pub name: Option<String>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            target: Target::Display { id: 0 },
+            system_audio: true,
+            mic: None,
+            camera: None,
+            fps: 60,
+            keys: true,
+            dir: project::projects_dir(),
+            name: None,
+        }
+    }
+}
+
+/// A camera-only constant-frame-rate recording (its own file).
+struct CameraRec {
+    shared: Arc<Shared>,
+    stop: Arc<AtomicBool>,
+    pacer: Option<std::thread::JoinHandle<()>>,
+    cam: Camera,
+}
+
+impl CameraRec {
+    fn start(sel: Option<&str>, path: &std::path::Path) -> Result<Self> {
+        let spec = VideoSpec { width: 1280, height: 720, fps: 30, codec: CapCodec::H264, bitrate: 8_000_000, pixel_format: PIX_BGRA };
+        let sink = Sink::new(Some(path), &spec, false, false, AudioLayout::Stems, [0.0; 2], None, CapScene::Screen, None)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
+        let cam = Camera::start_with(sel, shared.clone(), true)?;
+        let (ps, pstop) = (shared.clone(), stop.clone());
+        let pacer = std::thread::spawn(move || {
+            while !pstop.load(Ordering::SeqCst) {
+                let now = secs(host_now());
+                objc2::rc::autoreleasepool(|_| ps.with(|s| s.emit_until(now - s.lag())));
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        });
+        Ok(CameraRec { shared, stop, pacer: Some(pacer), cam })
+    }
+
+    fn t0(&self) -> Option<f64> {
+        let mut t = None;
+        self.shared.with(|s| t = s.t0_secs());
+        t
+    }
+
+    fn pause(&self, now: f64) {
+        self.shared.with(|s| {
+            s.pause(now);
+        });
+    }
+
+    fn resume(&self, now: f64) {
+        self.shared.with(|s| {
+            s.resume(now);
+        });
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let end = secs(host_now());
+        self.cam.stop();
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(p) = self.pacer.take() {
+            let _ = p.join();
+        }
+        let sink = self.shared.sink.lock().unwrap().take();
+        match sink {
+            Some(s) => objc2::rc::autoreleasepool(|_| s.finish(end)).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+pub struct Recorder {
+    pub package: Package,
+    session: Option<Session>,
+    camera: Option<CameraRec>,
+    input: Option<InputLogger>,
+    kind: SourceKind,
+    /// Captured region in global points at the start.
+    bounds: Rect,
+    /// Video pixels per point.
+    scale: f64,
+    size: (usize, usize),
+    window: Option<u32>,
+    pauses: Vec<(f64, Option<f64>)>,
+    pub started: Instant,
+    opts: Options,
+    app_name: Option<String>,
+}
+
+fn display_bounds(id: u32) -> Rect {
+    let r = unsafe { input::CGDisplayBounds(id) };
+    Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
+}
+
+fn even(v: f64) -> usize {
+    ((v / 2.0).round() as usize * 2).max(2)
+}
+
+impl Recorder {
+    pub fn start(opts: Options) -> Result<Self> {
+        let stamp = crate::util::timestamp_name();
+        std::fs::create_dir_all(&opts.dir).with_context(|| format!("creating {}", opts.dir.display()))?;
+        let path = match &opts.name {
+            Some(n) => opts.dir.join(format!("{n}.{}", project::EXTENSION)),
+            None => project::new_package_path(&opts.dir, &stamp),
+        };
+        let package = Package::new(&path);
+        std::fs::create_dir_all(package.recording_dir())?;
+
+        // Resolve the target: what to capture, at what size, where it is.
+        let (cap_target, kind, bounds, size, window, app_name) = match &opts.target {
+            Target::Pattern => (None, SourceKind::Display, Rect::new(0.0, 0.0, 1440.0, 900.0), (2880, 1800), None, None),
+            Target::Display { id } => {
+                let ds = screen::displays()?;
+                let d = ds.into_iter().find(|d| d.id == *id || *id == 0).context("display not found")?;
+                let b = display_bounds(d.id);
+                let px = (even(d.pixels.0 as f64), even(d.pixels.1 as f64));
+                (Some(screen::Target::Display(d, None)), SourceKind::Display, b, px, None, None)
+            }
+            Target::Area { display, rect } => {
+                let ds = screen::displays()?;
+                let d = ds.into_iter().find(|d| d.id == *display || *display == 0).context("display not found")?;
+                let db = display_bounds(d.id);
+                let scale = d.pixels.0 as f64 / d.points.0 as f64;
+                let px = (even(rect.w * scale), even(rect.h * scale));
+                let cg = objc2_core_foundation::CGRect::new(
+                    objc2_core_foundation::CGPoint::new(rect.x, rect.y),
+                    objc2_core_foundation::CGSize::new(rect.w, rect.h),
+                );
+                let global = rect.translate(db.min());
+                (Some(screen::Target::Display(d, Some(cg))), SourceKind::Area, global, px, None, None)
+            }
+            Target::Window { id } => {
+                let w = screen::find_window(&id.to_string())?;
+                let b = input::window_bounds(*id).unwrap_or(Rect::new(0.0, 0.0, w.size.0, w.size.1));
+                let scale = screen::displays()?.first().map_or(2.0, |d| d.pixels.0 as f64 / d.points.0 as f64);
+                let px = (even(w.size.0 * scale), even(w.size.1 * scale));
+                let app = Some(w.app.clone());
+                (Some(screen::Target::Window(w)), SourceKind::Window, b, px, Some(*id), app)
+            }
+        };
+        let scale = size.0 as f64 / bounds.w.max(1.0);
+        // High-quality HEVC: generous bits so re-encoding on export stays clean.
+        let bitrate = ((size.0 * size.1) as f64 * opts.fps as f64 * 0.08) as u64;
+        let cap = CapOptions {
+            output: package.rec("screen.mov"),
+            size,
+            fps: opts.fps,
+            codec: CapCodec::Hevc,
+            bitrate: bitrate.max(4_000_000),
+            system_audio: opts.system_audio,
+            mic: opts.mic.clone(),
+            webcam: None,
+            pip: PipSpec { size: 0.2, corner: Corner::BottomRight, shape: Shape::Rounded, mirror: false },
+            cursor: false,
+            clicks: false,
+            duration: None,
+            quiet: true,
+            test_pattern: matches!(opts.target, Target::Pattern).then_some(false),
+            audio_layout: AudioLayout::Stems,
+            gains_db: [0.0, 0.0],
+            mic_backend: MicBackend::Sck,
+            scene: CapScene::Screen,
+        };
+        crate::capture::record::check_permissions(&cap).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let input = InputLogger::start(package.rec("cursors"), window, opts.keys);
+        let session = match Session::start(&cap, cap_target, true, None) {
+            Ok(s) => s,
+            Err(e) => {
+                input.stop();
+                let _ = std::fs::remove_dir_all(&package.root);
+                return Err(e);
+            }
+        };
+        let camera = match &opts.camera {
+            Some(sel) => match CameraRec::start(sel.as_deref(), &package.rec("camera.mov")) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("glide: camera unavailable: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        Ok(Recorder {
+            package,
+            session: Some(session),
+            camera,
+            input: Some(input),
+            kind,
+            bounds,
+            scale,
+            size,
+            window,
+            pauses: vec![],
+            started: Instant::now(),
+            opts,
+            app_name,
+        })
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pauses.last().is_some_and(|p| p.1.is_none())
+    }
+
+    fn sess(&self) -> &Session {
+        self.session.as_ref().expect("session")
+    }
+
+    pub fn pause(&mut self) {
+        if self.is_paused() || !self.sess().has_frames() {
+            return;
+        }
+        let now = secs(host_now());
+        if self.sess().pause() {
+            if let Some(c) = &self.camera {
+                c.pause(now);
+            }
+            self.pauses.push((now, None));
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if !self.is_paused() {
+            return;
+        }
+        let now = secs(host_now());
+        if self.sess().resume() {
+            if let Some(c) = &self.camera {
+                c.resume(now);
+            }
+            if let Some(p) = self.pauses.last_mut() {
+                p.1 = Some(now);
+            }
+        }
+    }
+
+    /// Recorded seconds (excluding pauses).
+    pub fn elapsed(&self) -> f64 {
+        self.sess().recorded_secs()
+    }
+
+    pub fn error(&self) -> Option<String> {
+        if self.sess().failed() { self.sess().error() } else { None }
+    }
+
+    pub fn has_frames(&self) -> bool {
+        self.sess().has_frames()
+    }
+
+    /// Discard the recording.
+    pub fn cancel(mut self) {
+        if let Some(i) = self.input.take() {
+            i.stop();
+        }
+        if let Some(c) = self.camera.take() {
+            let _ = c.finish();
+        }
+        if let Some(s) = self.session.take() {
+            let _ = s.finish();
+        }
+        let _ = std::fs::remove_dir_all(&self.package.root);
+    }
+
+    /// Recording time (ms) of a host time, or None if it falls in a pause.
+    fn to_ms(&self, host: f64, t0: f64) -> Option<f64> {
+        let mut paused = 0.0;
+        for &(a, b) in &self.pauses {
+            let b = b.unwrap_or(f64::INFINITY);
+            if host >= b {
+                paused += b - a;
+            } else if host >= a {
+                return None;
+            }
+        }
+        Some((host - t0 - paused) * 1000.0)
+    }
+
+    /// Stop and write the package. Returns its path.
+    pub fn stop(mut self) -> Result<PathBuf> {
+        if self.is_paused() {
+            self.resume();
+        }
+        let input = self.input.take().map(|i| i.stop()).unwrap_or_default();
+        let cam_t0 = self.camera.as_ref().and_then(|c| c.t0());
+        if let Some(c) = self.camera.take()
+            && let Err(e) = c.finish()
+        {
+            eprintln!("glide: camera file: {e}");
+        }
+        let session = self.session.take().expect("session");
+        let t0 = session.t0_secs();
+        let duration_ms = session.recorded_secs() * 1000.0;
+        let stats = session.finish();
+        let Some(t0) = t0 else {
+            let _ = std::fs::remove_dir_all(&self.package.root);
+            bail!("no frames were captured (is Screen Recording permission granted?)");
+        };
+        stats.context("finalizing screen recording")?;
+        self.write_package(input, t0, duration_ms, cam_t0)?;
+        Ok(self.package.root.clone())
+    }
+
+    fn write_package(&self, input: InputLog, t0: f64, duration_ms: f64, cam_t0: Option<f64>) -> Result<()> {
+        let pkg = &self.package;
+        // Window recordings: origin follows the window as it moves.
+        let origin_at = |host: f64| -> (f64, f64) {
+            if self.window.is_some()
+                && let Some((_, b)) = input.bounds.iter().rev().find(|(h, _)| *h <= host).or(input.bounds.first())
+            {
+                return (b.x, b.y);
+            }
+            (self.bounds.x, self.bounds.y)
+        };
+        // The logger starts before the first video frame: keep the last
+        // event from before the start so the cursor has a position at 0.
+        let first_inside = input.mouse.iter().position(|m| self.to_ms(m.host, t0).is_some_and(|t| t >= 0.0));
+        let lead = first_inside.unwrap_or(input.mouse.len()).saturating_sub(1);
+        let mouse: Vec<MouseEvent> = input
+            .mouse
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let mut t = self.to_ms(m.host, t0)?;
+                if t < 0.0 && i == lead && m.kind != crate::project::recording::MouseKind::Up {
+                    t = 0.0;
+                }
+                if t < 0.0 || t > duration_ms + 50.0 {
+                    return None;
+                }
+                let (ox, oy) = origin_at(m.host);
+                Some(MouseEvent {
+                    t: t.max(0.0),
+                    x: (m.x - ox) * self.scale,
+                    y: (m.y - oy) * self.scale,
+                    kind: m.kind,
+                    button: m.button,
+                    cursor: m.cursor,
+                })
+            })
+            .collect();
+        let keys: Vec<KeyEvent> = input
+            .keys
+            .iter()
+            .filter_map(|k| {
+                let t = self.to_ms(k.host, t0)?;
+                (t >= 0.0 && t <= duration_ms).then(|| KeyEvent { t, code: k.code, key: k.key.clone(), mods: k.mods, down: k.down })
+            })
+            .collect();
+        let cursors: Vec<CursorImage> = input.cursors.clone();
+        let rec_dir = pkg.recording_dir();
+        let has_camera = rec_dir.join("camera.mov").exists();
+        let meta = RecordingMeta {
+            version: 1,
+            kind: self.kind,
+            duration_ms,
+            screen: VideoTrack {
+                file: "screen.mov".into(),
+                width: self.size.0 as u32,
+                height: self.size.1 as u32,
+                fps: self.opts.fps as f64,
+                offset_ms: 0.0,
+            },
+            scale: self.scale,
+            bounds: self.bounds,
+            camera: has_camera.then(|| VideoTrack {
+                file: "camera.mov".into(),
+                width: 1280,
+                height: 720,
+                fps: 30.0,
+                offset_ms: cam_t0.map_or(0.0, |c| (c - t0) * 1000.0),
+            }),
+            system_audio: self.opts.system_audio.then(|| AudioTrack { file: "screen.mov".into(), track: 0 }),
+            mic: self.opts.mic.is_some().then(|| AudioTrack {
+                file: "screen.mov".into(),
+                track: if self.opts.system_audio { 1 } else { 0 },
+            }),
+            app_name: self.app_name.clone(),
+            created_ms: now_ms(),
+        };
+        project::write_json(&pkg.rec("meta.json"), &meta)?;
+        project::write_json(&pkg.rec("mouse.json"), &mouse)?;
+        project::write_json(&pkg.rec("keys.json"), &keys)?;
+        project::write_json(&pkg.rec("cursors.json"), &cursors)?;
+        let rec = pkg.load_recording()?;
+        let proj = project::new_project(&pkg.name(), &rec);
+        pkg.save_project(&proj)?;
+        Ok(())
+    }
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}

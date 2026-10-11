@@ -339,6 +339,11 @@ impl Sink {
         self.t0.is_some()
     }
 
+    /// Host-clock time (seconds) of the first frame, once started.
+    pub fn t0_secs(&self) -> Option<f64> {
+        self.t0.map(|t| t as f64 / TIMESCALE as f64)
+    }
+
     pub fn failure(&self) -> Option<&str> {
         self.failed.as_deref()
     }

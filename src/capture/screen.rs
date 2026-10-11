@@ -149,7 +149,7 @@ pub struct Ivars {
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "RecScreenOutput"]
+    #[name = "GlideScreenOutput"]
     #[ivars = Ivars]
     pub struct ScreenOutput;
 

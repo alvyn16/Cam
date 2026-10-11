@@ -12,3 +12,4 @@ pub mod capture;
 pub mod util;
 pub mod media;
 pub mod export;
+pub mod recorder;

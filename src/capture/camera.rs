@@ -78,11 +78,14 @@ pub fn resolve_mic(sel: &str) -> Result<String> {
 
 pub struct CamIvars {
     shared: Arc<Shared>,
+    /// Deliver frames as the sink's primary ("screen") video, for a
+    /// camera-only recording.
+    as_screen: bool,
 }
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "RecCameraOutput"]
+    #[name = "GlideCameraOutput"]
     #[ivars = CamIvars]
     pub struct CameraOutput;
 
@@ -94,7 +97,12 @@ define_class!(
             unsafe {
                 if let Some(pb) = sb.image_buffer() {
                     let pts = sb.presentation_time_stamp();
-                    self.ivars().shared.with(|s| s.push_cam(pts, pb));
+                    let iv = self.ivars();
+                    if iv.as_screen {
+                        iv.shared.with(|s| s.push_screen(pts, pb));
+                    } else {
+                        iv.shared.with(|s| s.push_cam(pts, pb));
+                    }
                 }
             }
         }
@@ -113,6 +121,11 @@ unsafe impl Send for Camera {}
 impl Camera {
     /// `sel`: None = first camera, else unique ID or name substring.
     pub fn start(sel: Option<&str>, shared: Arc<Shared>) -> Result<Self> {
+        Self::start_with(sel, shared, false)
+    }
+
+    /// Like `start`; `as_screen` routes frames to the sink's main video.
+    pub fn start_with(sel: Option<&str>, shared: Arc<Shared>, as_screen: bool) -> Result<Self> {
         let cams = cameras_raw();
         let dev = match sel {
             // System-preferred camera (what FaceTime would use), else the
@@ -153,7 +166,7 @@ impl Camera {
                 num_i(PIX_BGRA as i64),
             )])));
             output.setAlwaysDiscardsLateVideoFrames(true);
-            let delegate = Self::make_delegate(shared);
+            let delegate = Self::make_delegate(shared, as_screen);
             let queue = DispatchQueue::new("rec.camera", None);
             output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
             if !session.canAddOutput(&output) {
@@ -169,8 +182,8 @@ impl Camera {
         }
     }
 
-    fn make_delegate(shared: Arc<Shared>) -> Retained<CameraOutput> {
-        let this = CameraOutput::alloc().set_ivars(CamIvars { shared });
+    fn make_delegate(shared: Arc<Shared>, as_screen: bool) -> Retained<CameraOutput> {
+        let this = CameraOutput::alloc().set_ivars(CamIvars { shared, as_screen });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -185,7 +198,7 @@ pub struct MicIvars {
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "RecMicOutput"]
+    #[name = "GlideMicOutput"]
     #[ivars = MicIvars]
     pub struct MicOutput;
 

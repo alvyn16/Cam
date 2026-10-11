@@ -58,6 +58,44 @@ enum Cmd {
         #[arg(long, value_parser = ["h264", "hevc"])]
         codec: Option<String>,
     },
+    /// Record the screen into a new .glide project.
+    Record {
+        /// Display id (see `glide devices`); default: main display.
+        #[arg(long)]
+        display: Option<u32>,
+        /// Window id (see `glide devices`).
+        #[arg(long)]
+        window: Option<u32>,
+        /// Area as x,y,w,h in points on the display.
+        #[arg(long)]
+        area: Option<String>,
+        /// Record a generated test pattern instead of the screen.
+        #[arg(long)]
+        pattern: bool,
+        #[arg(long)]
+        mic: bool,
+        #[arg(long)]
+        no_system_audio: bool,
+        #[arg(long)]
+        camera: bool,
+        /// Stop after this many seconds (else Ctrl-C).
+        #[arg(short = 't', long)]
+        duration: Option<f64>,
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+        /// Folder for the project (default ~/Movies/Glide).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List displays, windows, cameras and microphones.
+    Devices,
+    /// Show (or request) Screen Recording, Microphone and Camera access.
+    Permissions {
+        #[arg(long)]
+        request: bool,
+    },
     /// Write a synthetic recording package (no permissions needed).
     Synth {
         output: PathBuf,
@@ -72,6 +110,10 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // AppKit must be initialised for cursor and device queries.
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        let _ = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    }
     match cli.cmd {
         Some(Cmd::Frame { project, synthetic, time, height, style, output }) => {
             frame(project, synthetic, time, height, style, output)
@@ -80,6 +122,11 @@ fn main() -> Result<()> {
             export_cmd(project, synthetic, output, format, height, fps, quality, codec)
         }
         Some(Cmd::Synth { output, duration, width, height }) => synth(output, duration, width, height),
+        Some(Cmd::Record { display, window, area, pattern, mic, no_system_audio, camera, duration, fps, dir, name }) => {
+            record(display, window, area, pattern, mic, !no_system_audio, camera, duration, fps, dir, name)
+        }
+        Some(Cmd::Devices) => devices(),
+        Some(Cmd::Permissions { request }) => permissions(request),
         None => {
             println!("glide {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -212,7 +259,7 @@ fn synth(output: PathBuf, duration: f64, width: u32, height: u32) -> Result<()> 
         fill_bgra(&pb, &px, width, height, (width * 4) as usize);
         w.push_frame(&pb)?;
     }
-    w.finish(None)?;
+    w.finish()?;
     project::write_json(&pkg.rec("meta.json"), &rec.meta)?;
     project::write_json(&pkg.rec("mouse.json"), &rec.mouse)?;
     project::write_json(&pkg.rec("keys.json"), &rec.keys)?;
@@ -221,5 +268,114 @@ fn synth(output: PathBuf, duration: f64, width: u32, height: u32) -> Result<()> 
     let proj = project::new_project(&pkg.name(), &rec);
     pkg.save_project(&proj)?;
     println!("{} ({} frames, {} zooms)", output.display(), frames, proj.timeline.zooms.len());
+    Ok(())
+}
+
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" fn on_sigint(_: libc::c_int) {
+    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record(
+    display: Option<u32>,
+    window: Option<u32>,
+    area: Option<String>,
+    pattern: bool,
+    mic: bool,
+    system_audio: bool,
+    camera: bool,
+    duration: Option<f64>,
+    fps: u32,
+    dir: Option<PathBuf>,
+    name: Option<String>,
+) -> Result<()> {
+    use glide::recorder::{Options, Recorder, Target};
+    let target = if pattern {
+        Target::Pattern
+    } else if let Some(id) = window {
+        Target::Window { id }
+    } else if let Some(a) = area {
+        let v: Vec<f64> = a.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
+        anyhow::ensure!(v.len() == 4, "--area expects x,y,w,h");
+        Target::Area { display: display.unwrap_or(0), rect: glide::engine::geom::Rect::new(v[0], v[1], v[2], v[3]) }
+    } else {
+        Target::Display { id: display.unwrap_or(0) }
+    };
+    let opts = Options {
+        target,
+        system_audio: system_audio && !pattern,
+        mic: mic.then_some(None),
+        camera: camera.then_some(None),
+        fps,
+        dir: dir.unwrap_or_else(project::projects_dir),
+        name,
+        ..Default::default()
+    };
+    unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as usize) };
+    let rec = Recorder::start(opts)?;
+    eprintln!("glide: recording to {} (Ctrl-C to stop)", rec.package.root.display());
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if STOP.load(std::sync::atomic::Ordering::SeqCst) || rec.error().is_some() {
+            break;
+        }
+        if duration.is_some_and(|d| rec.has_frames() && rec.elapsed() >= d) {
+            break;
+        }
+        if duration.is_some_and(|d| !rec.has_frames() && rec.started.elapsed().as_secs_f64() > d + 5.0) {
+            break;
+        }
+    }
+    if let Some(e) = rec.error() {
+        eprintln!("glide: {e}");
+    }
+    let path = rec.stop()?;
+    let pkg = Package::new(&path);
+    let r = pkg.load_recording()?;
+    let p = pkg.load_project()?;
+    println!(
+        "{} ({:.1} s, {}x{}, {} mouse events, {} keys, {} cursors, {} zooms)",
+        path.display(),
+        r.meta.duration_ms / 1000.0,
+        r.meta.screen.width,
+        r.meta.screen.height,
+        r.mouse.len(),
+        r.keys.len(),
+        r.cursors.len(),
+        p.timeline.zooms.len()
+    );
+    Ok(())
+}
+
+fn devices() -> Result<()> {
+    use glide::capture::{camera, screen};
+    println!("Displays:");
+    for d in screen::displays()? {
+        println!("  {:>10}  {}x{} pt  {}x{} px", d.id, d.points.0, d.points.1, d.pixels.0, d.pixels.1);
+    }
+    println!("Windows:");
+    for w in screen::windows()? {
+        println!("  {:>10}  {} — {} ({:.0}x{:.0})", w.id, w.app, w.title, w.size.0, w.size.1);
+    }
+    println!("Cameras:");
+    for c in camera::cameras() {
+        println!("  {}  ({})", c.name, c.id);
+    }
+    println!("Microphones:");
+    for m in camera::microphones() {
+        println!("  {}  ({})", m.name, m.id);
+    }
+    Ok(())
+}
+
+fn permissions(request: bool) -> Result<()> {
+    use glide::capture::tcc;
+    if request {
+        tcc::request_all(true, true, true, std::time::Duration::from_secs(30));
+    }
+    println!("Screen Recording: {:?}", tcc::screen_status());
+    println!("Microphone:       {:?}", tcc::mic_status());
+    println!("Camera:           {:?}", tcc::camera_status());
     Ok(())
 }

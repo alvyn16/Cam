@@ -37,6 +37,8 @@ pub struct MovieWriter {
     audio: Option<Retained<AVAssetWriterInput>>,
     audio_fmt: CFRetained<CMAudioFormatDescription>,
     audio_written: usize,
+    soundtrack: Option<std::sync::Arc<Vec<[f32; 2]>>>,
+    audio_done: bool,
     fps: u32,
     pub frames: u64,
 }
@@ -101,6 +103,7 @@ impl MovieWriter {
                 (cf_ns(kCVPixelBufferWidthKey), num_i(s.width as i64)),
                 (cf_ns(kCVPixelBufferHeightKey), num_i(s.height as i64)),
                 (cf_ns(kCVPixelBufferIOSurfacePropertiesKey), obj(&*dict(vec![]))),
+                (cf_ns(kCVPixelBufferMetalCompatibilityKey), num_b(true)),
             ]);
             let adaptor = AVAssetWriterInputPixelBufferAdaptor::initWithAssetWriterInput_sourcePixelBufferAttributes(
                 AVAssetWriterInputPixelBufferAdaptor::alloc(),
@@ -142,6 +145,8 @@ impl MovieWriter {
                 audio,
                 audio_fmt: mixer::stereo_format(),
                 audio_written: 0,
+                soundtrack: None,
+                audio_done: false,
                 fps: s.fps,
                 frames: 0,
             })
@@ -158,24 +163,69 @@ impl MovieWriter {
         }
     }
 
-    fn wait_ready(&self, input: &AVAssetWriterInput) -> Result<()> {
-        let mut spins = 0;
-        while !unsafe { input.isReadyForMoreMediaData() } {
-            if unsafe { self.writer.status() } == AVAssetWriterStatus::Failed {
-                bail!("encoder failed: {}", err_text(&self.writer));
-            }
-            std::thread::sleep(Duration::from_micros(250));
-            spins += 1;
-            if spins > 40_000 {
-                bail!("encoder stalled");
-            }
+    /// Interleaved stereo at 48 kHz to write alongside the frames.
+    pub fn set_soundtrack(&mut self, mix: std::sync::Arc<Vec<[f32; 2]>>) {
+        self.soundtrack = Some(mix);
+    }
+
+    fn stalled(&self, input: &AVAssetWriterInput) -> anyhow::Error {
+        let which = if std::ptr::eq(input, &*self.video) { "video" } else { "audio" };
+        anyhow!(
+            "encoder stalled waiting for {which} (video frames {}, audio {:.2} s)",
+            self.frames,
+            self.audio_written as f64 / mixer::RATE
+        )
+    }
+
+    /// Append one audio chunk if the audio input will take it.
+    fn feed_audio_chunk(&mut self, until: usize) -> Result<bool> {
+        let (Some(audio), Some(mix)) = (self.audio.clone(), self.soundtrack.clone()) else { return Ok(false) };
+        if self.audio_done {
+            return Ok(false);
         }
-        Ok(())
+        if self.audio_written >= mix.len() {
+            // Tell the writer the track is complete so video isn't held
+            // back waiting to interleave with audio that never comes.
+            unsafe { audio.markAsFinished() };
+            self.audio_done = true;
+            return Ok(false);
+        }
+        let until = until.min(mix.len());
+        if self.audio_written >= until || !unsafe { audio.isReadyForMoreMediaData() } {
+            return Ok(false);
+        }
+        let n = (until - self.audio_written).min(4800);
+        let chunk: Vec<f32> = mix[self.audio_written..self.audio_written + n].iter().flat_map(|s| [s[0], s[1]]).collect();
+        let pts = unsafe { CMTime::new(self.audio_written as i64, mixer::RATE as i32) };
+        let sb = mixer::pcm_buffer(&self.audio_fmt, chunk, pts).ok_or_else(|| anyhow!("audio buffer"))?;
+        if !unsafe { audio.appendSampleBuffer(&sb) } {
+            bail!("append audio: {}", err_text(&self.writer));
+        }
+        self.audio_written += n;
+        Ok(true)
     }
 
     /// Append the next frame (frames are evenly spaced at the export fps).
+    /// Audio is fed while the video input waits, so neither starves.
     pub fn push_frame(&mut self, pb: &CVPixelBuffer) -> Result<()> {
-        self.wait_ready(&self.video)?;
+        let t_s = self.frames as f64 / self.fps as f64;
+        let lead = ((t_s + 1.0) * mixer::RATE) as usize;
+        while self.feed_audio_chunk(lead)? {}
+        let mut spins = 0;
+        while !unsafe { self.video.isReadyForMoreMediaData() } {
+            if unsafe { self.writer.status() } == AVAssetWriterStatus::Failed {
+                bail!("encoder failed: {}", err_text(&self.writer));
+            }
+            // The writer may want more audio before taking more video.
+            let ahead = ((t_s + 3.0) * mixer::RATE) as usize;
+            if !self.feed_audio_chunk(ahead)? {
+                std::thread::sleep(Duration::from_micros(250));
+                spins += 1;
+                if spins > 40_000 {
+                    return Err(self.stalled(&self.video));
+                }
+            }
+        }
         let t = unsafe { CMTime::new(self.frames as i64 * (TIMESCALE as i64 / self.fps as i64), TIMESCALE) };
         if !unsafe { self.adaptor.appendPixelBuffer_withPresentationTime(pb, t) } {
             bail!("append frame {}: {}", self.frames, err_text(&self.writer));
@@ -184,36 +234,35 @@ impl MovieWriter {
         Ok(())
     }
 
-    /// Append audio up to (and including) sample `until` from `mix`. Keeps
-    /// audio interleaved with video so neither input starves.
-    pub fn push_audio_until(&mut self, mix: &[[f32; 2]], until: usize) -> Result<()> {
+    /// Write any remaining audio.
+    fn drain_audio(&mut self) -> Result<()> {
         let Some(audio) = self.audio.clone() else { return Ok(()) };
-        let until = until.min(mix.len());
-        while self.audio_written < until {
-            self.wait_ready(&audio)?;
-            let n = (until - self.audio_written).min(4800);
-            let chunk: Vec<f32> = mix[self.audio_written..self.audio_written + n].iter().flat_map(|s| [s[0], s[1]]).collect();
-            let pts = unsafe { CMTime::new(self.audio_written as i64, mixer::RATE as i32) };
-            let sb = mixer::pcm_buffer(&self.audio_fmt, chunk, pts).ok_or_else(|| anyhow!("audio buffer"))?;
-            if !unsafe { audio.appendSampleBuffer(&sb) } {
-                bail!("append audio: {}", err_text(&self.writer));
+        let Some(len) = self.soundtrack.as_ref().map(|m| m.len()) else { return Ok(()) };
+        let mut spins = 0;
+        while !self.audio_done {
+            if !self.feed_audio_chunk(len)? {
+                if unsafe { self.writer.status() } == AVAssetWriterStatus::Failed {
+                    bail!("encoder failed: {}", err_text(&self.writer));
+                }
+                std::thread::sleep(Duration::from_micros(250));
+                spins += 1;
+                if spins > 40_000 {
+                    return Err(self.stalled(&audio));
+                }
             }
-            self.audio_written += n;
         }
         Ok(())
     }
 
-    pub fn finish(self, mix: Option<&[[f32; 2]]>) -> Result<()> {
-        if let Some(m) = mix {
-            let mut me = self;
-            me.push_audio_until(m, m.len())?;
-            return me.finish(None);
-        }
+    pub fn finish(mut self) -> Result<()> {
+        self.drain_audio()?;
         unsafe {
             let end = CMTime::new(self.frames as i64 * (TIMESCALE as i64 / self.fps as i64), TIMESCALE);
             self.writer.endSessionAtSourceTime(end);
             self.video.markAsFinished();
-            if let Some(a) = &self.audio {
+            if let Some(a) = &self.audio
+                && !self.audio_done
+            {
                 a.markAsFinished();
             }
             let (tx, rx) = mpsc::channel();
