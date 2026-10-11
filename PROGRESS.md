@@ -50,7 +50,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | A1–A2 | Mix, background music | ☑ | Per-slice volumes, mutes, master volume, looped music with fade. |
 | A3 | Enhance microphone | ◐ | DSP clean-up, not an ML denoiser. |
 | E1–E3 | MP4, resolution, frame rate | ☑ | Hardware H.264/HEVC, quality presets by bits per pixel. |
-| E4 | GIF | ◐ | Parallel NeuQuant palettes and duplicate-frame merging; no separate lossy optimiser pass. |
+| E4 | GIF | ☑ | Parallel NeuQuant palettes, delta frames (only changed tiles, transparent elsewhere), duplicate merging, loop option. |
 | E5 | Targets | ✗ | File, clipboard, reveal in Finder. No upload/share links (no accounts). |
 | E6 | Presets / size estimate | ☑ | |
 | E7 | Progress, cancel, quick export | ☑ | "Export & copy" banner after recording. |
@@ -120,4 +120,4 @@ test media.
 - 2026-10-11: style presets, desktop-wallpaper background, typing speed-up,
   loop playback, caption editing, masks, area picker, hide icons/Dock,
   configurable shortcuts, device frames, voice-over, iOS device capture,
-  menu bar sources, quick export.
+  menu bar sources, quick export, Finder document opening, GIF delta frames.
