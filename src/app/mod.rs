@@ -1,5 +1,5 @@
 //! The Glide app: one main window (Home ↔ Editor), a floating recording
-//! widget, a menu bar item and a global hotkey (⌥⇧⌘R). egui on wgpu with
+//! widget, a menu bar item and global shortcuts (default ⌥⇧⌘R). egui on wgpu with
 //! a transparent titlebar and Inter, sharing one GPU device with the
 //! editor's renderer.
 
@@ -322,6 +322,29 @@ impl App {
                 self.view = View::Editor(Box::new(ed));
             }
             Err(e) => self.error = Some(format!("Couldn't open {}: {e:#}", path.display())),
+        }
+    }
+
+    /// (Re)register the global shortcuts from settings.
+    fn bind_hotkeys(&mut self) {
+        let hk = self.settings.hotkeys.clone();
+        let mut failed = vec![];
+        for (slot, combo, cmd) in [(1, hk.record, Cmd::ToggleRecording), (2, hk.pause, Cmd::TogglePause), (3, hk.cancel, Cmd::Cancel)] {
+            match combo {
+                Some(c) => {
+                    if let Err(code) = hotkey::bind(slot, c, move || push(cmd.clone())) {
+                        eprintln!("glide: could not register {} (error {code})", c.label());
+                        failed.push(c.label());
+                    }
+                }
+                None => hotkey::unbind(slot),
+            }
+        }
+        if let Some(m) = &self.menubar {
+            m.set_hotkey(&hk.record_label(), !failed.iter().any(|l| *l == hk.record_label()));
+        }
+        if !failed.is_empty() {
+            self.error = Some(format!("Another app already uses {} — pick a different shortcut.", failed.join(", ")));
         }
     }
 
@@ -657,6 +680,7 @@ impl App {
         }
         match &mut self.view {
             View::Home => {
+                let was = home::CAPTURING_SHORTCUT.swap(false, Ordering::Relaxed);
                 let note = self.permission_note.clone();
                 let action = home::ui(ui, &mut self.settings, &mut self.devices, &mut self.projects, &mut self.thumbs, note.as_deref());
                 match action {
@@ -664,11 +688,23 @@ impl App {
                     home::Action::Record if self.settings.source == SourceKind::Area => push(Cmd::SelectArea(true)),
                     home::Action::Record => push(Cmd::ToggleRecording),
                     home::Action::SelectArea => push(Cmd::SelectArea(false)),
+                    home::Action::HotkeysChanged => {
+                        self.settings.save();
+                        self.bind_hotkeys();
+                    }
                     home::Action::Open(p) => push(Cmd::Open(p)),
                     home::Action::RequestPermissions => {
                         std::thread::spawn(|| crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60)));
                     }
                     home::Action::None => {}
+                }
+                let now = home::CAPTURING_SHORTCUT.load(Ordering::Relaxed);
+                if now && !was {
+                    for slot in 1..=3 {
+                        hotkey::unbind(slot);
+                    }
+                } else if was && !now {
+                    self.bind_hotkeys();
                 }
             }
             View::Editor(ed) => {
@@ -707,7 +743,7 @@ impl App {
                         ui.painter().circle_filled(rect.center(), 5.0, dot);
                         ui.label(RichText::new(crate::capture::record::clock(r.elapsed())).font(theme::semibold(14.0)).monospace());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::record_button(ui, 26.0, true).on_hover_text("Stop (⌥⇧⌘R)").clicked() {
+                            if widgets::record_button(ui, 26.0, true).on_hover_text(format!("Stop {}", self.settings.hotkeys.record_label())).clicked() {
                                 push(Cmd::ToggleRecording);
                             }
                             if widgets::icon_button(ui, if paused { widgets::Icon::Play } else { widgets::Icon::Pause }, true).on_hover_text(if paused { "Resume" } else { "Pause" }).clicked() {
@@ -963,10 +999,7 @@ impl ApplicationHandler for App {
         }
         let mtm = objc2::MainThreadMarker::new().expect("main thread");
         self.menubar = Some(menubar::MenuBar::new(mtm));
-        let r = hotkey::register(hotkey::KEY_R, hotkey::CMD | hotkey::SHIFT | hotkey::OPTION, || push(Cmd::ToggleRecording));
-        if let Err(code) = r {
-            eprintln!("glide: could not register ⌥⇧⌘R (error {code})");
-        }
+        self.bind_hotkeys();
         self.show_main(el);
         if let Some(p) = self.open_at_launch.take() {
             self.open_project(el, p);

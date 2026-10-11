@@ -97,8 +97,13 @@ impl MenuBar {
         mb
     }
 
-    pub fn hotkey_unavailable(&self) {
-        self.hotkey.setTitle(&ns("Global hotkey ⌥⇧⌘R unavailable"));
+    pub fn set_hotkey(&self, label: &str, ok: bool) {
+        let title = match (label.is_empty(), ok) {
+            (true, _) => "No global shortcut".to_string(),
+            (false, true) => format!("Global shortcut: {label}"),
+            (false, false) => format!("Global shortcut {label} unavailable"),
+        };
+        self.hotkey.setTitle(&ns(&title));
     }
 
     pub fn title(&self) -> Option<String> {

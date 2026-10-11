@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Ui, vec2};
 use serde::{Deserialize, Serialize};
 
+use super::hotkey::Combo;
 use super::theme::{self, pal};
 use super::widgets::{self, caption, row, segmented, toggle_row};
 use crate::project::{self, Package};
@@ -41,6 +42,33 @@ pub struct Settings {
     pub projects_dir: Option<PathBuf>,
     pub hide_desktop_icons: bool,
     pub hide_dock: bool,
+    pub hotkeys: Hotkeys,
+}
+
+/// Global shortcuts (None = unbound).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hotkeys {
+    pub record: Option<Combo>,
+    pub pause: Option<Combo>,
+    pub cancel: Option<Combo>,
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        use super::hotkey::{CMD, KEY_R, OPTION, SHIFT};
+        Hotkeys {
+            record: Some(Combo::new(KEY_R, CMD | SHIFT | OPTION)),
+            pause: Some(Combo::new(35, CMD | SHIFT | OPTION)), // P
+            cancel: None,
+        }
+    }
+}
+
+impl Hotkeys {
+    pub fn record_label(&self) -> String {
+        self.record.map_or_else(String::new, |c| c.label())
+    }
 }
 
 impl Default for Settings {
@@ -61,6 +89,7 @@ impl Default for Settings {
             projects_dir: None,
             hide_desktop_icons: false,
             hide_dock: false,
+            hotkeys: Hotkeys::default(),
         }
     }
 }
@@ -206,10 +235,61 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
     })
 }
 
+/// True while a shortcut button waits for keys (global hotkeys are paused
+/// so the old combination reaches the field instead of starting a recording).
+pub static CAPTURING_SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A shortcut button that records the next key combination when clicked.
+fn shortcut_row(ui: &mut Ui, label: &str, combo: &mut Option<Combo>) -> bool {
+    let id = ui.id().with(("shortcut", label));
+    let capturing = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    if capturing {
+        CAPTURING_SHORTCUT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut changed = false;
+    row(ui, label, |ui| {
+        let text = if capturing { "Press keys…".to_string() } else { combo.map_or("None".into(), |c| c.label()) };
+        let b = ui.add(egui::Button::new(text).selected(capturing).min_size(vec2(110.0, 0.0)));
+        if b.clicked() {
+            ui.data_mut(|d| {
+                d.insert_temp(id, !capturing);
+            });
+        }
+        if capturing {
+            let pressed = ui.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+            });
+            match pressed {
+                Some((egui::Key::Escape, _)) => {
+                    ui.data_mut(|d| d.insert_temp(id, false));
+                }
+                Some((egui::Key::Backspace | egui::Key::Delete, _)) => {
+                    *combo = None;
+                    changed = true;
+                    ui.data_mut(|d| d.insert_temp(id, false));
+                }
+                Some((k, m)) => {
+                    if let Some(c) = Combo::from_egui(k, m) {
+                        *combo = Some(c);
+                        changed = true;
+                        ui.data_mut(|d| d.insert_temp(id, false));
+                    }
+                }
+                None => {}
+            }
+        }
+    });
+    changed
+}
+
 pub enum Action {
     None,
     Record,
     SelectArea,
+    HotkeysChanged,
     Open(PathBuf),
     RequestPermissions,
 }
@@ -332,13 +412,24 @@ pub fn ui(
                 row(ui, "Frame rate", |ui| {
                     segmented(ui, &mut s.fps, &[(60, "60"), (30, "30")]);
                 });
+                egui::CollapsingHeader::new("Global shortcuts").show(ui, |ui| {
+                    let mut changed = false;
+                    changed |= shortcut_row(ui, "Start / stop", &mut s.hotkeys.record);
+                    changed |= shortcut_row(ui, "Pause / resume", &mut s.hotkeys.pause);
+                    changed |= shortcut_row(ui, "Cancel recording", &mut s.hotkeys.cancel);
+                    caption(ui, "Click a shortcut, then press the new keys (⌫ clears, ⎋ keeps it).");
+                    if changed {
+                        action = Action::HotkeysChanged;
+                    }
+                });
                 ui.add_space(18.0);
                 ui.vertical_centered(|ui| {
-                    if widgets::record_button(ui, 64.0, false).on_hover_text("Start recording (⌥⇧⌘R)").clicked() {
+                    let hk = s.hotkeys.record_label();
+                    if widgets::record_button(ui, 64.0, false).on_hover_text(format!("Start recording {hk}")).clicked() {
                         action = Action::Record;
                     }
                     ui.add_space(4.0);
-                    caption(ui, "Start recording  ⌥⇧⌘R");
+                    caption(ui, &format!("Start recording  {hk}"));
                 });
                 if let Some(note) = permission_note {
                     ui.add_space(12.0);
