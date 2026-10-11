@@ -77,12 +77,15 @@ pub fn screen_radius(device: DeviceFrame, screen: Rect) -> Option<f64> {
     }
 }
 
-/// The device body's outline (for the drop shadow), excluding thin buttons.
+/// The device body's outline for the drop shadow: its largest part (a
+/// laptop's lid, not the lid and base together, which would shadow empty
+/// space beside the lid).
 pub fn body(device: DeviceFrame, screen: Rect) -> Option<(Rect, f64)> {
-    parts(device, screen).into_iter().filter(|p| !p.over && p.border_width > 0.0).map(|p| (p.rect, p.radius)).reduce(|a, b| {
-        let r = Rect::from_points(a.0.min().min(b.0.min()), a.0.max().max(b.0.max()));
-        (r, a.1.max(b.1))
-    })
+    parts(device, screen)
+        .into_iter()
+        .filter(|p| !p.over)
+        .max_by(|a, b| (a.rect.w * a.rect.h).total_cmp(&(b.rect.w * b.rect.h)))
+        .map(|p| (p.rect, p.radius))
 }
 
 /// Shapes making up the frame around `screen` (output px), back to front.
