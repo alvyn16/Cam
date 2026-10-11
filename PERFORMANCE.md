@@ -79,6 +79,12 @@ on a Retina display) — over 240 consecutive 60 fps frames.
 | Real 5K recording with a blur + highlight mask, 1600×1000 | 165 | 2.7× |
 | Synthetic 2560×1600 recording | 600 | 10× |
 
+## Idle
+
+With a project open in the editor and nothing playing, the app used 0.00 s
+of CPU over 10 s (it only wakes for UI events, timers and background work)
+at 107 MB resident.
+
 ## How to reproduce
 
 ```sh
