@@ -56,6 +56,9 @@ enum Cmd {
         quality: Option<String>,
         #[arg(long, value_parser = ["h264", "hevc"])]
         codec: Option<String>,
+        /// MP4: aim for a file of about this many MB.
+        #[arg(long)]
+        target_mb: Option<u32>,
     },
     /// Record the screen into a new .glide project.
     Record {
@@ -164,8 +167,8 @@ fn main() -> Result<()> {
         Some(Cmd::Frame { project, synthetic, time, height, style, output }) => {
             frame(project, synthetic, time, height, style, output)
         }
-        Some(Cmd::Export { project, synthetic, output, format, height, fps, quality, codec }) => {
-            export_cmd(project, synthetic, output, format, height, fps, quality, codec)
+        Some(Cmd::Export { project, synthetic, output, format, height, fps, quality, codec, target_mb }) => {
+            export_cmd(project, synthetic, output, format, height, fps, quality, codec, target_mb)
         }
         Some(Cmd::Synth { output, duration, width, height }) => synth(output, duration, width, height),
         Some(Cmd::Record { display, window, area, device, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
@@ -279,6 +282,7 @@ fn export_cmd(
     fps: Option<u32>,
     quality: Option<String>,
     codec: Option<String>,
+    target_mb: Option<u32>,
 ) -> Result<()> {
     let (proj, rec, source, base) = if synthetic {
         let rec = glide::synth::recording(1920, 1080, 12_000.0);
@@ -290,6 +294,9 @@ fn export_cmd(
         (p, r, Source::Package(path.clone()), path)
     };
     let mut settings = proj.export;
+    if target_mb.is_some() {
+        settings.target_mb = target_mb;
+    }
     if let Some(f) = format {
         settings = if f == "gif" { ExportSettings::gif_default() } else { ExportSettings { format: ExportFormat::Mp4, ..settings } };
     }

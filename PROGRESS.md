@@ -54,6 +54,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | E5 | Targets | ✗ | File, clipboard, reveal in Finder. No upload/share links (no accounts). |
 | E6 | Presets / size estimate | ☑ | |
 | E7 | Progress, cancel, quick export | ☑ | "Export & copy" banner after recording. |
+| E8 | Size-targeted export | ☑ | Not in Screen Studio 3.7.1; Glide's "Fit to file size" (MP4) stays at or under the target, re-encoding once if the first pass overshoots. |
 | P1 | Projects library | ☑ | `~/Movies/Glide`, autosave, rendered thumbnails. |
 | P2 | Style presets | ☑ | Save/apply/delete, default preset for new recordings. |
 | P3 | Editor sidebar + selection inspector | ☑ | |

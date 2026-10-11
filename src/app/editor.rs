@@ -846,16 +846,21 @@ impl Editor {
                         widgets::row(ui, "Codec", |ui| {
                             widgets::segmented(ui, &mut s.codec, &[(Codec::H264, "H.264"), (Codec::Hevc, "HEVC")]);
                         });
+                        let mut fit = s.target_mb.is_some();
+                        if widgets::toggle_row(ui, "Fit to file size", &mut fit) {
+                            s.target_mb = fit.then_some(10);
+                        }
+                        if let Some(mb) = &mut s.target_mb {
+                            widgets::row(ui, "Target size", |ui| {
+                                ui.add(egui::DragValue::new(mb).range(1..=4000).suffix(" MB"));
+                            });
+                        }
                     } else {
                         widgets::toggle_row(ui, "Loop", &mut s.gif_loop);
                     }
                     let (w, h) = self.preview.scene.sizes.render_size(s.height);
                     let secs = self.duration() / 1000.0;
-                    let mb = if s.format == ExportFormat::Mp4 {
-                        (s.bitrate(w, h) as f64 * secs + 192_000.0 * secs) / 8.0 / 1e6
-                    } else {
-                        (w * h) as f64 * secs * s.fps as f64 * 0.08 / 1e6
-                    };
+                    let mb = s.estimate_mb(w, h, secs);
                     widgets::caption(ui, &format!("{w}×{h} • {:.1} s • about {:.0} MB", secs, mb.max(0.1)));
                 });
                 if s != self.project.export {

@@ -248,6 +248,29 @@ impl FramePump {
 
 /// Run an export job. `progress` receives 0..1; `cancel` aborts.
 pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
+    let s = job.settings;
+    let stats = run_pass(job, None, progress, cancel)?;
+    // "Fit to size" means at most that size: VideoToolbox's average bitrate
+    // can overshoot, so re-encode once with a corrected bitrate if it did.
+    if s.format == ExportFormat::Mp4
+        && let Some(mb) = s.target_mb
+    {
+        let target = mb as f64 * 1e6;
+        if stats.bytes as f64 > target {
+            let planned = s.bitrate(stats.width, stats.height, stats.video_seconds) as f64;
+            let audio = ExportSettings::AUDIO_BPS * stats.video_seconds / 8.0;
+            let video_now = (stats.bytes as f64 - audio).max(1.0);
+            let video_goal = (target * 0.95 - audio).max(target * 0.2);
+            let corrected = (planned * video_goal / video_now).max(250_000.0) as u64;
+            let mut again = run_pass(job, Some(corrected), progress, cancel)?;
+            again.seconds += stats.seconds;
+            return Ok(again);
+        }
+    }
+    Ok(stats)
+}
+
+fn run_pass(job: &Job, bitrate: Option<u64>, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats> {
     let started = Instant::now();
     let s = job.settings;
     let mut scene = Scene::new(job.project.clone(), &job.recording, s.fps as f64);
@@ -273,7 +296,7 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
             let soundtrack = audio::mix(&job.project, &job.recording, dir, &scene.map);
             let mut writer = MovieWriter::create(
                 &job.output,
-                &WriterSpec { width: w, height: h, fps: s.fps, codec: s.codec, bitrate: s.bitrate(w, h), audio: soundtrack.is_some() },
+                &WriterSpec { width: w, height: h, fps: s.fps, codec: s.codec, bitrate: bitrate.unwrap_or_else(|| s.bitrate(w, h, scene.duration() / 1000.0)), audio: soundtrack.is_some() },
             )?;
             if let Some(m) = soundtrack {
                 writer.set_soundtrack(Arc::new(m));

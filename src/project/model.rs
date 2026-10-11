@@ -636,6 +636,8 @@ pub struct ExportSettings {
     pub quality: Quality,
     pub codec: Codec,
     pub gif_loop: bool,
+    /// MP4 only: pick the bitrate so the file comes out at about this many MB.
+    pub target_mb: Option<u32>,
 }
 
 impl Default for ExportSettings {
@@ -647,6 +649,7 @@ impl Default for ExportSettings {
             quality: Quality::Social,
             codec: Codec::H264,
             gif_loop: true,
+            target_mb: None,
         }
     }
 }
@@ -661,13 +664,33 @@ impl ExportSettings {
         ExportSettings { format: ExportFormat::Gif, height: 480, fps: 15, quality: Quality::Studio, ..Default::default() }
     }
 
-    /// Target video bitrate (bits/s) for an output size.
-    pub fn bitrate(&self, width: u32, height: u32) -> u64 {
+    /// Audio bitrate assumed for size estimates (AAC stereo).
+    pub const AUDIO_BPS: f64 = 192_000.0;
+
+    /// Target video bitrate (bits/s) for an output size and duration. With a
+    /// target size the bitrate fills that size (minus audio and container
+    /// overhead); otherwise it follows the quality preset.
+    pub fn bitrate(&self, width: u32, height: u32, secs: f64) -> u64 {
+        if let Some(mb) = self.target_mb.filter(|_| self.format == ExportFormat::Mp4)
+            && secs > 0.0
+        {
+            let total = mb as f64 * 8e6 * 0.96 / secs;
+            return (total - Self::AUDIO_BPS).max(250_000.0) as u64;
+        }
         let bpp = self.quality.bits_per_pixel();
         let base = width as f64 * height as f64 * self.fps as f64 * bpp;
         // HEVC reaches the same quality with ~40% fewer bits.
         let codec = if self.codec == Codec::Hevc { 0.6 } else { 1.0 };
         (base * codec).max(250_000.0) as u64
+    }
+
+    /// Rough output size in MB.
+    pub fn estimate_mb(&self, width: u32, height: u32, secs: f64) -> f64 {
+        match self.format {
+            ExportFormat::Mp4 => (self.bitrate(width, height, secs) as f64 + Self::AUDIO_BPS) * secs / 8e6,
+            // Delta-frame GIFs of screen content average ~0.035 bytes per pixel per frame.
+            ExportFormat::Gif => (width * height) as f64 * secs * self.fps as f64 * 0.035 / 1e6,
+        }
     }
 }
 
@@ -731,6 +754,10 @@ mod tests {
     #[test]
     fn bitrate_formula() {
         let e = ExportSettings::default();
-        assert_eq!(e.bitrate(1920, 1080), (1920.0 * 1080.0 * 60.0 * 0.05) as u64);
+        assert_eq!(e.bitrate(1920, 1080, 10.0), (1920.0 * 1080.0 * 60.0 * 0.05) as u64);
+        // Fit to 10 MB over 20 s: ~3.84 Mbit/s total minus audio.
+        let t = ExportSettings { target_mb: Some(10), ..e };
+        assert_eq!(t.bitrate(1920, 1080, 20.0), (10.0 * 8e6 * 0.96 / 20.0 - ExportSettings::AUDIO_BPS) as u64);
+        assert!((t.estimate_mb(1920, 1080, 20.0) - 9.6).abs() < 0.01);
     }
 }
