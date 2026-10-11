@@ -11,4 +11,5 @@ pub mod pattern;
 pub mod record;
 pub mod screen;
 pub mod tcc;
+pub mod winsize;
 pub mod writer;

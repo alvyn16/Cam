@@ -29,6 +29,7 @@ sounds, wallpapers, cursors or fonts.
 | Renderer (React + MobX + PixiJS/WebGL) | Recording UI, editor, preview and export rendering. Export renders frames with PixiJS and encodes with WebCodecs `VideoEncoder` (H.264 `avc1.640033`, hardware preferred, constant bitrate, `latencyMode: quality`). |
 | `polyrecorder` (Swift) | Capture of display, window, area, camera, microphone, system audio and iOS devices. Also logs mouse moves, clicks and keystrokes, cursor images and window bounds. Started with a JSON config on stdin; reports newline-delimited JSON status on stdout (`recordingPrepared`, `recordingResumed`, `recordingStoppedWithError`, …). Start, pause and resume are signals. A `discover` subcommand streams the available displays, windows and devices. |
 | Other helpers | `list-windows`, `manage-window`, `hide-icons` (desktop icons), `macos-wallpaper`, `face-detector`, `dynamic-mask-tracker`, `audio-composer`, `deep-filter` (speech denoise), `transcribe-audio` (Apple Speech), `whisper` (whisper.cpp), `ffmpeg`, `gifsicle`, `sf-icon` (SF Symbols). |
+| Unused helper | `face-detector <video> <interval_ms>` runs Vision face detection over the camera video and is exposed as the `faceBounds` query (1000 ms default, cached under the project's `cache/face/`), but no renderer bundle in 3.7.1 calls it (API names the UI uses, such as `detectMaskedContentShift`, appear in the renderer bundles; `faceBounds` appears in none), so it has no user-visible behaviour to match. |
 
 ## Project format
 
@@ -153,6 +154,7 @@ Status legend: ☐ not started · ◐ partial · ☑ done (verified). The *Statu
 | R10 | Hide desktop icons / dock while recording | Options. |
 | R11 | Global shortcuts | User-configurable global hotkeys to start, stop and pause. |
 | R12 | Permissions | Screen Recording, Microphone, Camera, Accessibility (input monitoring). |
+| R13 | Resize the recorded window | In window mode the highlighted window shows its size ("W × H") and a Resize button. The menu offers 16:9 sizes (1280×720, 1920×1080, 2560×1440) at the top and 4:3, 9:16, 16:10 and Square submenus, the user's saved sizes ("Save current size", "Delete saved sizes"), and "Custom..." (inline width × height fields, Enter confirms, Escape cancels). Sizes larger than the window's display, or equal to its current size, are disabled. Implemented by the `manage-window` helper (`<id> --resize=WxH`, also `--bring-to-front`, `--focus`) through the Accessibility API. |
 
 ### Automatic zoom and motion
 | # | Feature | Behaviour |

@@ -47,6 +47,8 @@ pub struct Settings {
     pub hotkeys: Hotkeys,
     /// iPhone/iPad unique id.
     pub ios_device: Option<String>,
+    /// Window sizes (points) saved from the Resize menu.
+    pub window_sizes: Vec<(u32, u32)>,
 }
 
 /// Global shortcuts (None = unbound).
@@ -95,6 +97,7 @@ impl Default for Settings {
             hide_dock: false,
             hotkeys: Hotkeys::default(),
             ios_device: None,
+            window_sizes: vec![],
         }
     }
 }
@@ -124,10 +127,21 @@ pub struct Device {
     pub name: String,
 }
 
+/// A window that can be recorded.
+#[derive(Clone, Debug)]
+pub struct WindowEntry {
+    pub id: u32,
+    pub label: String,
+    /// Size in points.
+    pub size: (f64, f64),
+    /// Size of the display it's on, in points.
+    pub display: (f64, f64),
+}
+
 #[derive(Default)]
 pub struct Devices {
     pub displays: Vec<(u32, String)>,
-    pub windows: Vec<(u32, String)>,
+    pub windows: Vec<WindowEntry>,
     pub cameras: Vec<Device>,
     pub mics: Vec<Device>,
     pub ios: Vec<Device>,
@@ -142,9 +156,11 @@ impl Devices {
                 .unwrap_or_default(),
             windows: screen::windows()
                 .map(|ws| {
+                    let ws: Vec<_> = ws.into_iter().filter(|w| !w.title.is_empty() && w.app != "Glide").collect();
+                    let displays = crate::capture::winsize::display_sizes(&ws);
                     ws.into_iter()
-                        .filter(|w| !w.title.is_empty() && w.app != "Glide")
-                        .map(|w| (w.id, format!("{} — {}", w.app, w.title)))
+                        .zip(displays)
+                        .map(|(w, display)| WindowEntry { id: w.id, label: format!("{} — {}", w.app, w.title), size: w.size, display })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -330,6 +346,109 @@ pub enum Action {
     HotkeysChanged,
     Open(PathBuf),
     RequestPermissions,
+    ResizeWindow { id: u32, width: u32, height: u32 },
+}
+
+/// Outcome of the last window resize, shown under the window picker.
+static RESIZE_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_resize_note(note: Option<String>) {
+    *RESIZE_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = note;
+}
+
+fn size_label((w, h): (u32, u32)) -> String {
+    format!("{w} × {h}")
+}
+
+/// The chosen window's size with a Resize menu (common sizes, saved sizes,
+/// custom). Returns the size picked this frame.
+fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option<(u32, u32)> {
+    use crate::capture::winsize::PRESETS;
+    let current = (w.size.0.round() as u32, w.size.1.round() as u32);
+    let fits = |(a, b): (u32, u32)| a as f64 <= w.display.0 && b as f64 <= w.display.1 && (a, b) != current;
+    let custom_id = ui.id().with("custom-window-size");
+    let mut custom: Option<[u32; 2]> = ui.data(|d| d.get_temp(custom_id));
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        caption(ui, &format!("{} pt", size_label(current)));
+        ui.menu_button("Resize", |ui| {
+            for &size in PRESETS[0].1 {
+                if ui.add_enabled(fits(size), egui::Button::new(size_label(size))).clicked() {
+                    picked = Some(size);
+                }
+            }
+            for (name, sizes) in &PRESETS[1..] {
+                ui.menu_button(*name, |ui| {
+                    for &size in *sizes {
+                        if ui.add_enabled(fits(size), egui::Button::new(size_label(size))).clicked() {
+                            picked = Some(size);
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            if s.window_sizes.is_empty() {
+                ui.add_enabled(false, egui::Button::new("No saved sizes"));
+            }
+            for &size in &s.window_sizes {
+                if ui.add_enabled(fits(size), egui::Button::new(size_label(size))).clicked() {
+                    picked = Some(size);
+                }
+            }
+            let known = PRESETS.iter().any(|(_, l)| l.contains(&current)) || s.window_sizes.contains(&current);
+            if ui.add_enabled(!known, egui::Button::new("Save current size")).clicked() {
+                s.window_sizes.push(current);
+            }
+            if !s.window_sizes.is_empty() {
+                ui.menu_button("Delete saved size", |ui| {
+                    let mut gone = None;
+                    for &size in &s.window_sizes {
+                        if ui.button(size_label(size)).clicked() {
+                            gone = Some(size);
+                        }
+                    }
+                    if let Some(g) = gone {
+                        s.window_sizes.retain(|x| *x != g);
+                    }
+                });
+            }
+            ui.separator();
+            if ui.button("Custom…").clicked() {
+                custom = Some([current.0, current.1]);
+            }
+        });
+    });
+    if let Some(c) = &mut custom {
+        let mut done = false;
+        ui.horizontal(|ui| {
+            let max = (w.display.0.min(10_000.0) as u32, w.display.1.min(10_000.0) as u32);
+            ui.add(egui::DragValue::new(&mut c[0]).range(200..=max.0).suffix(" w"));
+            ui.label("×");
+            ui.add(egui::DragValue::new(&mut c[1]).range(200..=max.1).suffix(" h"));
+            if ui.button("Resize").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                picked = Some((c[0], c[1]));
+                done = true;
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                done = true;
+            }
+        });
+        if done {
+            custom = None;
+        }
+    }
+    ui.data_mut(|d| match custom {
+        Some(c) => {
+            d.insert_temp(custom_id, c);
+        }
+        None => {
+            d.remove::<[u32; 2]>(custom_id);
+        }
+    });
+    if let Some(note) = RESIZE_NOTE.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+        caption(ui, note);
+    }
+    picked
 }
 
 pub fn ui(
@@ -383,12 +502,18 @@ pub fn ui(
                         });
                     }
                     SourceKind::Window => {
-                        let label = s.window.and_then(|w| dev.windows.iter().find(|d| d.0 == w)).map_or("Choose a window".into(), |d| d.1.clone());
+                        let chosen = s.window.and_then(|w| dev.windows.iter().find(|d| d.id == w)).cloned();
+                        let label = chosen.as_ref().map_or("Choose a window".into(), |d| d.label.clone());
                         egui::ComboBox::from_id_salt("window").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                            for (id, name) in &dev.windows {
-                                ui.selectable_value(&mut s.window, Some(*id), name);
+                            for d in &dev.windows {
+                                ui.selectable_value(&mut s.window, Some(d.id), &d.label);
                             }
                         });
+                        if let Some(w) = &chosen
+                            && let Some((width, height)) = window_size_row(ui, s, w)
+                        {
+                            action = Action::ResizeWindow { id: w.id, width, height };
+                        }
                         if ui.small_button("Refresh windows").clicked() {
                             *dev = Devices::load();
                         }

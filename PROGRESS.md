@@ -35,6 +35,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R10 | Hide desktop icons / Dock | ☑ | Excluded from the capture by window layer; wallpaper kept. Verified on a real recording. |
 | R11 | Global shortcuts | ☑ | Start/stop, pause, cancel; re-bindable; conflicts reported. |
 | R12 | Permissions | ☑ | Status, request button, exact steps below. |
+| R13 | Resize the recorded window | ☑ | Window source shows the window's size with a Resize menu: the same preset groups, saved sizes, custom size; sizes that don't fit its display are disabled. Accessibility API (needs Accessibility permission). Verified by resizing Glide's own window (`scripts/selftest.sh --screen`). |
 | Z1–Z7 | Auto zoom, zoom model, targeting, manual target, edge snapping, spring zoom, motion blur | ☑ | Engine unit tests; manual target picked by clicking the preview. |
 | C1–C9 | Cursor re-rendering, smoothing, tilt, press, idle hide, hidden slices, click circle/ripple, click sounds, loop/freeze | ☑ | System cursor images, plus generated vector and touch skins. |
 | S1 | Backgrounds | ☑ | Generated wallpapers, gradients, colour, imported image, current desktop picture, blur. |
@@ -62,9 +63,9 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 ## Verification on this MacBook (M4 Pro, macOS 27)
 
-`scripts/selftest.sh --screen` (2026-10-11): 4/4 pass.
+`scripts/selftest.sh --screen` (2026-10-11): 5/5 pass.
 
-- `cargo test` (77): engine, project, presets, renderer helpers, masks,
+- `cargo test` (78): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
   change detection, GIF quantisation, icon, plus a
@@ -74,7 +75,9 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
   the display (screenshotted) and is confirmed → record (test pattern) →
   pause/resume → stop → editor opens the new project → export → quit.
 - Real 5K display recording (Screen Recording granted to the terminal) →
-  export. Masks, device frames and voice-over mixing checked on real
+  export.
+- Window resize: Glide's own window resized to 1024×700 through the
+  Accessibility API and read back. Masks, device frames and voice-over mixing checked on real
   footage with `glide frame` and ffmpeg.
 
 UI layouts are checked with `glide snapshot`, which renders the real UI
@@ -101,6 +104,8 @@ with the Apple Development identity so grants survive rebuilds.
      need no permission).
    - **Speech Recognition**: allow when prompted by *Transcribe microphone*
      in the Captions tab.
+   - **Accessibility**: enable **Glide** to use *Resize* on the Window source
+     (macOS asks the first time).
 3. To try iPhone/iPad recording: connect the device with a cable, unlock it,
    tap *Trust*, then pick **iPhone** as the source (`glide devices` lists it).
 4. Optional end-to-end check from Terminal (uses the terminal's own grants):
@@ -124,7 +129,8 @@ test media.
   loop playback, caption editing, masks, area picker, hide icons/Dock,
   configurable shortcuts, device frames, voice-over, iOS device capture,
   menu bar sources, quick export, Finder document opening, GIF delta frames.
-- 2026-10-11: "Data may be visible" warnings for masks (`glide check-masks`).
+- 2026-10-11: "Data may be visible" warnings for masks (`glide check-masks`);
+  resize the recorded window (`glide resize-window`).
 - 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
   fixes from a full code review (preview audio lifecycle, timeline clamps,
   area bounds, voice-over/editor lifecycle, quit and restart behaviour).

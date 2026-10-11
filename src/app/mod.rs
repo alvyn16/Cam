@@ -745,6 +745,17 @@ impl App {
                     home::Action::RequestPermissions => {
                         std::thread::spawn(|| crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60)));
                     }
+                    home::Action::ResizeWindow { id, width, height } => {
+                        let note = match crate::capture::winsize::resize(id, width as f64, height as f64) {
+                            Ok((w, h)) if (w.round() as u32, h.round() as u32) != (width, height) => {
+                                Some(format!("The app limited the window to {w:.0} × {h:.0}"))
+                            }
+                            Ok(_) => None,
+                            Err(e) => Some(format!("{e:#}")),
+                        };
+                        home::set_resize_note(note);
+                        self.devices = home::Devices::load();
+                    }
                     home::Action::None => {}
                 }
                 let now = home::CAPTURING_SHORTCUT.load(Ordering::Relaxed);

@@ -123,6 +123,9 @@ enum Cmd {
         light: bool,
         #[arg(long, default_value_t = 0.0)]
         at: f64,
+        /// Home: show the Window source with the first window chosen.
+        #[arg(long)]
+        window: bool,
         #[arg(short, long)]
         output: PathBuf,
     },
@@ -150,6 +153,8 @@ enum Cmd {
     },
     /// Transcribe a project's microphone track into captions.
     Transcribe { project: PathBuf },
+    /// Resize a window (id or name, see `glide devices`) to WxH points before recording it.
+    ResizeWindow { window: String, size: String },
     /// List where content under a blur/pixelate mask moves ("data may be visible").
     CheckMasks { project: PathBuf },
     /// List displays, windows, cameras and microphones.
@@ -218,7 +223,7 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, output }) => {
+        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, window, output }) => {
             use glide::app::editor::Tab;
             let tab = tab.map(|t| {
                 Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
@@ -232,9 +237,18 @@ fn main() -> Result<()> {
                 dark: !light,
                 playhead_ms: at * 1000.0,
                 size: (1320.0, 840.0),
+                window,
             };
             glide::app::snapshot::render(&shot, &output)?;
             println!("{}", output.display());
+            Ok(())
+        }
+        Some(Cmd::ResizeWindow { window, size }) => {
+            let (w, h) = size.split_once(['x', '×']).ok_or_else(|| anyhow::anyhow!("size must look like 1920x1080"))?;
+            let (w, h): (f64, f64) = (w.trim().parse()?, h.trim().parse()?);
+            let win = glide::capture::screen::find_window(&window)?;
+            let got = glide::capture::winsize::resize(win.id, w, h)?;
+            println!("{} — {}: {:.0}×{:.0} → {:.0}×{:.0}", win.app, win.title, win.size.0, win.size.1, got.0, got.1);
             Ok(())
         }
         Some(Cmd::CheckMasks { project }) => {
@@ -517,5 +531,6 @@ fn permissions(request: bool) -> Result<()> {
     println!("Screen Recording: {:?}", tcc::screen_status());
     println!("Microphone:       {:?}", tcc::mic_status());
     println!("Camera:           {:?}", tcc::camera_status());
+    println!("Accessibility:    {} (resizing windows)", if glide::capture::winsize::trusted(false) { "Authorized" } else { "NotDetermined/Denied" });
     Ok(())
 }

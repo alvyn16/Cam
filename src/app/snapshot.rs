@@ -23,6 +23,8 @@ pub struct Shot<'a> {
     pub dark: bool,
     pub playhead_ms: f64,
     pub size: (f32, f32),
+    /// Home: show the Window source with the first window chosen.
+    pub window: bool,
 }
 
 pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
@@ -59,6 +61,10 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         settings.projects_dir = Some(dir.into());
     }
     let mut devices = Devices::load();
+    if shot.window {
+        settings.source = home::SourceKind::Window;
+        settings.window = devices.windows.first().map(|w| w.id);
+    }
     let mut projects = home::scan_projects(&settings.dir());
     let mut thumbs = Thumbs::default();
 
