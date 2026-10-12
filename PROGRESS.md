@@ -31,7 +31,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R6 | Camera | ◐ | Separate 720p file, bubble/layouts in the editor. Not exercised live: Camera permission not granted on this Mac. |
 | R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Everything after capture is tested with a synthetic portrait device recording (`glide synth --device`: phone frame chosen automatically, no cursor, MP4 export) in `scripts/selftest.sh`. Live capture untested: no iPhone/iPad was connected. |
 | R8 | Input logging | ☑ | 120 Hz mouse + buttons, cursor images with hotspots, keystrokes (needs Input Monitoring). |
-| R9 | Countdown, pause/resume, restart, cancel | ☑ | Floating widget; verified by the scripted GUI run. |
+| R9 | Countdown, pause/resume, restart, cancel | ☑ | Floating control bar like Screen Studio's: a native borderless, non-activating panel (clicking it doesn't bring Glide forward or change the recorded menu bar) shaped as a pill with a vibrancy background, hairline border and system shadow; pulsing red dot (orange when paused), monospaced timer, SF Symbol cancel / restart / pause buttons with hover highlights and tooltips (with shortcuts), red stop button; dragged by its background, remembered for the session; centred above the Dock on the recorded display. Kept out of recordings (own-window exclusion plus `sharingType = none`): checked on a real 5K recording of the display it sat on. The scripted GUI run checks it's present and draggable. |
 | R10 | Hide desktop icons / Dock | ☑ | Excluded from the capture by window layer; wallpaper kept. Verified on a real recording. |
 | R11 | Global shortcuts | ☑ | Start/stop, pause, cancel; re-bindable; conflicts reported. |
 | R12 | Permissions | ☑ | Status, request button, exact steps below. |
@@ -141,6 +141,7 @@ transcription were exercised only through their code paths and test media.
   resize the recorded window (`glide resize-window`); on-screen window
   picker covering every display; warning when the built-in mic is off with
   the lid closed; Whisper captions.
+- 2026-10-11: native floating recording control bar.
 - 2026-10-11: live preview of the selected source on the recording canvas.
 - 2026-10-11: editor-first window: recording setup in the editor layout,
   recents popover off the title, compact Record + source menu in the

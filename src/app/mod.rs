@@ -1,7 +1,7 @@
-//! The Glide app: one main window (Home ↔ Editor), a floating recording
-//! widget, a menu bar item and global shortcuts (default ⌥⇧⌘R). egui on wgpu with
-//! a transparent titlebar and Inter, sharing one GPU device with the
-//! editor's renderer.
+//! The Glide app: one main window (recording setup ↔ editor), a floating
+//! recording control bar (native panel), a menu bar item and global
+//! shortcuts (default ⌥⇧⌘R). egui on wgpu with a transparent titlebar and
+//! Inter, sharing one GPU device with the editor's renderer.
 
 pub mod editor;
 pub mod maskwatch;
@@ -16,6 +16,7 @@ pub mod snapshot;
 pub mod theme;
 pub mod timeline;
 pub mod voiceover;
+pub mod recbar;
 pub mod widgets;
 pub mod winpick;
 
@@ -101,7 +102,6 @@ struct Win {
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Main,
-    Widget,
     /// The picker overlay on this display.
     Overlay(u32),
 }
@@ -182,7 +182,10 @@ fn log(msg: &str) {
 struct App {
     gpu: Option<Gpu>,
     main: Option<Win>,
-    widget: Option<Win>,
+    /// Floating recording controls (while recording).
+    bar: Option<recbar::RecordBar>,
+    /// Where the user last left the bar (screen points, bottom-left).
+    bar_origin: Option<objc2_core_foundation::CGPoint>,
     /// Picker overlays, one per display.
     overlays: Vec<Win>,
     area: AreaPick,
@@ -228,7 +231,8 @@ impl App {
         App {
             gpu: None,
             main: None,
-            widget: None,
+            bar: None,
+            bar_origin: None,
             overlays: vec![],
             area: AreaPick::default(),
             view: View::Start,
@@ -250,18 +254,15 @@ impl App {
         }
     }
 
-    fn open_window(&mut self, el: &ActiveEventLoop, title: &str, size: (f64, f64), min: (f64, f64), floating: bool) -> Win {
+    fn open_window(&mut self, el: &ActiveEventLoop, title: &str, size: (f64, f64), min: (f64, f64)) -> Win {
         use winit::platform::macos::WindowAttributesExtMacOS;
-        let mut attrs = Window::default_attributes()
+        let attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(winit::dpi::LogicalSize::new(size.0, size.1))
             .with_min_inner_size(winit::dpi::LogicalSize::new(min.0, min.1))
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true)
             .with_title_hidden(true);
-        if floating {
-            attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop).with_resizable(false);
-        }
         self.make_window(el, attrs, false)
     }
 
@@ -366,7 +367,7 @@ impl App {
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
         if self.main.is_none() {
-            let w = self.open_window(el, "Glide", (1320.0, 840.0), (980.0, 640.0), false);
+            let w = self.open_window(el, "Glide", (1320.0, 840.0), (980.0, 640.0));
             self.main = Some(w);
         }
         if let Some(w) = &self.main {
@@ -418,6 +419,11 @@ impl App {
 
     fn recorder_options(&self) -> recorder::Options {
         let s = &self.settings;
+        // GLIDE_SELFTEST_REAL records the main display (to check what ends up
+        // in a real recording, e.g. that the control bar doesn't).
+        if self.selftest.is_some() && std::env::var_os("GLIDE_SELFTEST_REAL").is_some() {
+            return recorder::Options { target: Target::Display { id: 0 }, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()), ..Default::default() };
+        }
         if self.selftest.is_some() {
             return recorder::Options { target: Target::Pattern, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()), ..Default::default() };
         }
@@ -450,7 +456,7 @@ impl App {
         }
     }
 
-    fn start_recording(&mut self, el: &ActiveEventLoop) {
+    fn start_recording(&mut self, _el: &ActiveEventLoop) {
         if self.recording.is_some() || self.finishing {
             return;
         }
@@ -466,9 +472,13 @@ impl App {
         if let Some(w) = &self.main {
             w.window.set_visible(false);
         }
-        if self.widget.is_none() {
-            let w = self.open_window(el, "Glide Recording", (300.0, 64.0), (300.0, 64.0), true);
-            self.widget = Some(w);
+        if self.bar.is_none()
+            && let Some(mtm) = objc2::MainThreadMarker::new()
+        {
+            let hk = &self.settings.hotkeys;
+            let display = if matches!(self.settings.source, SourceKind::Display | SourceKind::Area) { self.settings.display } else { 0 };
+            let pause = hk.pause.map(|c| c.label()).unwrap_or_default();
+            self.bar = Some(recbar::RecordBar::new(mtm, display, self.bar_origin, &hk.record_label(), &pause));
         }
         if countdown.is_none() {
             self.begin_capture();
@@ -487,7 +497,7 @@ impl App {
             Err(e) => {
                 self.recording = None;
                 self.error = Some(format!("Couldn't start recording: {e:#}"));
-                self.widget = None;
+                self.close_bar();
                 self.permission_note = permission_note();
                 push(Cmd::ShowWindow);
             }
@@ -496,7 +506,7 @@ impl App {
 
     fn stop_recording(&mut self) {
         let Some(rec) = self.recording.take() else { return };
-        self.widget = None;
+        self.close_bar();
         let Some(r) = rec.rec else {
             push(Cmd::ShowWindow);
             return;
@@ -525,10 +535,17 @@ impl App {
                 std::thread::spawn(move || objc2::rc::autoreleasepool(|_| r.cancel()));
             }
         }
-        // Restarting keeps the recording widget up for the new take.
+        // Restarting keeps the recording bar up for the new take.
         if !restarting {
-            self.widget = None;
+            self.close_bar();
             push(Cmd::ShowWindow);
+        }
+    }
+
+    /// Remove the recording bar, remembering where it was.
+    fn close_bar(&mut self) {
+        if let Some(b) = self.bar.take() {
+            self.bar_origin = Some(b.origin());
         }
     }
 
@@ -656,6 +673,12 @@ impl App {
             _ => String::new(),
         };
         let paused = matches!(&self.recording, Some(Recording { rec: Some(r), .. }) if r.is_paused());
+        if let Some(b) = &mut self.bar {
+            b.update(match &self.recording {
+                Some(Recording { rec: None, countdown_until: Some(t) }) => recbar::State::Countdown(t.saturating_duration_since(Instant::now()).as_secs() + 1),
+                _ => recbar::State::Recording { clock: clock.clone(), paused },
+            });
+        }
         if let Some(m) = &mut self.menubar {
             m.update(&menubar::View { recording: self.recording.is_some(), paused, finishing: self.finishing, clock: &clock });
         }
@@ -752,6 +775,11 @@ impl App {
                 if !self.overlays.is_empty() || self.settings.source != SourceKind::Area {
                     fail("window picker cancel".into());
                 }
+                // A real recording is of the main display; put the bar there too.
+                if std::env::var_os("GLIDE_SELFTEST_REAL").is_some() {
+                    self.settings.source = SourceKind::Display;
+                    self.settings.display = 0;
+                }
                 st.phase = 1;
                 st.at = Instant::now();
                 push(Cmd::ToggleRecording);
@@ -775,7 +803,17 @@ impl App {
                     }
                     if st.resumed && r.elapsed() >= 3.0 {
                         let live = self.live.running.is_some() || self.live.starting.is_some();
-                        log(&format!("recording widget={} elapsed={:.1}s live_preview_running={live}", self.widget.is_some(), r.elapsed()));
+                        let bar = self.bar.as_ref().map(|b| (b.window_number(), b.draggable()));
+                        let at = self.bar.as_ref().map(|b| (b.origin().x.round(), b.origin().y.round()));
+                        log(&format!("recording bar={bar:?} origin={at:?} elapsed={:.1}s live_preview_running={live}", r.elapsed()));
+                        if let (Some(dir), Some((num, _))) = (std::env::var_os("GLIDE_SELFTEST_SHOTS"), bar) {
+                            let out = PathBuf::from(dir).join("record-bar.png");
+                            let ok = std::process::Command::new("screencapture").args(["-x", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
+                            log(&format!("recording bar screenshot {} ok={ok}", out.display()));
+                        }
+                        if bar.is_none_or(|(_, draggable)| !draggable) {
+                            fail("recording bar missing or not draggable".into());
+                        }
                         if live {
                             fail("live preview kept running while recording".into());
                         }
@@ -1022,50 +1060,6 @@ impl App {
         if let Some(w) = &self.main {
             w.window.set_title("Glide");
         }
-    }
-
-    fn draw_widget(&mut self, ui: &mut egui::Ui) {
-        let p = theme::pal(ui);
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: 76, right: 10, top: 0, bottom: 0 })).show(ui, |ui| {
-            toolbar_drag(ui);
-            ui.horizontal_centered(|ui| {
-                match &self.recording {
-                    Some(Recording { rec: None, countdown_until: Some(t), .. }) => {
-                        let n = t.saturating_duration_since(Instant::now()).as_secs() + 1;
-                        ui.label(RichText::new(format!("Starting in {n}…")).font(theme::semibold(14.0)));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Cancel").clicked() {
-                                push(Cmd::Cancel);
-                            }
-                        });
-                    }
-                    Some(Recording { rec: Some(r), .. }) => {
-                        let paused = r.is_paused();
-                        let dot = if paused { Color32::from_rgb(255, 159, 10) } else { Color32::from_rgb(255, 59, 48) };
-                        let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 5.0, dot);
-                        ui.label(RichText::new(crate::capture::record::clock(r.elapsed())).font(theme::semibold(14.0)).monospace());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::record_button(ui, 26.0, true).on_hover_text(format!("Stop {}", self.settings.hotkeys.record_label())).clicked() {
-                                push(Cmd::ToggleRecording);
-                            }
-                            if widgets::icon_button(ui, if paused { widgets::Icon::Play } else { widgets::Icon::Pause }, true).on_hover_text(if paused { "Resume" } else { "Pause" }).clicked() {
-                                push(Cmd::TogglePause);
-                            }
-                            if widgets::icon_button(ui, widgets::Icon::Restart, true).on_hover_text("Restart").clicked() {
-                                push(Cmd::Restart);
-                            }
-                            if widgets::icon_button(ui, widgets::Icon::Close, true).on_hover_text("Cancel").clicked() {
-                                push(Cmd::Cancel);
-                            }
-                        });
-                    }
-                    _ => {
-                        ui.label("Starting…");
-                    }
-                }
-            });
-        });
     }
 
     /// Area picker: dim the display, drag a rect, confirm with Return.
@@ -1395,8 +1389,6 @@ impl App {
         let is = |w: &Option<Win>| w.as_ref().is_some_and(|w| w.window.id() == id);
         if is(&self.main) {
             Some(Which::Main)
-        } else if is(&self.widget) {
-            Some(Which::Widget)
         } else {
             self.overlays.iter().find(|w| w.window.id() == id).map(|w| Which::Overlay(w.display))
         }
@@ -1406,7 +1398,6 @@ impl App {
     fn take_window(&mut self, which: Which) -> Option<Win> {
         match which {
             Which::Main => self.main.take(),
-            Which::Widget => self.widget.take(),
             Which::Overlay(d) => {
                 let i = self.overlays.iter().position(|w| w.display == d)?;
                 Some(self.overlays.remove(i))
@@ -1417,7 +1408,6 @@ impl App {
     fn window_mut(&mut self, which: Which) -> Option<&mut Win> {
         match which {
             Which::Main => self.main.as_mut(),
-            Which::Widget => self.widget.as_mut(),
             Which::Overlay(d) => self.overlays.iter_mut().find(|w| w.display == d),
         }
     }
@@ -1425,7 +1415,6 @@ impl App {
     fn put_back(&mut self, which: Which, win: Win) {
         match which {
             Which::Main => self.main = Some(win),
-            Which::Widget => self.widget = Some(win),
             Which::Overlay(_) => self.overlays.push(win),
         }
     }
@@ -1441,7 +1430,6 @@ impl App {
         let mut keep = true;
         let out = ctx.run_ui(input, |ui| match which {
             Which::Main => self.draw_main(ui, renderer),
-            Which::Widget => self.draw_widget(ui),
             Which::Overlay(display) => {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     self.draw_overlay(ui, display);
@@ -1534,7 +1522,7 @@ impl ApplicationHandler for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
         self.tick(el);
-        for w in [self.main.as_ref(), self.widget.as_ref()].into_iter().flatten().chain(&self.overlays) {
+        for w in self.main.iter().chain(&self.overlays) {
             w.window.request_redraw();
         }
     }
@@ -1553,7 +1541,6 @@ impl ApplicationHandler for App {
                     }
                     push(Cmd::Quit);
                 }
-                Which::Widget => push(Cmd::Cancel),
                 Which::Overlay(_) => {
                     self.area.closed = true;
                     self.area.windows = None;
@@ -1637,10 +1624,7 @@ impl ApplicationHandler for App {
             w.window.request_redraw();
             next = now + Duration::from_millis(8);
         }
-        if live && let Some(w) = &self.widget {
-            w.window.request_redraw();
-        }
-        for w in [self.main.as_mut(), self.widget.as_mut()].into_iter().flatten().chain(self.overlays.iter_mut()) {
+        for w in self.main.iter_mut().chain(self.overlays.iter_mut()) {
             if let Some(t) = w.repaint_at {
                 if t <= now {
                     w.repaint_at = None;
