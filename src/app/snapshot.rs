@@ -25,6 +25,8 @@ pub struct Shot<'a> {
     pub size: (f32, f32),
     /// Home: show the Window source with the first window chosen.
     pub window: bool,
+    /// Draw the recent-recordings popover under the title.
+    pub recents: bool,
 }
 
 pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
@@ -65,7 +67,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         settings.source = home::SourceKind::Window;
         settings.window = devices.windows.first().map(|w| w.id);
     }
-    let mut projects = home::scan_projects(&settings.dir());
+    let projects = home::scan_projects(&settings.dir());
     let mut thumbs = Thumbs::default();
 
     let mut last = None;
@@ -79,8 +81,9 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
         // Thumbnails load on background threads.
         let wait = match (i, editor.is_some()) {
+            (4, _) if shot.recents => 5000,
             (4, true) => 600,
-            (4, false) => 5000,
+            (4, false) => 300,
             _ => 20,
         };
         std::thread::sleep(std::time::Duration::from_millis(wait));
@@ -95,15 +98,27 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
                 ed.tick();
             }
         }
-        let out = ctx.run_ui(input, |ui| match &mut editor {
-            Some(ed) => {
-                let mut back = false;
-                ed.ui(ui, &mut renderer, &mut back);
+        let out = ctx.run_ui(input, |ui| {
+            match &mut editor {
+                Some(ed) => {
+                    let mut chrome = home::Chrome { settings: &mut settings, devices: &mut devices, projects: &projects, thumbs: &mut thumbs, action: home::Action::None };
+                    ed.ui(ui, &mut renderer, &mut chrome);
+                }
+                None => {
+                    home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, None);
+                }
             }
-            None => {
-                home::ui(ui, &mut settings, &mut devices, &mut projects, &mut thumbs, None);
+            // The popover itself (a menu only opens from a click).
+            if shot.recents {
+                let current = editor.as_ref().map(|e| e.package.root.clone());
+                egui::Area::new(egui::Id::new("recents-preview")).fixed_pos(egui::pos2(130.0, 50.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        home::recents(ui, &projects, &mut thumbs, current.as_deref(), &settings.dir());
+                    });
+                });
             }
         });
+
         for (id, deltas) in &out.textures_delta.set {
             for d in deltas {
                 renderer.update_texture(&gpu.device, &gpu.queue, *id, d);

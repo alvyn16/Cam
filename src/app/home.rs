@@ -1,4 +1,5 @@
-//! Home: start a recording and browse projects.
+//! Recording setup and recent recordings: the window's start state (the
+//! editor layout with no recording open) and the editor's title-bar controls.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -346,6 +347,8 @@ pub enum Action {
     HotkeysChanged,
     Open(PathBuf),
     RequestPermissions,
+    /// Close the open recording (back to recording setup).
+    Back,
     ResizeWindow { id: u32, width: u32, height: u32 },
     /// Pick a window on screen.
     SelectWindow,
@@ -454,248 +457,390 @@ pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option
     picked
 }
 
-pub fn ui(
-    ui: &mut Ui,
-    s: &mut Settings,
-    dev: &mut Devices,
-    projects: &mut Vec<ProjectEntry>,
-    thumbs: &mut Thumbs,
-    permission_note: Option<&str>,
-) -> Action {
+/// Recording setup for the inspector: source, audio, camera and options.
+pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permission_note: Option<&str>) -> Action {
+    let mut action = Action::None;
+    ui.label(RichText::new("Source").font(theme::semibold(13.0)).color(pal(ui).secondary));
+    ui.add_space(4.0);
+    segmented(ui, &mut s.source, &[(SourceKind::Display, "Display"), (SourceKind::Window, "Window"), (SourceKind::Area, "Area"), (SourceKind::Device, "iPhone")]);
+    ui.add_space(8.0);
+    match s.source {
+        SourceKind::Display => {
+            let label = dev.displays.iter().find(|d| d.0 == s.display).map_or("Main display".to_string(), |d| d.1.clone());
+            egui::ComboBox::from_id_salt("display").width(290.0).selected_text(label).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.display, 0, "Main display");
+                for (id, name) in &dev.displays {
+                    ui.selectable_value(&mut s.display, *id, name);
+                }
+            });
+        }
+        SourceKind::Window => {
+            let chosen = s.window.and_then(|w| dev.windows.iter().find(|d| d.id == w)).cloned();
+            let label = chosen.as_ref().map_or("Choose a window".into(), |d| d.label.clone());
+            egui::ComboBox::from_id_salt("window").width(290.0).selected_text(label).show_ui(ui, |ui| {
+                for d in &dev.windows {
+                    ui.selectable_value(&mut s.window, Some(d.id), &d.label);
+                }
+            });
+            if let Some(w) = &chosen
+                && let Some((width, height)) = window_size_row(ui, s, w)
+            {
+                action = Action::ResizeWindow { id: w.id, width, height };
+            }
+            ui.horizontal(|ui| {
+                if ui.small_button("Pick on screen…").on_hover_text("Highlight windows on the display and click one").clicked() {
+                    action = Action::SelectWindow;
+                }
+                if ui.small_button("Refresh windows").clicked() {
+                    *dev = Devices::load();
+                }
+            });
+        }
+        SourceKind::Device => {
+            if dev.ios.is_empty() {
+                caption(ui, "Connect an iPhone or iPad with a cable, unlock it and trust this Mac.");
+            } else {
+                if s.ios_device.as_ref().is_none_or(|id| !dev.ios.iter().any(|d| &d.id == id)) {
+                    s.ios_device = dev.ios.first().map(|d| d.id.clone());
+                }
+                let label = s.ios_device.as_ref().and_then(|id| dev.ios.iter().find(|d| &d.id == id)).map_or("", |d| d.name.as_str()).to_string();
+                egui::ComboBox::from_id_salt("ios").width(290.0).selected_text(label).show_ui(ui, |ui| {
+                    for d in &dev.ios {
+                        ui.selectable_value(&mut s.ios_device, Some(d.id.clone()), &d.name);
+                    }
+                });
+            }
+            if ui.small_button("Refresh").clicked() {
+                *dev = Devices::load();
+            }
+        }
+        SourceKind::Area => {
+            ui.horizontal(|ui| {
+                if ui.button("Select area…").on_hover_text("Drag a region on the screen").clicked() {
+                    action = Action::SelectArea;
+                }
+                caption(ui, &format!("{:.0} × {:.0} at {:.0}, {:.0}", s.area[2], s.area[3], s.area[0], s.area[1]));
+            });
+            egui::CollapsingHeader::new("Exact size").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, l) in ["x", "y", "w", "h"].iter().enumerate() {
+                        ui.label(*l);
+                        ui.add(egui::DragValue::new(&mut s.area[i]).speed(4.0).range(0.0..=8000.0));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for (name, w, h) in [("1280×720", 1280.0, 720.0), ("1920×1080", 1920.0, 1080.0), ("1080×1080", 1080.0, 1080.0)] {
+                        if ui.small_button(name).clicked() {
+                            s.area[2] = w;
+                            s.area[3] = h;
+                        }
+                    }
+                });
+            });
+        }
+    }
+    ui.add_space(10.0);
+    ui.separator();
+    toggle_row(ui, "System audio", &mut s.system_audio);
+    toggle_row(ui, "Microphone", &mut s.mic);
+    if s.mic {
+        let label = s.mic_id.as_ref().and_then(|id| dev.mics.iter().find(|m| &m.id == id)).map_or("Default".to_string(), |m| m.name.clone());
+        egui::ComboBox::from_id_salt("mic").width(290.0).selected_text(label).show_ui(ui, |ui| {
+            ui.selectable_value(&mut s.mic_id, None, "Default");
+            for m in &dev.mics {
+                ui.selectable_value(&mut s.mic_id, Some(m.id.clone()), &m.name);
+            }
+        });
+        if crate::capture::camera::builtin_mic_off(s.mic_id.as_deref()) {
+            caption(ui, "The lid is closed, so the built-in microphone only records silence. Choose another microphone.");
+        }
+    }
+    toggle_row(ui, "Camera", &mut s.camera);
+    if s.camera {
+        let label = s.camera_id.as_ref().and_then(|id| dev.cameras.iter().find(|m| &m.id == id)).map_or("Default".to_string(), |m| m.name.clone());
+        egui::ComboBox::from_id_salt("cam").width(290.0).selected_text(label).show_ui(ui, |ui| {
+            ui.selectable_value(&mut s.camera_id, None, "Default");
+            for m in &dev.cameras {
+                ui.selectable_value(&mut s.camera_id, Some(m.id.clone()), &m.name);
+            }
+        });
+    }
+    toggle_row(ui, "Record key presses", &mut s.keys);
+    toggle_row(ui, "3 s countdown", &mut s.countdown);
+    if matches!(s.source, SourceKind::Display | SourceKind::Area) {
+        toggle_row(ui, "Hide desktop icons", &mut s.hide_desktop_icons);
+        toggle_row(ui, "Hide Dock", &mut s.hide_dock);
+    }
+    row(ui, "Frame rate", |ui| {
+        segmented(ui, &mut s.fps, &[(60, "60"), (30, "30")]);
+    });
+    egui::CollapsingHeader::new("Global shortcuts").show(ui, |ui| {
+        let mut changed = false;
+        changed |= shortcut_row(ui, "Start / stop", &mut s.hotkeys.record);
+        changed |= shortcut_row(ui, "Pause / resume", &mut s.hotkeys.pause);
+        changed |= shortcut_row(ui, "Cancel recording", &mut s.hotkeys.cancel);
+        caption(ui, "Click a shortcut, then press the new keys (⌫ clears, ⎋ keeps it).");
+        if changed {
+            action = Action::HotkeysChanged;
+        }
+    });
+    if let Some(note) = permission_note {
+        ui.add_space(12.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(255, 159, 10, 30))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.label(RichText::new(note).size(12.0));
+                if ui.button("Request access").clicked() {
+                    action = Action::RequestPermissions;
+                }
+            });
+    }
+    action
+}
+
+/// One line describing what Record will capture.
+pub fn source_summary(s: &Settings, dev: &Devices) -> String {
+    let source = match s.source {
+        SourceKind::Display => dev.displays.iter().find(|d| d.0 == s.display).map_or("Main display".to_string(), |d| d.1.split(" — ").next().unwrap_or("Display").to_string()),
+        SourceKind::Window => s.window.and_then(|w| dev.windows.iter().find(|d| d.id == w)).map_or("A window (pick it next)".to_string(), |d| d.label.clone()),
+        SourceKind::Area => format!("Area {:.0} × {:.0}", s.area[2], s.area[3]),
+        SourceKind::Device => s.ios_device.as_ref().and_then(|id| dev.ios.iter().find(|d| &d.id == id)).map_or("iPhone / iPad".to_string(), |d| d.name.clone()),
+    };
+    let on = |b: bool| if b { "on" } else { "off" };
+    format!("{source}  ·  system audio {}  ·  mic {}  ·  camera {}", on(s.system_audio), on(s.mic), on(s.camera))
+}
+
+fn source_name(k: SourceKind) -> &'static str {
+    match k {
+        SourceKind::Display => "Display",
+        SourceKind::Window => "Window",
+        SourceKind::Area => "Area",
+        SourceKind::Device => "iPhone",
+    }
+}
+
+/// Recent recordings, newest first, with small thumbnails; plus Open… and
+/// the projects folder. Used as the popover off the window title.
+pub fn recents(ui: &mut Ui, projects: &[ProjectEntry], thumbs: &mut Thumbs, current: Option<&Path>, dir: &Path) -> Action {
     let mut action = Action::None;
     let p = pal(ui);
-    egui::Panel::top("home-toolbar")
+    const WIDTH: f32 = 340.0;
+    ui.set_width(WIDTH);
+    ui.label(RichText::new("Recent recordings").font(theme::semibold(12.0)).color(p.secondary));
+    if projects.is_empty() {
+        caption(ui, "Nothing recorded yet.");
+    }
+    for e in projects.iter().take(10) {
+        let open = current == Some(e.path.as_path());
+        let (rect, resp) = ui.allocate_exact_size(vec2(WIDTH, 46.0), Sense::click());
+        if resp.hovered() || open {
+            ui.painter().rect_filled(rect, CornerRadius::same(6), if open { p.pressed } else { p.hover });
+        }
+        let thumb = egui::Rect::from_min_size(rect.min + vec2(4.0, 5.0), vec2(58.0, 36.0));
+        ui.painter().rect_filled(thumb, CornerRadius::same(4), p.control);
+        if let Some(tex) = thumbs.get(ui.ctx(), &e.path) {
+            ui.painter().image(tex, thumb, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        let x = thumb.right() + 10.0;
+        ui.painter().text(egui::pos2(x, rect.top() + 7.0), egui::Align2::LEFT_TOP, &e.name, theme::semibold(12.5), p.text);
+        ui.painter().text(
+            egui::pos2(x, rect.top() + 25.0),
+            egui::Align2::LEFT_TOP,
+            format!("{}  ·  {}", widgets::fmt_time(e.duration_ms), ago(e.modified)),
+            egui::FontId::proportional(11.0),
+            p.secondary,
+        );
+        if resp.clicked() && !open {
+            action = Action::Open(e.path.clone());
+        }
+        resp.context_menu(|ui| {
+            if ui.button("Show in Finder").clicked() {
+                super::macos::reveal(&e.path);
+            }
+        });
+    }
+    ui.separator();
+    if ui.button("Open…").clicked()
+        && let Some(f) = rfd::FileDialog::new().set_directory(dir).pick_folder()
+    {
+        action = Action::Open(f);
+    }
+    if ui.button("Show projects folder").clicked() {
+        super::macos::open_folder(dir);
+    }
+    action
+}
+
+/// A small down chevron at the right end of a menu button (Inter has no ▾;
+/// the label leaves room for it).
+fn chevron(ui: &Ui, r: &egui::Response) {
+    let c = egui::pos2(r.rect.right() - 13.0, r.rect.center().y + 1.0);
+    let stroke = Stroke::new(1.5, pal(ui).secondary);
+    ui.painter().line_segment([c + vec2(-4.0, -2.5), c], stroke);
+    ui.painter().line_segment([c, c + vec2(4.0, -2.5)], stroke);
+}
+
+/// What the editor's title bar needs from the app: recording settings and
+/// recent recordings. Its `action` is handled after the frame.
+pub struct Chrome<'a> {
+    pub settings: &'a mut Settings,
+    pub devices: &'a mut Devices,
+    pub projects: &'a [ProjectEntry],
+    pub thumbs: &'a mut Thumbs,
+    pub action: Action,
+}
+
+impl Chrome<'_> {
+    fn set(&mut self, a: Action) {
+        if !matches!(a, Action::None) {
+            self.action = a;
+        }
+    }
+
+    /// Back, then the title, which opens recent recordings.
+    pub fn title_left(&mut self, ui: &mut Ui, title: &str, open: Option<&Path>) {
+        if open.is_some() && ui.button("‹ Back").on_hover_text("Close this recording and set up a new one").clicked() {
+            self.set(Action::Back);
+        }
+        ui.add_space(8.0);
+        let dir = self.settings.dir();
+        let mut a = Action::None;
+        let r = ui.menu_button(RichText::new(format!("{title}      ")).font(theme::semibold(theme::BODY)), |ui| {
+            a = recents(ui, self.projects, self.thumbs, open, &dir);
+        });
+        chevron(ui, &r.response);
+        r.response.on_hover_text("Recent recordings");
+        self.set(a);
+    }
+
+    /// Compact record controls: Record now, and a menu for the source and
+    /// audio/camera (laid out right to left, so Record comes last).
+    pub fn record_controls(&mut self, ui: &mut Ui) {
+        let s = &mut *self.settings;
+        let mut a = Action::None;
+        let r = ui.menu_button(format!("{}      ", source_name(s.source)), |ui| {
+            for k in [SourceKind::Display, SourceKind::Window, SourceKind::Area, SourceKind::Device] {
+                if ui.selectable_label(s.source == k, source_name(k)).clicked() {
+                    s.source = k;
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut s.system_audio, "System audio");
+            ui.checkbox(&mut s.mic, "Microphone");
+            ui.checkbox(&mut s.camera, "Camera");
+            ui.separator();
+            if ui.button("More options…").on_hover_text("Close this recording and show every recording option").clicked() {
+                a = Action::Back;
+            }
+        });
+        chevron(ui, &r.response);
+        r.response.on_hover_text("What to record");
+        let rec = egui::Button::new(RichText::new("●  Record").color(Color32::from_rgb(255, 69, 58)).font(theme::semibold(theme::BODY)));
+        if ui.add(rec).on_hover_text(format!("{}  ({})", source_summary(s, self.devices), s.hotkeys.record_label())).clicked() {
+            a = Action::Record;
+        }
+        self.set(a);
+    }
+}
+
+/// The window with no recording open: the editor's layout with recording
+/// setup in the inspector, a big Record button on the canvas and an empty
+/// timeline.
+pub fn start_view(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, projects: &[ProjectEntry], thumbs: &mut Thumbs, permission_note: Option<&str>) -> Action {
+    let mut chrome = Chrome { settings: s, devices: dev, projects, thumbs, action: Action::None };
+    let p = pal(ui);
+    egui::Panel::top("editor-toolbar")
         .exact_size(theme::TOOLBAR_H)
         .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::TRAFFIC_LIGHTS_W as i8, right: 12, top: 0, bottom: 0 }))
         .show(ui, |ui| {
             super::toolbar_drag(ui);
             ui.horizontal_centered(|ui| {
-                ui.label(RichText::new("Glide").font(theme::semibold(15.0)));
+                chrome.title_left(ui, "New recording", None);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Open…").clicked()
-                        && let Some(f) = rfd::FileDialog::new().set_directory(s.dir()).pick_folder()
-                    {
-                        action = Action::Open(f);
-                    }
-                    if ui.button("Projects folder").clicked() {
-                        super::macos::open_folder(&s.dir());
-                    }
+                    ui.add_enabled_ui(false, |ui| {
+                        widgets::primary(ui, "Export");
+                        ui.add_space(6.0);
+                        let _ = ui.button("Presets");
+                        ui.add_space(4.0);
+                        widgets::icon_button(ui, widgets::Icon::Redo, false);
+                        widgets::icon_button(ui, widgets::Icon::Undo, false);
+                    });
                 });
             });
         });
 
-    egui::Panel::left("new-recording")
-        .exact_size(340.0)
+    egui::Panel::right("inspector")
+        .exact_size(320.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(18, 14)))
+        .frame(egui::Frame::new().fill(p.inspector).inner_margin(egui::Margin::symmetric(14, 10)))
         .show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                ui.label(RichText::new("New recording").font(theme::semibold(17.0)));
-                ui.add_space(10.0);
-                segmented(ui, &mut s.source, &[(SourceKind::Display, "Display"), (SourceKind::Window, "Window"), (SourceKind::Area, "Area"), (SourceKind::Device, "iPhone")]);
-                ui.add_space(8.0);
-                match s.source {
-                    SourceKind::Display => {
-                        let label = dev.displays.iter().find(|d| d.0 == s.display).map_or("Main display".to_string(), |d| d.1.clone());
-                        egui::ComboBox::from_id_salt("display").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut s.display, 0, "Main display");
-                            for (id, name) in &dev.displays {
-                                ui.selectable_value(&mut s.display, *id, name);
-                            }
-                        });
+                // The editor's tabs, with Record active until there's a recording.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    let pill = |label: &str, sel: bool| {
+                        egui::Button::new(RichText::new(label).size(12.0).color(if sel { Color32::WHITE } else { p.text }))
+                            .fill(if sel { theme::accent() } else { p.control })
+                            .stroke(if sel { Stroke::NONE } else { Stroke::new(0.5, p.control_border) })
+                            .corner_radius(CornerRadius::same(12))
+                    };
+                    ui.add(pill("Record", true));
+                    for (_, label) in super::editor::Tab::ALL {
+                        ui.add_enabled(false, pill(label, false)).on_disabled_hover_text("Record or open a recording to edit it");
                     }
-                    SourceKind::Window => {
-                        let chosen = s.window.and_then(|w| dev.windows.iter().find(|d| d.id == w)).cloned();
-                        let label = chosen.as_ref().map_or("Choose a window".into(), |d| d.label.clone());
-                        egui::ComboBox::from_id_salt("window").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                            for d in &dev.windows {
-                                ui.selectable_value(&mut s.window, Some(d.id), &d.label);
-                            }
-                        });
-                        if let Some(w) = &chosen
-                            && let Some((width, height)) = window_size_row(ui, s, w)
-                        {
-                            action = Action::ResizeWindow { id: w.id, width, height };
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Pick on screen…").on_hover_text("Highlight windows on the display and click one").clicked() {
-                                action = Action::SelectWindow;
-                            }
-                            if ui.small_button("Refresh windows").clicked() {
-                                *dev = Devices::load();
-                            }
-                        });
-                    }
-                    SourceKind::Device => {
-                        if dev.ios.is_empty() {
-                            caption(ui, "Connect an iPhone or iPad with a cable, unlock it and trust this Mac.");
-                        } else {
-                            if s.ios_device.as_ref().is_none_or(|id| !dev.ios.iter().any(|d| &d.id == id)) {
-                                s.ios_device = dev.ios.first().map(|d| d.id.clone());
-                            }
-                            let label = s.ios_device.as_ref().and_then(|id| dev.ios.iter().find(|d| &d.id == id)).map_or("", |d| d.name.as_str()).to_string();
-                            egui::ComboBox::from_id_salt("ios").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                                for d in &dev.ios {
-                                    ui.selectable_value(&mut s.ios_device, Some(d.id.clone()), &d.name);
-                                }
-                            });
-                        }
-                        if ui.small_button("Refresh").clicked() {
-                            *dev = Devices::load();
-                        }
-                    }
-                    SourceKind::Area => {
-                        ui.horizontal(|ui| {
-                            if ui.button("Select area…").on_hover_text("Drag a region on the screen").clicked() {
-                                action = Action::SelectArea;
-                            }
-                            caption(ui, &format!("{:.0} × {:.0} at {:.0}, {:.0}", s.area[2], s.area[3], s.area[0], s.area[1]));
-                        });
-                        egui::CollapsingHeader::new("Exact size").show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, l) in ["x", "y", "w", "h"].iter().enumerate() {
-                                    ui.label(*l);
-                                    ui.add(egui::DragValue::new(&mut s.area[i]).speed(4.0).range(0.0..=8000.0));
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                for (name, w, h) in [("1280×720", 1280.0, 720.0), ("1920×1080", 1920.0, 1080.0), ("1080×1080", 1080.0, 1080.0)] {
-                                    if ui.small_button(name).clicked() {
-                                        s.area[2] = w;
-                                        s.area[3] = h;
-                                    }
-                                }
-                            });
-                        });
-                    }
-                }
-                ui.add_space(10.0);
+                });
+                ui.add_space(4.0);
                 ui.separator();
-                toggle_row(ui, "System audio", &mut s.system_audio);
-                toggle_row(ui, "Microphone", &mut s.mic);
-                if s.mic {
-                    let label = s.mic_id.as_ref().and_then(|id| dev.mics.iter().find(|m| &m.id == id)).map_or("Default".to_string(), |m| m.name.clone());
-                    egui::ComboBox::from_id_salt("mic").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut s.mic_id, None, "Default");
-                        for m in &dev.mics {
-                            ui.selectable_value(&mut s.mic_id, Some(m.id.clone()), &m.name);
-                        }
-                    });
-                    if crate::capture::camera::builtin_mic_off(s.mic_id.as_deref()) {
-                        caption(ui, "The lid is closed, so the built-in microphone only records silence. Choose another microphone.");
-                    }
-                }
-                toggle_row(ui, "Camera", &mut s.camera);
-                if s.camera {
-                    let label = s.camera_id.as_ref().and_then(|id| dev.cameras.iter().find(|m| &m.id == id)).map_or("Default".to_string(), |m| m.name.clone());
-                    egui::ComboBox::from_id_salt("cam").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut s.camera_id, None, "Default");
-                        for m in &dev.cameras {
-                            ui.selectable_value(&mut s.camera_id, Some(m.id.clone()), &m.name);
-                        }
-                    });
-                }
-                toggle_row(ui, "Record key presses", &mut s.keys);
-                toggle_row(ui, "3 s countdown", &mut s.countdown);
-                if matches!(s.source, SourceKind::Display | SourceKind::Area) {
-                    toggle_row(ui, "Hide desktop icons", &mut s.hide_desktop_icons);
-                    toggle_row(ui, "Hide Dock", &mut s.hide_dock);
-                }
-                row(ui, "Frame rate", |ui| {
-                    segmented(ui, &mut s.fps, &[(60, "60"), (30, "30")]);
-                });
-                egui::CollapsingHeader::new("Global shortcuts").show(ui, |ui| {
-                    let mut changed = false;
-                    changed |= shortcut_row(ui, "Start / stop", &mut s.hotkeys.record);
-                    changed |= shortcut_row(ui, "Pause / resume", &mut s.hotkeys.pause);
-                    changed |= shortcut_row(ui, "Cancel recording", &mut s.hotkeys.cancel);
-                    caption(ui, "Click a shortcut, then press the new keys (⌫ clears, ⎋ keeps it).");
-                    if changed {
-                        action = Action::HotkeysChanged;
-                    }
-                });
-                ui.add_space(18.0);
-                ui.vertical_centered(|ui| {
-                    let hk = s.hotkeys.record_label();
-                    if widgets::record_button(ui, 64.0, false).on_hover_text(format!("Start recording {hk}")).clicked() {
-                        action = Action::Record;
-                    }
-                    ui.add_space(4.0);
-                    caption(ui, &format!("Start recording  {hk}"));
-                });
-                if let Some(note) = permission_note {
-                    ui.add_space(12.0);
-                    egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(255, 159, 10, 30))
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(egui::Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(note).size(12.0));
-                            if ui.button("Request access").clicked() {
-                                action = Action::RequestPermissions;
-                            }
-                        });
-                }
+                ui.add_space(4.0);
+                let a = record_settings(ui, chrome.settings, chrome.devices, permission_note);
+                chrome.set(a);
             });
         });
 
-    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin::same(20))).show(ui, |ui| {
-        ui.label(RichText::new("Projects").font(theme::semibold(17.0)));
-        ui.add_space(10.0);
-        if projects.is_empty() {
-            caption(ui, "Your recordings will appear here.");
-            return;
-        }
-        let mut remove: Option<PathBuf> = None;
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
-                for e in projects.iter() {
-                    let card = vec2(232.0, 180.0);
-                    let (rect, resp) = ui.allocate_exact_size(card, Sense::click());
-                    let hover = resp.hovered();
-                    let painter = ui.painter_at(rect.expand(4.0));
-                    let thumb_rect = egui::Rect::from_min_size(rect.min, vec2(card.x, 131.0));
-                    painter.rect_filled(thumb_rect, CornerRadius::same(8), if ui.visuals().dark_mode { Color32::from_white_alpha(10) } else { Color32::from_black_alpha(10) });
-                    if let Some(tex) = thumbs.get(ui.ctx(), &e.path) {
-                        painter.image(tex, thumb_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    painter.rect_stroke(thumb_rect, CornerRadius::same(8), Stroke::new(if hover { 2.0 } else { 0.5 }, if hover { theme::accent() } else { p.control_border }), egui::StrokeKind::Outside);
-                    painter.text(thumb_rect.left_bottom() + vec2(2.0, 8.0), egui::Align2::LEFT_TOP, &e.name, theme::semibold(12.5), p.text);
-                    painter.text(
-                        thumb_rect.left_bottom() + vec2(2.0, 27.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{}  ·  {}", widgets::fmt_time(e.duration_ms), ago(e.modified)),
-                        egui::FontId::proportional(11.0),
-                        p.secondary,
-                    );
-                    if resp.clicked() {
-                        action = Action::Open(e.path.clone());
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("Open").clicked() {
-                            action = Action::Open(e.path.clone());
-                            ui.close();
-                        }
-                        if ui.button("Show in Finder").clicked() {
-                            super::macos::reveal(&e.path);
-                            ui.close();
-                        }
-                        if ui.button("Move to Trash").clicked() {
-                            remove = Some(e.path.clone());
-                            ui.close();
-                        }
-                    });
+    egui::Panel::bottom("timeline")
+        .exact_size(236.0)
+        .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(12, 8)))
+        .show(ui, |ui| {
+            super::timeline::empty(ui);
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(if ui.visuals().dark_mode { Color32::from_rgb(0x1c, 0x1c, 0x1e) } else { Color32::from_rgb(0xe4, 0xe4, 0xe7) }))
+        .show(ui, |ui| {
+            let s = &*chrome.settings;
+            let mut a = Action::None;
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() / 2.0 - 130.0).max(16.0));
+                let hk = s.hotkeys.record_label();
+                if widgets::record_button(ui, 96.0, false).on_hover_text(format!("Start recording {hk}")).clicked() {
+                    a = Action::Record;
+                }
+                ui.add_space(14.0);
+                ui.label(RichText::new(format!("Record {}", source_name(s.source).to_lowercase())).font(theme::semibold(20.0)));
+                ui.add_space(4.0);
+                caption(ui, &source_summary(s, chrome.devices));
+                let next = match s.source {
+                    SourceKind::Area => "You'll drag to select the area next.",
+                    SourceKind::Window if s.window.is_none() => "You'll pick the window on screen next.",
+                    _ if s.countdown => "Recording starts after a 3 s countdown.",
+                    _ => "",
+                };
+                if !next.is_empty() {
+                    caption(ui, next);
+                }
+                caption(ui, &format!("Shortcut {hk}"));
+                ui.add_space(18.0);
+                if ui.button("Open a recording…").clicked()
+                    && let Some(f) = rfd::FileDialog::new().set_directory(s.dir()).pick_folder()
+                {
+                    a = Action::Open(f);
                 }
             });
+            chrome.set(a);
         });
-        if let Some(r) = remove {
-            super::macos::trash(&r);
-            thumbs.forget(&r);
-            projects.retain(|e| e.path != r);
-        }
-    });
-    action
+    chrome.action
 }
 
 fn ago(t: SystemTime) -> String {

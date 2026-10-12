@@ -126,6 +126,9 @@ enum Cmd {
         /// Home: show the Window source with the first window chosen.
         #[arg(long)]
         window: bool,
+        /// Also draw the recent-recordings popover.
+        #[arg(long)]
+        recents: bool,
         #[arg(short, long)]
         output: PathBuf,
     },
@@ -231,7 +234,7 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, window, output }) => {
+        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, window, recents, output }) => {
             use glide::app::editor::Tab;
             let tab = tab.map(|t| {
                 Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
@@ -246,6 +249,7 @@ fn main() -> Result<()> {
                 playhead_ms: at * 1000.0,
                 size: (1320.0, 840.0),
                 window,
+                recents,
             };
             glide::app::snapshot::render(&shot, &output)?;
             println!("{}", output.display());

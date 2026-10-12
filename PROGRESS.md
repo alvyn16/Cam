@@ -11,7 +11,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | M3 | Media: AVAssetReader decode with seeking and prefetch | ☑ |
 | M4 | Recording: ScreenCaptureKit display/window/area, system audio, mic, camera, input + cursor logging, iOS devices | ☑ (capture core from rec-rs) |
 | M5 | Export: MP4 (VideoToolbox H.264/HEVC, zero-copy), audio mix with cuts/speed/voice-over ducking, GIF | ☑ |
-| M6 | Editor UI (egui + Inter): library, preview, inspector, timeline, recording widget, area picker, menu bar, shortcuts | ☑ |
+| M6 | Editor UI (egui + Inter): one editor-first window (recording setup, recents popover), preview, inspector, timeline, recording widget, area/window pickers, menu bar, shortcuts | ☑ |
 | M7 | Captions (Apple Speech, on device, editable), shortcut overlay | ☑ |
 | M8 | App bundle, icon, signing (`scripts/build.sh`) | ☑ |
 | M9 | Verification with real recordings; `PERFORMANCE.md` | ☑ `scripts/selftest.sh --screen`, `scripts/bench.sh` |
@@ -56,7 +56,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | E6 | Presets / size estimate | ☑ | |
 | E7 | Progress, cancel, quick export | ☑ | "Export & copy" banner after recording. |
 | E8 | Size-targeted export | ☑ | Not in Screen Studio 3.7.1; Glide's "Fit to file size" (MP4) stays at or under the target, re-encoding once if the first pass overshoots. |
-| P1 | Projects library | ☑ | `~/Movies/Glide`, autosave, rendered thumbnails. |
+| P1 | Projects library | ☑ | `~/Movies/Glide`, autosave. Editor-first window (Micky's request): no separate library or New-recording screen; recent recordings (with rendered thumbnails) are a popover off the window title, plus Open… and the projects folder. |
 | P2 | Style presets | ☑ | Save/apply/delete, default preset for new recordings. |
 | P3 | Editor sidebar + selection inspector | ☑ | |
 | P4 | Menu bar | ☑ | Record display/window/area, pause, status with elapsed time. |
@@ -73,11 +73,12 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
   headless UI smoke test driving every editor panel.
 - Synthetic package → MP4 and GIF.
 - Synthetic iPhone recording (1180×2556, kind = device) → phone frame → MP4.
-- Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch → area picker opens over
-  the display (screenshotted) and is confirmed → window picker opens with the
-  display's windows, highlights one (screenshotted) and is cancelled → record
-  (test pattern) →
-  pause/resume → stop → editor opens the new project → export → quit.
+- Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch (opens on recording
+  setup) → area picker opens over the display (screenshotted) and is
+  confirmed → window picker opens on every display, highlights a window
+  (screenshotted) and is cancelled → record (test pattern) → pause/resume →
+  stop → editor opens the new project → export → Back to recording setup →
+  the recording heads the recents list → reopen it → quit.
 - Real 5K display recording (Screen Recording granted to the terminal) →
   export.
 - Window resize: Glide's own window resized to 1024×700 through the
@@ -139,6 +140,9 @@ transcription were exercised only through their code paths and test media.
   resize the recorded window (`glide resize-window`); on-screen window
   picker covering every display; warning when the built-in mic is off with
   the lid closed; Whisper captions.
+- 2026-10-11: editor-first window: recording setup in the editor layout,
+  recents popover off the title, compact Record + source menu in the
+  editor's title bar; no separate library screen.
 - 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
   fixes from a full code review (preview audio lifecycle, timeline clamps,
   area bounds, voice-over/editor lifecycle, quit and restart behaviour).

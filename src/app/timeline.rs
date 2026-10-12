@@ -86,6 +86,36 @@ fn lanes(ranges: &[(f64, f64)]) -> Vec<usize> {
     out
 }
 
+/// The timeline before anything is recorded: the transport and tracks,
+/// disabled and empty.
+pub fn empty(ui: &mut Ui) {
+    let p = pal(ui);
+    ui.add_enabled_ui(false, |ui| {
+        ui.horizontal(|ui| {
+            let _ = ui.add(egui::Button::new(RichText::new("▶").size(14.0)).min_size(vec2(32.0, 24.0)));
+            ui.label(RichText::new("0:00.0 / 0:00.0").monospace());
+            let _ = ui.selectable_label(false, "Loop");
+            ui.separator();
+            for label in ["✂ Split", "+ Zoom", "+ Mask", "Delete"] {
+                let _ = ui.button(label);
+            }
+        });
+    });
+    ui.add_space(4.0);
+    let width = ui.available_width() - 4.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, RULER_H + 3.0 * (TRACK_H + GAP) + 4.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let track_bg = if ui.visuals().dark_mode { Color32::from_white_alpha(8) } else { Color32::from_black_alpha(8) };
+    for (i, name) in ["Clips", "Zoom", "Masks"].into_iter().enumerate() {
+        let r = Rect::from_min_size(pos2(rect.left(), rect.top() + RULER_H + 2.0 + i as f32 * (TRACK_H + GAP)), vec2(width, TRACK_H));
+        painter.rect_filled(r, CornerRadius::same(6), track_bg);
+        painter.text(r.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, name, egui::FontId::proportional(10.0), p.tertiary);
+        if i == 0 {
+            painter.text(r.center(), egui::Align2::CENTER_CENTER, "Your recording opens here when you stop", egui::FontId::proportional(12.0), p.secondary);
+        }
+    }
+}
+
 pub fn ui(ui: &mut Ui, ed: &mut Editor) {
     let p = pal(ui);
     let has_cam = ed.rec.meta.camera.is_some();

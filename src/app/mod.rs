@@ -44,6 +44,8 @@ pub enum Cmd {
     Cancel,
     ShowWindow,
     OpenFolder,
+    /// Close the open recording and show recording setup.
+    Back,
     Open(PathBuf),
     /// Show the area picker; `true` starts recording when confirmed.
     SelectArea(bool),
@@ -133,7 +135,8 @@ enum AreaDrag {
 }
 
 enum View {
-    Home,
+    /// No recording open: recording setup in the editor's layout.
+    Start,
     Editor(Box<Editor>),
 }
 
@@ -153,6 +156,8 @@ struct SelfTest {
     at: Instant,
     paused_at: Option<Instant>,
     resumed: bool,
+    /// The recording made by the test.
+    package: Option<PathBuf>,
 }
 
 fn log(msg: &str) {
@@ -192,7 +197,7 @@ fn permission_note() -> Option<String> {
 
 impl App {
     fn new(open: Option<PathBuf>) -> App {
-        let selftest = std::env::var_os("GLIDE_GUI_SELFTEST").map(|_| SelfTest { phase: 0, at: Instant::now(), paused_at: None, resumed: false });
+        let selftest = std::env::var_os("GLIDE_GUI_SELFTEST").map(|_| SelfTest { phase: 0, at: Instant::now(), paused_at: None, resumed: false, package: None });
         let mut settings = if selftest.is_some() { Settings::default() } else { Settings::load() };
         if let Some(dir) = std::env::var_os("GLIDE_OUTPUT_DIR") {
             settings.projects_dir = Some(PathBuf::from(dir));
@@ -207,7 +212,7 @@ impl App {
             widget: None,
             overlays: vec![],
             area: AreaPick::default(),
-            view: View::Home,
+            view: View::Start,
             devices: Devices::load(),
             settings,
             projects,
@@ -529,6 +534,7 @@ impl App {
             Cmd::Cancel => self.cancel_recording(false),
             Cmd::ShowWindow => self.show_main(el),
             Cmd::OpenFolder => macos::open_folder(&self.settings.dir()),
+            Cmd::Back => self.close_project(),
             Cmd::Open(p) => self.open_project(el, p),
             Cmd::RecordSource(kind) => {
                 if self.recording.is_some() {
@@ -645,7 +651,11 @@ impl App {
         }
         match st.phase {
             0 if since > Duration::from_millis(800) => {
-                log(&format!("launched main_window={} menubar={}", self.main.is_some(), self.menubar.is_some()));
+                let start = matches!(self.view, View::Start);
+                log(&format!("launched main_window={} menubar={} start_view={start}", self.main.is_some(), self.menubar.is_some()));
+                if !start {
+                    fail("didn't open on recording setup".into());
+                }
                 st.phase = 10;
                 st.at = Instant::now();
                 push(Cmd::SelectArea(false));
@@ -752,6 +762,7 @@ impl App {
                         ed.project.timeline.zooms.len(),
                         ed.rec.mouse.len()
                     ));
+                    st.package = Some(ed.package.root.clone());
                     ed.start_export();
                     st.phase = 3;
                 }
@@ -767,13 +778,35 @@ impl App {
                             if size == 0 {
                                 fail("empty export".into());
                             }
-                            log("PASS");
                             st.phase = 4;
-                            push(Cmd::Quit);
+                            st.at = Instant::now();
+                            push(Cmd::Back);
                         }
                         Err(e) => fail(format!("export: {e}")),
                     }
                 }
+            }
+            // Back to recording setup; the new recording heads the recents
+            // popover; reopen it from there.
+            4 if since > Duration::from_millis(300) => {
+                let first = self.projects.first().map(|p| p.path.clone());
+                log(&format!("back start_view={} recent={:?}", matches!(self.view, View::Start), first.as_ref().map(|p| p.display().to_string())));
+                if !matches!(self.view, View::Start) || first.is_none() || first != st.package {
+                    fail("back to recording setup / recents".into());
+                }
+                st.phase = 5;
+                st.at = Instant::now();
+                push(Cmd::Open(first.unwrap()));
+            }
+            5 if since > Duration::from_millis(300) => {
+                let reopened = matches!(&self.view, View::Editor(ed) if Some(&ed.package.root) == st.package.as_ref());
+                log(&format!("reopened from recents={reopened}"));
+                if !reopened {
+                    fail("reopen from recents".into());
+                }
+                log("PASS");
+                st.phase = 6;
+                push(Cmd::Quit);
             }
             _ => {}
         }
@@ -799,63 +832,79 @@ impl App {
             });
             return;
         }
-        match &mut self.view {
-            View::Home => {
-                let was = home::CAPTURING_SHORTCUT.swap(false, Ordering::Relaxed);
-                let note = self.permission_note.clone();
-                let action = home::ui(ui, &mut self.settings, &mut self.devices, &mut self.projects, &mut self.thumbs, note.as_deref());
-                match action {
-                    // Area recordings confirm the region first.
-                    home::Action::Record if self.settings.source == SourceKind::Area => push(Cmd::SelectArea(true)),
-                    home::Action::Record if self.settings.source == SourceKind::Window && self.settings.window.is_none() => {
-                        push(Cmd::SelectWindow(true))
-                    }
-                    home::Action::SelectWindow => push(Cmd::SelectWindow(false)),
-                    home::Action::Record => push(Cmd::ToggleRecording),
-                    home::Action::SelectArea => push(Cmd::SelectArea(false)),
-                    home::Action::HotkeysChanged => {
-                        self.settings.save();
-                        self.bind_hotkeys();
-                    }
-                    home::Action::Open(p) => push(Cmd::Open(p)),
-                    home::Action::RequestPermissions => {
-                        std::thread::spawn(|| crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60)));
-                    }
-                    home::Action::ResizeWindow { id, width, height } => {
-                        let note = match crate::capture::winsize::resize(id, width as f64, height as f64) {
-                            Ok((w, h)) if (w.round() as u32, h.round() as u32) != (width, height) => {
-                                Some(format!("The app limited the window to {w:.0} × {h:.0}"))
-                            }
-                            Ok(_) => None,
-                            Err(e) => Some(format!("{e:#}")),
-                        };
-                        home::set_resize_note(note);
-                        self.devices = home::Devices::load();
-                    }
-                    home::Action::None => {}
-                }
-                let now = home::CAPTURING_SHORTCUT.load(Ordering::Relaxed);
-                if now && !was {
-                    for slot in 1..=3 {
-                        hotkey::unbind(slot);
-                    }
-                } else if was && !now {
-                    self.bind_hotkeys();
-                }
-            }
+        let was = home::CAPTURING_SHORTCUT.swap(false, Ordering::Relaxed);
+        let note = self.permission_note.clone();
+        let action = match &mut self.view {
+            View::Start => home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref()),
             View::Editor(ed) => {
-                let mut back = false;
-                ed.ui(ui, renderer, &mut back);
-                if back {
-                    // Its thumbnail re-renders if the project changed.
-                    self.thumbs.forget(&ed.package.root);
-                    self.view = View::Home;
-                    self.projects = home::scan_projects(&self.settings.dir());
-                    if let Some(w) = &self.main {
-                        w.window.set_title("Glide");
-                    }
-                }
+                let mut chrome = home::Chrome {
+                    settings: &mut self.settings,
+                    devices: &mut self.devices,
+                    projects: &self.projects,
+                    thumbs: &mut self.thumbs,
+                    action: home::Action::None,
+                };
+                ed.ui(ui, renderer, &mut chrome);
+                chrome.action
             }
+        };
+        self.handle_action(action);
+        let now = home::CAPTURING_SHORTCUT.load(Ordering::Relaxed);
+        if now && !was {
+            for slot in 1..=3 {
+                hotkey::unbind(slot);
+            }
+        } else if was && !now {
+            self.bind_hotkeys();
+        }
+    }
+
+    /// Act on a button in the start view or the editor's title bar.
+    fn handle_action(&mut self, action: home::Action) {
+        match action {
+            // Area recordings confirm the region first.
+            home::Action::Record if self.settings.source == SourceKind::Area => push(Cmd::SelectArea(true)),
+            home::Action::Record if self.settings.source == SourceKind::Window && self.settings.window.is_none() => {
+                push(Cmd::SelectWindow(true))
+            }
+            home::Action::SelectWindow => push(Cmd::SelectWindow(false)),
+            home::Action::Record => push(Cmd::ToggleRecording),
+            home::Action::SelectArea => push(Cmd::SelectArea(false)),
+            home::Action::HotkeysChanged => {
+                self.settings.save();
+                self.bind_hotkeys();
+            }
+            home::Action::Open(p) => push(Cmd::Open(p)),
+            home::Action::RequestPermissions => {
+                std::thread::spawn(|| crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60)));
+            }
+            home::Action::ResizeWindow { id, width, height } => {
+                let note = match crate::capture::winsize::resize(id, width as f64, height as f64) {
+                    Ok((w, h)) if (w.round() as u32, h.round() as u32) != (width, height) => {
+                        Some(format!("The app limited the window to {w:.0} × {h:.0}"))
+                    }
+                    Ok(_) => None,
+                    Err(e) => Some(format!("{e:#}")),
+                };
+                home::set_resize_note(note);
+                self.devices = home::Devices::load();
+            }
+            home::Action::Back => self.close_project(),
+            home::Action::None => {}
+        }
+    }
+
+    /// Close the open recording (it saves) and show recording setup.
+    fn close_project(&mut self) {
+        if let View::Editor(ed) = &mut self.view {
+            ed.save();
+            // Its thumbnail re-renders if the project changed.
+            self.thumbs.forget(&ed.package.root);
+        }
+        self.view = View::Start;
+        self.projects = home::scan_projects(&self.settings.dir());
+        if let Some(w) = &self.main {
+            w.window.set_title("Glide");
         }
     }
 
@@ -1459,7 +1508,7 @@ impl ApplicationHandler for App {
         }
         let animating = match &mut self.view {
             View::Editor(ed) => ed.tick(),
-            View::Home => false,
+            View::Start => false,
         };
         let live = self.recording.is_some() || self.finishing;
         let now = Instant::now();

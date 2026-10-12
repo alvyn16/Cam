@@ -1,6 +1,7 @@
-//! Headless UI smoke test: drive the home view and every editor panel through
-//! egui frames (no window), including selections, playback and the export
-//! sheet, to catch panics and layout loops without needing a display.
+//! Headless UI smoke test: drive the start view (recording setup) and every
+//! editor panel through egui frames (no window), including selections,
+//! playback, the export sheet and the title-bar controls, to catch panics
+//! and layout loops without needing a display.
 
 use std::time::Duration;
 
@@ -32,12 +33,28 @@ fn editor_and_home_render_every_panel() {
 
     let mut ed = Editor::open(&path, gpu).unwrap();
     let mut t = 0.0;
-    let mut back = false;
+    let mut settings = Settings { projects_dir: Some(dir.clone()), ..Settings::default() };
+    let mut devices = Devices::default();
+    let mut thumbs = Thumbs::default();
+    let projects = home::scan_projects(&dir);
+    assert_eq!(projects.len(), 1);
+    // The editor's frame: its title bar draws Back, the title (recents) and
+    // the record controls from the app's settings.
+    let mut actions = vec![];
+    let mut editor_frame = |ed: &mut Editor, t: f64| {
+        frame(&ctx, t, |ui| {
+            let mut chrome = home::Chrome { settings: &mut settings, devices: &mut devices, projects: &projects, thumbs: &mut thumbs, action: home::Action::None };
+            ed.ui(ui, &mut renderer, &mut chrome);
+            if !matches!(chrome.action, home::Action::None) {
+                actions.push(format!("{:?}", std::mem::discriminant(&chrome.action)));
+            }
+        })
+    };
     for (tab, _) in Tab::ALL {
         ed.tab = tab;
         for _ in 0..2 {
             t += 0.016;
-            frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+            editor_frame(&mut ed, t);
         }
     }
     // Selections show their own inspector panels.
@@ -46,7 +63,7 @@ fn editor_and_home_render_every_panel() {
     for sel in [Selection::Slice(slice), zoom.map_or(Selection::None, Selection::Zoom)] {
         ed.selection = sel;
         t += 0.016;
-        frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+        editor_frame(&mut ed, t);
     }
     // Edits: split, add a zoom, undo/redo.
     ed.seek(1500.0);
@@ -73,7 +90,7 @@ fn editor_and_home_render_every_panel() {
     // The export sheet renders.
     ed.export.open = true;
     t += 0.016;
-    frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+    editor_frame(&mut ed, t);
     ed.export.open = false;
 
     // A blur over the first sidebar item: the synthetic UI moves the
@@ -96,27 +113,33 @@ fn editor_and_home_render_every_panel() {
     assert!((found[0].start - 1500.0).abs() <= 100.0 && found[0].end >= 2800.0, "{found:?}");
     assert!(glide::app::timeline::extra_height(&ed) > 0.0);
     t += 0.016;
-    frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+    editor_frame(&mut ed, t);
     ed.cut_exposure(found[0]);
     assert!(ed.project.timeline.slices.iter().all(|s| s.end <= found[0].start || s.start >= found[0].end), "{:?}", ed.project.timeline.slices);
     assert_eq!(glide::app::timeline::extra_height(&ed), 0.0);
     t += 0.016;
-    frame(&ctx, t, |ui| ed.ui(ui, &mut renderer, &mut back));
+    editor_frame(&mut ed, t);
     ed.save();
-    assert!(!back);
+    drop(editor_frame);
+    assert!(actions.is_empty(), "no title-bar button was pressed: {actions:?}");
+    let root = ed.package.root.clone();
 
-    // Home with this folder as the library.
-    let mut settings = Settings::default();
-    settings.projects_dir = Some(dir.clone());
-    let mut projects = home::scan_projects(&dir);
-    assert_eq!(projects.len(), 1);
-    let mut devices = Devices::default();
-    let mut thumbs = Thumbs::default();
-    for _ in 0..3 {
-        t += 0.016;
-        frame(&ctx, t, |ui| {
-            home::ui(ui, &mut settings, &mut devices, &mut projects, &mut thumbs, Some("permission note"));
-        });
+    // Start view (no recording open) with this folder as the library, every
+    // source, the recents popover and the permission note.
+    for source in [home::SourceKind::Display, home::SourceKind::Window, home::SourceKind::Area, home::SourceKind::Device] {
+        settings.source = source;
+        for _ in 0..2 {
+            t += 0.016;
+            frame(&ctx, t, |ui| {
+                let a = home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, Some("permission note"));
+                assert!(matches!(a, home::Action::None));
+            });
+        }
     }
+    t += 0.016;
+    frame(&ctx, t, |ui| {
+        let a = home::recents(ui, &projects, &mut thumbs, Some(&root), &dir);
+        assert!(matches!(a, home::Action::None));
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }

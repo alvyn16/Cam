@@ -692,7 +692,10 @@ impl Editor {
     }
 
     /// Draw the editor. `back` is set when the user leaves for the library.
-    pub fn ui(&mut self, ui: &mut Ui, egui_renderer: &mut egui_wgpu::Renderer, back: &mut bool) {
+    /// The editor window. `chrome` draws the app-level title-bar controls
+    /// (Back, the title with recent recordings, Record) and collects their
+    /// action.
+    pub fn ui(&mut self, ui: &mut Ui, egui_renderer: &mut egui_wgpu::Renderer, chrome: &mut super::home::Chrome) {
         let ctx = ui.ctx().clone();
         self.handle_keys(&ctx);
         let p = pal(ui);
@@ -702,13 +705,9 @@ impl Editor {
             .exact_size(theme::TOOLBAR_H)
             .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::TRAFFIC_LIGHTS_W as i8, right: 12, top: 0, bottom: 0 }))
             .show(ui, |ui| {
+                super::toolbar_drag(ui);
                 ui.horizontal_centered(|ui| {
-                    if ui.button("‹ Projects").clicked() {
-                        self.save();
-                        *back = true;
-                    }
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(&self.project.name).font(theme::semibold(theme::BODY)));
+                    chrome.title_left(ui, &self.project.name, Some(&self.package.root));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::primary(ui, "Export").clicked() {
                             self.export.open = true;
@@ -722,6 +721,8 @@ impl Editor {
                         if widgets::icon_button(ui, widgets::Icon::Undo, !self.undo.is_empty()).on_hover_text("Undo ⌘Z").clicked() {
                             self.undo();
                         }
+                        ui.add_space(10.0);
+                        chrome.record_controls(ui);
                     });
                 });
             });
@@ -842,13 +843,13 @@ impl Editor {
             if ui.button("✂ Split").on_hover_text("Split at playhead (S)").clicked() {
                 self.split();
             }
-            if ui.button("＋ Zoom").on_hover_text("Add zoom at playhead (Z)").clicked() {
+            if ui.button("+ Zoom").on_hover_text("Add zoom at playhead (Z)").clicked() {
                 self.add_zoom();
             }
-            if ui.button("＋ Mask").on_hover_text("Blur, pixelate or highlight a region (M)").clicked() {
+            if ui.button("+ Mask").on_hover_text("Blur, pixelate or highlight a region (M)").clicked() {
                 self.add_mask();
             }
-            if self.rec.meta.camera.is_some() && ui.button("＋ Layout").clicked() {
+            if self.rec.meta.camera.is_some() && ui.button("+ Layout").clicked() {
                 let src = self.source_at_playhead();
                 let dur_src = self.rec.meta.duration_ms;
                 self.edit(|p| {
