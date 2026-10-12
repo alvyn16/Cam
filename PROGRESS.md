@@ -66,7 +66,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 `scripts/selftest.sh --screen` (2026-10-11): 8/8 pass.
 
-- `cargo test` (86): engine, project, presets, renderer helpers, masks,
+- `cargo test` (87): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   Whisper transcription of synthesized speech,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
@@ -147,6 +147,10 @@ transcription were exercised only through their code paths and test media.
   resize the recorded window (`glide resize-window`); on-screen window
   picker covering every display; warning when the built-in mic is off with
   the lid closed; Whisper captions.
+- 2026-10-11: new app icon (Micky's request: no purple): a Big Sur
+  superellipse tile in graphite fading to near-black, a white cursor
+  gliding in on a tapered curved trail, and a small red record dot; a test
+  checks it has no purple pixels.
 - 2026-10-11: background settings fix (Micky's report: no visible effect).
   Full-screen recordings defaulted to 0 % padding, which hides the
   background entirely; blur had nothing to soften on the smooth generated
