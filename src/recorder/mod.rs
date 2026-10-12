@@ -53,6 +53,10 @@ pub struct Options {
     pub name: Option<String>,
     pub hide_desktop_icons: bool,
     pub hide_dock: bool,
+    /// Leave this app's own sounds out of the system audio. ScreenCaptureKit
+    /// treats every running copy of Glide as this app, so the command line
+    /// (which makes no sound) turns it off.
+    pub exclude_own_audio: bool,
 }
 
 impl Default for Options {
@@ -68,6 +72,7 @@ impl Default for Options {
             name: None,
             hide_desktop_icons: false,
             hide_dock: false,
+            exclude_own_audio: true,
         }
     }
 }
@@ -272,6 +277,7 @@ impl Recorder {
             scene: CapScene::Screen,
             hide_desktop_icons: opts.hide_desktop_icons,
             hide_dock: opts.hide_dock,
+            exclude_own_audio: opts.exclude_own_audio,
         };
         if let Err(e) = crate::capture::record::check_permissions(&cap) {
             let _ = std::fs::remove_dir_all(&package.root);

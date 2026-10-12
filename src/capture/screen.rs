@@ -43,7 +43,7 @@ fn shareable_content() -> Result<Retained<SCShareableContent>> {
     match rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(c)) => Ok(c.0),
         Ok(Err(e)) => bail!(
-            "ScreenCaptureKit refused: {e}\n  -> grant Screen & System Audio Recording to Rec (see `rec permissions`)"
+            "ScreenCaptureKit refused: {e}\n  -> grant Screen & System Audio Recording to Glide (see `glide permissions`)"
         ),
         Err(_) => bail!("timed out waiting for ScreenCaptureKit shareable content"),
     }
@@ -71,11 +71,14 @@ pub struct WindowInfo {
     /// Size in points.
     pub size: (f64, f64),
     pub window: Retained<SCWindow>,
+    /// The display it's on (from the same lookup), for system audio.
+    pub display: Option<Retained<SCDisplay>>,
 }
 
 /// On-screen, normal-layer windows that have a title or an owning app.
 pub fn windows() -> Result<Vec<WindowInfo>> {
     let content = shareable_content()?;
+    let displays = unsafe { content.displays() };
     let mut out = vec![];
     for w in unsafe { content.windows() }.iter() {
         unsafe {
@@ -88,7 +91,15 @@ pub fn windows() -> Result<Vec<WindowInfo>> {
             if (app.is_empty() && title.is_empty()) || f.size.width < 40.0 || f.size.height < 40.0 {
                 continue;
             }
-            out.push(WindowInfo { id: w.windowID(), app, title, size: (f.size.width, f.size.height), window: w });
+            let (cx, cy) = (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0);
+            let display = displays
+                .iter()
+                .find(|d| {
+                    let r = d.frame();
+                    (r.origin.x..r.origin.x + r.size.width).contains(&cx) && (r.origin.y..r.origin.y + r.size.height).contains(&cy)
+                })
+                .or_else(|| displays.firstObject());
+            out.push(WindowInfo { id: w.windowID(), app, title, size: (f.size.width, f.size.height), window: w, display });
         }
     }
     Ok(out)
@@ -106,13 +117,13 @@ pub fn find_window(sel: &str) -> Result<WindowInfo> {
         if let Some(w) = ws.into_iter().find(|w| w.id == id) {
             return Ok(w);
         }
-        bail!("no on-screen window with id {id} (see `rec-rs devices`)");
+        bail!("no on-screen window with id {id} (see `glide devices`)");
     }
     let lower = sel.to_lowercase();
     ws.into_iter()
         .filter(|w| format!("{} {}", w.app, w.title).to_lowercase().contains(&lower))
         .max_by(|a, b| (a.size.0 * a.size.1).total_cmp(&(b.size.0 * b.size.1)))
-        .ok_or_else(|| anyhow!("no on-screen window matches {sel:?} (see `rec-rs devices`)"))
+        .ok_or_else(|| anyhow!("no on-screen window matches {sel:?} (see `glide devices`)"))
 }
 
 /// CGWindowLevel of the Dock (kCGDockWindowLevel).
@@ -150,10 +161,13 @@ pub struct ScreenConfig {
     pub mic: Option<Option<String>>,
     pub hide_desktop_icons: bool,
     pub hide_dock: bool,
+    pub exclude_own_audio: bool,
 }
 
 pub struct Ivars {
     shared: Arc<Shared>,
+    /// The audio-only companion stream: its (tiny) video frames are dropped.
+    audio_only: bool,
 }
 
 define_class!(
@@ -181,8 +195,8 @@ define_class!(
 );
 
 impl ScreenOutput {
-    fn create(shared: Arc<Shared>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(Ivars { shared });
+    fn create(shared: Arc<Shared>, audio_only: bool) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(Ivars { shared, audio_only });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -194,7 +208,7 @@ impl ScreenOutput {
         }
         let shared = &self.ivars().shared;
         if kind == SCStreamOutputType::Screen {
-            if !frame_complete(sb) {
+            if self.ivars().audio_only || !frame_complete(sb) {
                 return;
             }
             let Some(pb) = (unsafe { sb.image_buffer() }) else { return };
@@ -202,6 +216,16 @@ impl ScreenOutput {
             let pb: objc2_core_foundation::CFRetained<CVPixelBuffer> = pb;
             shared.with(|s| s.push_screen(pts, pb));
         } else if kind == SCStreamOutputType::Audio {
+            if std::env::var_os("REC_DEBUG").is_some() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n.is_multiple_of(25) {
+                    let pts = unsafe { sb.presentation_time_stamp() };
+                    let peak = crate::capture::mixer::decode(sb).map_or(-1.0, |(_, _, f)| f.iter().fold(0f32, |m, x| m.max(x[0].abs())));
+                    let now = crate::util::secs(crate::util::host_now());
+                    eprintln!("glide: debug: system audio buffer {n} (companion={}) pts={:.3} now={now:.3} peak={peak:.3}", self.ivars().audio_only, pts.value as f64 / pts.timescale as f64);
+                }
+            }
             shared.with(|s| s.push_audio(AudioKind::System, sb));
         } else if kind == SCStreamOutputType::Microphone {
             shared.with(|s| s.push_audio(AudioKind::Mic, sb));
@@ -224,6 +248,8 @@ fn frame_complete(sb: &CMSampleBuffer) -> bool {
 
 pub struct ScreenCapture {
     stream: Retained<SCStream>,
+    /// System audio for window recordings (see `audio_stream`).
+    audio: Option<AudioStream>,
     _output: Retained<ScreenOutput>,
     _queues: Vec<dispatch2::DispatchRetained<DispatchQueue>>,
 }
@@ -289,10 +315,14 @@ impl ScreenCapture {
             if cfg.pixel_format == PIX_420V {
                 conf.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_709_2);
             }
-            conf.setCapturesAudio(cfg.system_audio);
+            // A window filter only hears the window's own app, so window
+            // recordings take the Mac's audio from a companion stream.
+            let window = matches!(cfg.target, Target::Window(_));
+            let main_audio = cfg.system_audio && !window;
+            conf.setCapturesAudio(main_audio);
             conf.setSampleRate(48000);
             conf.setChannelCount(2);
-            conf.setExcludesCurrentProcessAudio(true);
+            conf.setExcludesCurrentProcessAudio(cfg.exclude_own_audio);
             if let Some(dev) = &cfg.mic {
                 conf.setCaptureMicrophone(true);
                 if let Some(id) = dev {
@@ -300,7 +330,14 @@ impl ScreenCapture {
                 }
             }
 
-            let output = ScreenOutput::create(shared);
+            let audio = match &cfg.target {
+                Target::Window(w) if cfg.system_audio => {
+                    let display = w.display.as_ref().context("no display to take system audio from")?;
+                    Some(audio_stream(display, cfg.exclude_own_audio, shared.clone())?)
+                }
+                _ => None,
+            };
+            let output = ScreenOutput::create(shared, false);
             let delegate = ProtocolObject::from_ref(&*output);
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, Some(delegate));
             let out_proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
@@ -310,7 +347,7 @@ impl ScreenCapture {
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(out_proto, SCStreamOutputType::Screen, Some(&vq))
                 .map_err(|e| anyhow!("add screen output: {}", e.localizedDescription()))?;
-            if cfg.system_audio {
+            if main_audio {
                 stream
                     .addStreamOutput_type_sampleHandlerQueue_error(out_proto, SCStreamOutputType::Audio, Some(&aq))
                     .map_err(|e| anyhow!("add audio output: {}", e.localizedDescription()))?;
@@ -320,14 +357,70 @@ impl ScreenCapture {
                     .addStreamOutput_type_sampleHandlerQueue_error(out_proto, SCStreamOutputType::Microphone, Some(&mq))
                     .map_err(|e| anyhow!("add microphone output: {}", e.localizedDescription()))?;
             }
-            wait_err(|b| stream.startCaptureWithCompletionHandler(Some(b)))
-                .context("starting screen capture")?;
-            Ok(ScreenCapture { stream, _output: output, _queues: vec![vq, aq, mq] })
+            if let Some(a) = &audio {
+                a.start()?;
+            }
+            if let Err(e) = wait_err(|b| stream.startCaptureWithCompletionHandler(Some(b))) {
+                if let Some(a) = &audio {
+                    let _ = a.stop();
+                }
+                return Err(e).context("starting screen capture");
+            }
+            Ok(ScreenCapture { stream, audio, _output: output, _queues: vec![vq, aq, mq] })
         }
     }
 
     pub fn stop(&self) -> Result<()> {
+        let audio = self.audio.as_ref().map(AudioStream::stop);
+        unsafe { wait_err(|b| self.stream.stopCaptureWithCompletionHandler(Some(b)))? };
+        audio.unwrap_or(Ok(()))
+    }
+}
+
+struct AudioStream {
+    stream: Retained<SCStream>,
+    _output: Retained<ScreenOutput>,
+    _queue: dispatch2::DispatchRetained<DispatchQueue>,
+}
+
+impl AudioStream {
+    fn start(&self) -> Result<()> {
+        unsafe { wait_err(|b| self.stream.startCaptureWithCompletionHandler(Some(b))) }.context("starting system audio capture")
+    }
+
+    fn stop(&self) -> Result<()> {
         unsafe { wait_err(|b| self.stream.stopCaptureWithCompletionHandler(Some(b))) }
+    }
+}
+
+/// An audio-only stream over a whole display: everything the Mac plays
+/// (other than Glide itself), whatever the video source. Its video is the
+/// smallest ScreenCaptureKit allows and is dropped.
+fn audio_stream(display: &SCDisplay, exclude_own_audio: bool, shared: Arc<Shared>) -> Result<AudioStream> {
+    unsafe {
+        let filter = SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), display, &NSArray::new());
+        let conf = SCStreamConfiguration::new();
+        conf.setWidth(2);
+        conf.setHeight(2);
+        conf.setMinimumFrameInterval(CMTime::new(1, 30));
+        conf.setCapturesAudio(true);
+        conf.setSampleRate(48000);
+        conf.setChannelCount(2);
+        conf.setExcludesCurrentProcessAudio(exclude_own_audio);
+        let output = ScreenOutput::create(shared, true);
+        let delegate = ProtocolObject::from_ref(&*output);
+        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, Some(delegate));
+        let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
+        let aq = DispatchQueue::new("rec.screen.system-audio", None);
+        // A screen output too, so ScreenCaptureKit has somewhere to put
+        // the frames it insists on making.
+        stream
+            .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Screen, Some(&aq))
+            .map_err(|e| anyhow!("add screen output: {}", e.localizedDescription()))?;
+        stream
+            .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Audio, Some(&aq))
+            .map_err(|e| anyhow!("add audio output: {}", e.localizedDescription()))?;
+        Ok(AudioStream { stream, _output: output, _queue: aq })
     }
 }
 

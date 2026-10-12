@@ -179,6 +179,29 @@ fn log(msg: &str) {
     eprintln!("selftest: {msg}");
 }
 
+/// Scripted playback check for `GLIDE_GUI_PLAYTEST=<package>`
+/// (scripts/selftest.sh): open the project and play it through the
+/// speakers (while the script records what the Mac plays), checking that
+/// the output follows the volume, mute and playhead. Logs `playtest:` lines
+/// and exits non-zero on failure.
+struct PlayTest {
+    path: PathBuf,
+    phase: u8,
+    at: Instant,
+    started: Instant,
+    /// Seconds to play before changing anything.
+    secs: f64,
+    /// Seconds to wait before opening the project (GLIDE_PLAYTEST_DELAY).
+    delay: f64,
+    max_drift: f64,
+    loud_db: f32,
+    volume: f64,
+}
+
+fn plog(msg: &str) {
+    eprintln!("playtest: {msg}");
+}
+
 struct App {
     gpu: Option<Gpu>,
     main: Option<Win>,
@@ -207,6 +230,7 @@ struct App {
     open_at_launch: Option<PathBuf>,
     permission_note: Option<String>,
     selftest: Option<SelfTest>,
+    playtest: Option<PlayTest>,
 }
 
 fn permission_note() -> Option<String> {
@@ -220,7 +244,19 @@ fn permission_note() -> Option<String> {
 impl App {
     fn new(open: Option<PathBuf>) -> App {
         let selftest = std::env::var_os("GLIDE_GUI_SELFTEST").map(|_| SelfTest { phase: 0, at: Instant::now(), paused_at: None, resumed: false, package: None });
-        let mut settings = if selftest.is_some() { Settings::default() } else { Settings::load() };
+        let playtest = std::env::var_os("GLIDE_GUI_PLAYTEST").map(|p| PlayTest {
+            path: PathBuf::from(p),
+            phase: 0,
+            at: Instant::now(),
+            started: Instant::now(),
+            secs: std::env::var("GLIDE_PLAYTEST_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0),
+            delay: std::env::var("GLIDE_PLAYTEST_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5),
+            max_drift: 0.0,
+            loud_db: 0.0,
+            volume: 1.0,
+        });
+        let scripted = selftest.is_some() || playtest.is_some();
+        let mut settings = if scripted { Settings::default() } else { Settings::load() };
         if let Some(dir) = std::env::var_os("GLIDE_OUTPUT_DIR") {
             settings.projects_dir = Some(PathBuf::from(dir));
         }
@@ -251,6 +287,7 @@ impl App {
             open_at_launch: open,
             permission_note: permission_note(),
             selftest,
+            playtest,
         }
     }
 
@@ -375,7 +412,7 @@ impl App {
             w.window.focus_window();
             w.window.request_redraw();
         }
-        if self.selftest.is_none() {
+        if !self.scripted() {
             macos::activate();
         }
     }
@@ -453,6 +490,7 @@ impl App {
             name: None,
             hide_desktop_icons: s.hide_desktop_icons,
             hide_dock: s.hide_dock,
+            exclude_own_audio: true,
         }
     }
 
@@ -461,7 +499,7 @@ impl App {
             return;
         }
         self.error = None;
-        if self.selftest.is_none() {
+        if !self.scripted() {
             self.settings.save();
         }
         if let View::Editor(ed) = &mut self.view {
@@ -667,6 +705,7 @@ impl App {
             }
         }
         self.selftest_step(el);
+        self.playtest_step();
         let clock = match &self.recording {
             Some(Recording { rec: Some(r), .. }) => crate::capture::record::clock(r.elapsed()),
             Some(Recording { countdown_until: Some(t), .. }) => format!("{}", t.saturating_duration_since(Instant::now()).as_secs() + 1),
@@ -681,6 +720,164 @@ impl App {
         }
         if let Some(m) = &mut self.menubar {
             m.update(&menubar::View { recording: self.recording.is_some(), paused, finishing: self.finishing, clock: &clock });
+        }
+    }
+
+    /// Driven by GLIDE_GUI_SELFTEST or GLIDE_GUI_PLAYTEST: keep the user's
+    /// settings untouched and stay in the background.
+    fn scripted(&self) -> bool {
+        self.selftest.is_some() || self.playtest.is_some()
+    }
+
+    fn playtest_step(&mut self) {
+        let Some(pt) = &mut self.playtest else { return };
+        let since = pt.at.elapsed();
+        let fail = |msg: String| {
+            plog(&format!("FAIL {msg}"));
+            std::process::exit(1);
+        };
+        if pt.started.elapsed() > Duration::from_secs(90) {
+            fail(format!("timed out in phase {}", pt.phase));
+        }
+        if pt.phase == 0 {
+            if since.as_secs_f64() > pt.delay {
+                push(Cmd::Open(pt.path.clone()));
+                pt.phase = 1;
+                pt.at = Instant::now();
+            }
+            return;
+        }
+        let View::Editor(ed) = &mut self.view else {
+            if since > Duration::from_secs(10) {
+                fail(format!("couldn't open {}: {:?}", pt.path.display(), self.error));
+            }
+            return;
+        };
+        let settled = !ed.audio.mixing();
+        // Edit the project the way the Audio tab does.
+        let edit = |ed: &mut Editor, f: &dyn Fn(&mut crate::project::model::AudioStyle)| {
+            let mut d = ed.project.clone();
+            f(&mut d.style.audio);
+            ed.commit(d);
+            ed.audio.reset_meter();
+        };
+        match pt.phase {
+            // Mixed: play from the start, looping so the checks below have
+            // something to hear.
+            1 if settled => {
+                if !ed.audio.has_audio() {
+                    fail("the project has nothing to hear".into());
+                }
+                pt.volume = ed.project.style.audio.volume;
+                ed.looping = true;
+                ed.playhead = 0.0;
+                ed.toggle_play();
+                ed.audio.reset_meter();
+                plog(&format!("playing {} ({:.1} s)", pt.path.display(), ed.duration() / 1000.0));
+                pt.phase = 2;
+                pt.at = Instant::now();
+            }
+            2 => {
+                if since > Duration::from_millis(500) {
+                    pt.max_drift = pt.max_drift.max((ed.audio.position_ms() - ed.playhead_now()).abs());
+                }
+                if since.as_secs_f64() >= pt.secs {
+                    let m = ed.audio.meter();
+                    pt.loud_db = m.rms_db();
+                    plog(&format!("output frames={} rms={:.1} dBFS peak={:.3} max_drift={:.0} ms", m.frames, m.rms_db(), m.peak, pt.max_drift));
+                    if (m.frames as f64) < pt.secs * 0.7 * 44_100.0 {
+                        fail(format!("the output only rendered {} frames in {:.1} s", m.frames, pt.secs));
+                    }
+                    if pt.loud_db < -45.0 {
+                        fail(format!("playback is silent ({:.1} dBFS)", pt.loud_db));
+                    }
+                    if pt.max_drift > 80.0 {
+                        fail(format!("audio drifted {:.0} ms from the playhead", pt.max_drift));
+                    }
+                    let v = pt.volume;
+                    edit(ed, &|a| a.volume = v * 0.25);
+                    pt.phase = 3;
+                    pt.at = Instant::now();
+                }
+            }
+            // A quarter of the volume is 12 dB down, straight away. (Measured
+            // against the soundtrack, which may be quiet for a while.)
+            3 if since > Duration::from_millis(700) => {
+                let m = ed.audio.meter();
+                let Some(gain) = m.gain_db() else {
+                    if since > Duration::from_secs(4) {
+                        fail("the soundtrack stayed silent".into());
+                    }
+                    return;
+                };
+                let want = 20.0 * (0.25 * pt.volume).log10() as f32;
+                plog(&format!("volume x0.25 rms={:.1} dBFS, {gain:.1} dB relative to the soundtrack (want {want:.1})", m.rms_db()));
+                if (gain - want).abs() > 2.0 {
+                    fail("the volume didn't change what's heard".into());
+                }
+                let v = pt.volume;
+                edit(ed, &|a| {
+                    a.volume = v;
+                    a.mute_system = true;
+                    a.mute_mic = true;
+                });
+                pt.phase = 4;
+                pt.at = Instant::now();
+            }
+            4 if settled && since > Duration::from_millis(200) => {
+                ed.audio.reset_meter();
+                pt.phase = 5;
+                pt.at = Instant::now();
+            }
+            5 if since > Duration::from_millis(600) => {
+                let m = ed.audio.meter();
+                plog(&format!("muted rms={:.1} dBFS frames={}", m.rms_db(), m.frames));
+                if m.rms_db() > -70.0 || m.frames == 0 {
+                    fail("mute didn't silence playback".into());
+                }
+                edit(ed, &|a| {
+                    a.mute_system = false;
+                    a.mute_mic = false;
+                });
+                pt.phase = 6;
+                pt.at = Instant::now();
+            }
+            6 if settled && since > Duration::from_millis(200) => {
+                ed.audio.reset_meter();
+                pt.phase = 7;
+                pt.at = Instant::now();
+            }
+            7 if since > Duration::from_millis(600) => {
+                let m = ed.audio.meter();
+                let Some(gain) = m.gain_db() else {
+                    if since > Duration::from_secs(4) {
+                        fail("unmuting didn't bring the sound back".into());
+                    }
+                    return;
+                };
+                plog(&format!("unmuted rms={:.1} dBFS, {gain:.1} dB relative to the soundtrack", m.rms_db()));
+                if m.rms_db() < -70.0 {
+                    fail("unmuting didn't bring the sound back".into());
+                }
+                let to = ed.duration() * 0.5;
+                ed.seek(to);
+                pt.phase = 8;
+                pt.at = Instant::now();
+            }
+            8 if since > Duration::from_millis(400) => {
+                let now = ed.playhead_now();
+                let drift = ed.audio.position_ms() - now;
+                plog(&format!("after seek audio={:.0} ms playhead={now:.0} ms", ed.audio.position_ms()));
+                if drift.abs() > 80.0 {
+                    fail(format!("audio is {drift:.0} ms off the playhead after a seek"));
+                }
+                ed.toggle_play();
+                ed.looping = false;
+                plog("PASS");
+                pt.phase = 9;
+                push(Cmd::Quit);
+            }
+            _ => {}
         }
     }
 
@@ -1353,7 +1550,7 @@ impl App {
             Some(id) => {
                 self.settings.source = SourceKind::Window;
                 self.settings.window = Some(id);
-                if self.selftest.is_none() {
+                if !self.scripted() {
                     self.settings.save();
                 }
                 self.devices = Devices::load();
@@ -1376,7 +1573,7 @@ impl App {
                 self.settings.source = SourceKind::Area;
                 self.settings.display = self.area.display;
                 self.settings.area = [r.left() as f64, r.top() as f64, r.width() as f64, r.height() as f64];
-                if self.selftest.is_none() {
+                if !self.scripted() {
                     self.settings.save();
                 }
                 push(if self.area.record_after { Cmd::ToggleRecording } else { Cmd::ShowWindow });
@@ -1603,7 +1800,7 @@ impl ApplicationHandler for App {
         while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        if self.selftest.is_none() {
+        if !self.scripted() {
             self.settings.save();
         }
     }

@@ -479,15 +479,25 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     let a = &mut d.style.audio;
     section(ui, "Audio", |ui| {
         slider(ui, "Volume", &mut a.volume, 0.0..=2.0, "");
+        let peaks = *ed.peaks.lock().unwrap_or_else(|e| e.into_inner());
+        let silent = |p: Option<f32>| peaks.is_some() && super::editor::TrackPeaks::silent(p);
         if ed.rec.meta.mic.is_some() {
             toggle_row(ui, "Mute microphone", &mut a.mute_mic);
+            if silent(peaks.and_then(|p| p.mic)) {
+                caption(ui, "The microphone only recorded silence.");
+            }
             toggle_row(ui, "Enhance voice", &mut a.enhance_mic);
             if a.enhance_mic {
                 caption(ui, "On-device voice isolation removes background noise.");
             }
+        } else if ed.rec.meta.system_audio.is_some() {
+            caption(ui, "The microphone was off for this recording (turn it on in the Record options next time).");
         }
         if ed.rec.meta.system_audio.is_some() {
             toggle_row(ui, "Mute system audio", &mut a.mute_system);
+            if silent(peaks.and_then(|p| p.system)) {
+                caption(ui, "System audio is silent: nothing played that ScreenCaptureKit could capture (sounds from command-line tools aren't).");
+            }
         }
         if ed.rec.meta.mic.is_none() && ed.rec.meta.system_audio.is_none() {
             caption(ui, "This recording has no audio.");

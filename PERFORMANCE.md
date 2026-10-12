@@ -83,6 +83,18 @@ Picking a wallpaper regenerates it (1920×1200, on the CPU, rows in
 parallel): 8–10 ms, so swatch clicks and slider drags update the canvas
 on the next frame. (Single-threaded with the glass ribbons it was 95 ms.)
 
+## Editor audio
+
+Playback mixes the edit's soundtrack in the background and streams it to
+CoreAudio from a real-time callback; the playhead is the clock.
+
+| | Measured |
+|---|---|
+| Re-mix after a mute / clip-volume / music edit, 74 s recording | 180 ms first, 40 ms after (decoded tracks cached by the OS) |
+| Master volume change heard | next output buffer (~10 ms) |
+| Audio vs playhead drift while playing | ≤ 45 ms (re-seeked past 60 ms) |
+| After a seek | within 15 ms |
+
 ## Mask checks ("data may be visible")
 
 `glide check-masks` runs the same background check the editor uses: every

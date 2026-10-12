@@ -18,8 +18,19 @@ fn load(dir: &Path, track: &Option<crate::project::recording::AudioTrack>) -> Op
     crate::media::read_audio(&dir.join(&t.file), t.track).ok().filter(|v| !v.is_empty())
 }
 
+/// Peak level of a recorded track (0..1), or None if it wasn't recorded or
+/// can't be read.
+pub fn track_peak(dir: &Path, track: &Option<crate::project::recording::AudioTrack>) -> Option<f32> {
+    let t = track.as_ref()?;
+    let buf = crate::media::read_audio(&dir.join(&t.file), t.track).ok()?;
+    Some(buf.iter().fold(0.0f32, |m, s| m.max(s[0].abs()).max(s[1].abs())))
+}
+
+/// Below this peak a track is silence (AAC-coded digital silence is -91 dBFS).
+pub const SILENT_PEAK: f32 = 1e-4;
+
 /// Linear-interpolated sample at fractional index.
-fn sample(src: &[Stereo], x: f64) -> Stereo {
+pub fn sample(src: &[Stereo], x: f64) -> Stereo {
     if src.is_empty() || x < 0.0 {
         return [0.0, 0.0];
     }
@@ -205,7 +216,7 @@ fn click_sound() -> Vec<Stereo> {
         .collect()
 }
 
-fn soft_clip(x: f32) -> f32 {
+pub fn soft_clip(x: f32) -> f32 {
     if x.abs() < 0.9 { x } else { x.signum() * (0.9 + 0.1 * ((x.abs() - 0.9) / 0.1).tanh()) }
 }
 
@@ -234,6 +245,18 @@ pub fn duck_envelope(len: usize, spans: &[(usize, usize)], level: f32) -> Vec<f3
 
 /// Build the export soundtrack. Returns None when there's nothing to hear.
 pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap) -> Option<Vec<Stereo>> {
+    let mut out = mix_unmastered(project, rec, dir, map)?;
+    let v = project.style.audio.volume as f32;
+    for o in out.iter_mut() {
+        o[0] = soft_clip(o[0] * v);
+        o[1] = soft_clip(o[1] * v);
+    }
+    Some(out)
+}
+
+/// The soundtrack before the master volume and limiter (the editor's
+/// playback applies those live). None when nothing is audible.
+pub fn mix_unmastered(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap) -> Option<Vec<Stereo>> {
     let style = &project.style.audio;
     let len = (map.duration() / 1000.0 * RATE).ceil() as usize;
     let mut out = vec![[0.0f32; 2]; len];
@@ -318,15 +341,7 @@ pub fn mix(project: &Project, rec: &Recording, dir: Option<&Path>, map: &TimeMap
         }
         any = true;
     }
-    if !any {
-        return None;
-    }
-    let v = style.volume as f32;
-    for o in out.iter_mut() {
-        o[0] = soft_clip(o[0] * v);
-        o[1] = soft_clip(o[1] * v);
-    }
-    Some(out)
+    any.then_some(out)
 }
 
 #[cfg(test)]

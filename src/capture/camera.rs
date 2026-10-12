@@ -195,7 +195,7 @@ pub fn resolve_mic(sel: &str) -> Result<String> {
     mics.iter()
         .find(|m| m.name.to_lowercase().contains(&lower))
         .map(|m| m.id.clone())
-        .ok_or_else(|| anyhow!("no microphone matches {sel:?} (see `rec-rs devices`)"))
+        .ok_or_else(|| anyhow!("no microphone matches {sel:?} (see `glide devices`)"))
 }
 
 pub struct CamIvars {

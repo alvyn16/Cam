@@ -15,5 +15,6 @@ pub mod export;
 pub mod recorder;
 pub mod transcribe;
 pub mod exposure;
+pub mod audiocheck;
 pub mod whisper;
 pub mod app;

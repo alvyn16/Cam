@@ -26,7 +26,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R1 | Display recording | ☑ | Native Retina size, display refresh, cursor hidden (re-rendered later). |
 | R2 | Window recording | ☑ | Window bounds logged over time; cursor stays aligned when the window moves. Picked on screen ("Pick on screen…", Record with no window chosen, or the menu bar's Record Window…): windows outlined front to back, the one under the pointer highlighted with name, size, Resize, Use/Record and Adjust area; right-click for Bring to front / Ignore / Reset ignored; Esc cancels. Like Screen Studio, the pickers cover every display at once (one overlay per display; each shows its own windows, one shared selection; an area moves to the display you drag on). The scripted GUI run opens it on both displays here, highlights a window, screenshots each display and cancels. |
 | R3 | Area recording | ☑ | Drag-to-select picker (move/resize, Return/Esc), size presets, exact values. |
-| R4 | System audio | ☑ | Own track (stems). |
+| R4 | System audio | ☑ | Own track (stems). Everything the Mac plays, whatever the source: window recordings take it from a companion audio-only display stream (a window filter alone only hears the window's own app; before the fix a window recording was silent while another app played). ScreenCaptureKit only hears apps, not command-line players such as `afplay`. The app leaves its own sounds out; `glide record` doesn't (ScreenCaptureKit treats every copy of Glide as one app, so excluding "itself" also muted a Glide window playing). Checked by the selftest's audio round trip (a helper app plays a 1234 Hz tone, Glide records it from an area and from another app's window). |
 | R5 | Microphone | ☑ | Own track; "Enhance voice" applies ML voice isolation, levelling and automatic gain control (±9 dB, speech-gated) at export rather than at capture, so the raw track stays untouched. Live capture checked with Microphone granted to the terminal: both capture paths (ScreenCaptureKit and AVCaptureSession) write a 48 kHz mono track in sync with the video. On this Mac it was silent (−91 dB, same with ffmpeg) because the lid is closed and macOS disconnects the built-in mic; Glide now warns about that before recording and in the voice-over panel. |
 | R6 | Camera | ◐ | Separate 720p file, bubble/layouts in the editor. Not exercised live: Camera permission not granted on this Mac. |
 | R7 | iOS device recording | ◐ | CoreMediaIO screen-capture devices, native-size HEVC, phone/tablet frame. Everything after capture is tested with a synthetic portrait device recording (`glide synth --device`: phone frame chosen automatically, no cursor, MP4 export) in `scripts/selftest.sh`. Live capture untested: no iPhone/iPad was connected. |
@@ -49,6 +49,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | O1 | Shortcut overlay | ☑ | |
 | O2 | Captions | ☑ | Whisper (whisper.cpp with Metal; base/small/medium, downloaded on first use) or Apple Speech, both on device, word timings, editable lines. Verified with speech synthesized by `say` attached as a mic track: Whisper base returned all 20 words exactly, 7 s of speech in 0.4 s (plus a test that repeats this whenever the model is present). Apple Speech needs Speech Recognition permission (run from Glide.app) and wasn't exercised live. |
 | A1–A2 | Mix, background music | ☑ | Per-slice volumes, mutes, master volume, looped music with fade. |
+| A4 | Editor playback audio | ☑ | Plays through CoreAudio (cpal) from the edit's mix, in step with the playhead (re-seeked past 60 ms of drift; ≤ 45 ms measured). The master volume applies live in the output callback; mutes, clip volumes, music and voice-overs re-mix in the background (40–180 ms for 74 s) and swap in while playing; playing before the mix is ready picks up in step. The output restarts itself if the device changes or stops (another app reconfiguring it). Replaces AVPlayer on a temporary WAV, which stayed silent for a whole playback if the mix wasn't ready yet and ignored edits until paused. The Audio tab says when a track is silent or the mic was off. Checked by `GLIDE_GUI_PLAYTEST` (output level, ×0.25 volume = −12.0 dB, mute = silence, seek in sync) while another recording hears the speakers' tone. |
 | A3 | Enhance microphone | ☑ | Apple's on-device ML voice isolation (AUSoundIsolation) run offline, then levelled: noise floor −45 → −90 dB on a test clip, ~60× real time. DSP fallback. |
 | E1–E3 | MP4, resolution, frame rate | ☑ | Hardware H.264/HEVC, quality presets by bits per pixel. |
 | E4 | GIF | ☑ | Parallel NeuQuant palettes, delta frames (only changed tiles, transparent elsewhere), duplicate merging, loop option. |
@@ -64,16 +65,19 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 ## Verification on this MacBook (M4 Pro, macOS 27)
 
-`scripts/selftest.sh --screen` (2026-10-11): 8/8 pass.
+`scripts/selftest.sh --screen` (2026-10-12): 13/13 pass.
 
-- `cargo test` (87): engine, project, presets, renderer helpers, masks,
+- `cargo test` (92): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   Whisper transcription of synthesized speech,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
   change detection, window picking, GIF quantisation, icon, plus a
   headless UI smoke test driving every editor panel and background tests
   that edit each Background setting through the editor, read the preview's
-  pixels back and compare them (and the exported frame) before and after.
+  pixels back and compare them (and the exported frame) before and after,
+  and audio tests (track levels and the silence note, the playback mix
+  following mutes while open, the exported MP4 carrying the tone, tone
+  detection under louder sound).
 - Synthetic package → MP4 and GIF.
 - Background check (`glide check-background`): 22 edits (each wallpaper,
   blur on and off, gradient, its angle and colours, two colours, an image,
@@ -88,6 +92,12 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
   the recording heads the recents list → reopen it → quit.
 - Real 5K display recording (Screen Recording granted to the terminal) →
   export, and the background check on it.
+- Audio round trip (`--audio`, part of `--screen`): a helper app plays a
+  1234 Hz tone → Glide records it (5.7 s of 6 heard) → the editor plays the
+  recording while a second recording listens (5.8 s heard; ×0.25 volume
+  measured at −12.0 dB, mute silent, seek in sync) → the export carries it
+  → a recording of another app's window hears it too → the microphone
+  hears it through the speakers (reported only: depends on lid/headphones).
 - Window resize: Glide's own window resized to 1024×700 through the
   Accessibility API and read back. Masks, device frames and voice-over mixing checked on real
   footage with `glide frame` and ffmpeg.
@@ -147,6 +157,13 @@ transcription were exercised only through their code paths and test media.
   resize the recorded window (`glide resize-window`); on-screen window
   picker covering every display; warning when the built-in mic is off with
   the lid closed; Whisper captions.
+- 2026-10-12: audio fix (Micky's report: recordings had no sound in the
+  editor). Editor playback rebuilt on CoreAudio with a live mix; window
+  recordings now hear every app; `glide record` no longer mutes a running
+  Glide; the Audio tab explains silent tracks and a mic that was off (his
+  recordings had the mic off and, mostly, nothing playing); exports no longer
+  leave `.sb-…` temporaries next to the file; `glide audio-check` and the
+  selftest's audio round trip.
 - 2026-10-11: new app icon (Micky's request: no purple): a Big Sur
   superellipse tile in graphite fading to near-black, a white cursor
   gliding in on a tapered curved trail, and a small red record dot; a test

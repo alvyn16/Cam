@@ -1,7 +1,7 @@
 //! The editor: preview, inspector, timeline and export for one project.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -94,6 +94,20 @@ pub struct ExportState {
     pub result: Option<Result<(PathBuf, Stats), String>>,
 }
 
+/// Peak level of each recorded track (None = not recorded), measured in
+/// the background when the project opens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrackPeaks {
+    pub system: Option<f32>,
+    pub mic: Option<f32>,
+}
+
+impl TrackPeaks {
+    pub fn silent(level: Option<f32>) -> bool {
+        level.is_none_or(|p| p < crate::export::audio::SILENT_PEAK)
+    }
+}
+
 pub struct Editor {
     pub package: Package,
     pub project: Project,
@@ -130,6 +144,19 @@ pub struct Editor {
     copy_when_exported: bool,
     /// Where content under blur/pixelate masks moves ("data may be visible").
     pub mask_watch: super::maskwatch::MaskWatch,
+    pub peaks: Arc<Mutex<Option<TrackPeaks>>>,
+    /// The "no sound" note has been shown.
+    silence_noted: bool,
+}
+
+/// Why a recording has no sound.
+pub fn silence_note(rec: &Recording, p: TrackPeaks) -> &'static str {
+    match (rec.meta.mic.is_some(), rec.meta.system_audio.is_some()) {
+        (false, false) => "This recording has no audio: system audio and the microphone were off.",
+        (false, true) => "This recording is silent: the microphone was off and the Mac played nothing ScreenCaptureKit could capture.",
+        (true, _) if p.mic.is_some() => "This recording is silent: the microphone only picked up silence (lid closed or muted input?).",
+        _ => "This recording's audio couldn't be read.",
+    }
 }
 
 impl Editor {
@@ -143,6 +170,14 @@ impl Editor {
         let mask_watch = super::maskwatch::MaskWatch::new(package.rec(&rec.meta.screen.file));
         let mut audio = AudioPreview::new();
         audio.rebuild_now(&project, &rec, path);
+        let peaks = Arc::new(Mutex::new(None));
+        {
+            let (peaks, meta, rd) = (peaks.clone(), rec.meta.clone(), package.recording_dir());
+            std::thread::spawn(move || {
+                let p = TrackPeaks { system: crate::export::audio::track_peak(&rd, &meta.system_audio), mic: crate::export::audio::track_peak(&rd, &meta.mic) };
+                *peaks.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+            });
+        }
         Ok(Editor {
             package,
             project,
@@ -172,11 +207,18 @@ impl Editor {
             fresh: false,
             copy_when_exported: false,
             mask_watch,
+            peaks,
+            silence_noted: false,
         })
     }
 
     pub fn duration(&self) -> f64 {
         self.preview.scene.duration()
+    }
+
+    /// The playhead right now (it moves between frames while playing).
+    pub fn playhead_now(&self) -> f64 {
+        self.playing.map_or(self.playhead, |(t0, from)| (from + t0.elapsed().as_secs_f64() * 1000.0).min(self.duration()))
     }
 
     pub fn is_playing(&self) -> bool {
@@ -539,7 +581,22 @@ impl Editor {
                 }
             }
         }
+        if self.playing.is_some() {
+            self.audio.sync(self.playhead);
+        }
         self.audio.tick();
+        if let Some(e) = self.audio.error.take() {
+            self.status = Some(e);
+        }
+        if !self.silence_noted
+            && let Some(p) = *self.peaks.lock().unwrap_or_else(|e| e.into_inner())
+        {
+            self.silence_noted = true;
+            let added = !self.project.timeline.voiceovers.is_empty() || self.project.style.audio.music.is_some();
+            if TrackPeaks::silent(p.system) && TrackPeaks::silent(p.mic) && !added {
+                self.status = Some(silence_note(&self.rec, p).into());
+            }
+        }
         let exposures_changed = self.mask_watch.update(&self.project.timeline.masks);
         if self.dirty_at.is_some_and(|t| t.elapsed() > Duration::from_millis(800)) {
             self.save();

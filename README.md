@@ -83,11 +83,13 @@ dist/glide export Project.glide --format gif
 dist/glide devices                  # displays, windows, cameras, mics, iPhones
 dist/glide check-masks Project.glide # where content under masks moves
 dist/glide check-background Project.glide # every background option visibly changes a frame
+dist/glide audio-check Project.glide --freq 880 # levels, and how much is a test tone
 dist/glide transcribe Project.glide --engine whisper-small  # captions
 dist/glide resize-window 1234 1920x1080 # window id from `glide devices`
 dist/glide permissions --request
 dist/glide synth demo.glide         # synthetic project (no permissions needed)
-scripts/selftest.sh --screen        # end-to-end checks
+scripts/selftest.sh --screen        # end-to-end checks (plays a quiet test tone)
+scripts/selftest.sh --audio         # just the audio round trip
 scripts/bench.sh                    # performance measurements
 ```
 

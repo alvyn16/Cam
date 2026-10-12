@@ -41,6 +41,7 @@ pub struct MovieWriter {
     audio_done: bool,
     fps: u32,
     pub frames: u64,
+    path: std::path::PathBuf,
 }
 
 unsafe impl Send for MovieWriter {}
@@ -149,6 +150,7 @@ impl MovieWriter {
                 audio_done: false,
                 fps: s.fps,
                 frames: 0,
+                path: abs,
             })
         }
     }
@@ -275,11 +277,26 @@ impl MovieWriter {
                 bail!("writing failed: {}", err_text(&self.writer));
             }
         }
+        remove_fast_start_leftovers(&self.path);
         Ok(())
     }
 
     pub fn cancel(self) {
         unsafe { self.writer.cancelWriting() };
+    }
+}
+
+/// Optimising for network use (index first) rewrites the movie through a
+/// `<name>.sb-…` temporary that AVFoundation can leave next to the finished
+/// file; remove it.
+fn remove_fast_start_leftovers(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefix = format!("{name}.sb-");
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 

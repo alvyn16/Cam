@@ -136,6 +136,26 @@ pub fn write_device_package(output: &std::path::Path, duration: f64, width: u32,
     write(output, rec, duration)
 }
 
+/// Give a synthetic package a system-audio track: a sine at `hz`, 0.1
+/// amplitude (-20 dBFS peak), for the whole recording.
+pub fn add_tone(output: &std::path::Path, hz: f64) -> anyhow::Result<()> {
+    use crate::project::recording::AudioTrack;
+    use crate::project::{self, Package};
+    let pkg = Package::new(output);
+    let (_, mut rec) = pkg.load()?;
+    let n = (rec.meta.duration_ms / 1000.0 * crate::capture::mixer::RATE) as usize;
+    let tone: Vec<[f32; 2]> = (0..n)
+        .map(|i| {
+            let v = 0.1 * (std::f64::consts::TAU * hz * i as f64 / crate::capture::mixer::RATE).sin() as f32;
+            [v, v]
+        })
+        .collect();
+    crate::app::player::write_wav(&pkg.rec("system.wav"), &tone)?;
+    rec.meta.system_audio = Some(AudioTrack { file: "system.wav".into(), track: 0 });
+    project::write_json(&pkg.rec("meta.json"), &rec.meta)?;
+    Ok(())
+}
+
 fn write(output: &std::path::Path, rec: Recording, duration: f64) -> anyhow::Result<(u64, usize)> {
     use crate::media::writer::{MovieWriter, WriterSpec, fill_bgra};
     use crate::project::{self, Package, model::Codec};

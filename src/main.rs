@@ -52,6 +52,21 @@ enum Cmd {
         #[arg(long, default_value_t = 400)]
         height: u32,
     },
+    /// Measure a recording's or a video's audio, and how much of it is a
+    /// test tone (system and mic tracks of a .glide package, or every audio
+    /// track of a media file).
+    AudioCheck {
+        path: PathBuf,
+        /// The tone to look for, Hz.
+        #[arg(long, default_value_t = 880.0)]
+        freq: f64,
+        /// Fail unless this track (system, mic, or audio0, audio1… for
+        /// files) holds the tone for at least --min-seconds.
+        #[arg(long)]
+        require: Vec<String>,
+        #[arg(long, default_value_t = 1.0)]
+        min_seconds: f64,
+    },
     /// Export a project to MP4 or GIF.
     Export {
         project: Option<PathBuf>,
@@ -213,6 +228,9 @@ enum Cmd {
         /// Make it an iPhone/iPad recording (portrait sizes get a phone frame).
         #[arg(long)]
         device: bool,
+        /// Add a system-audio track: a sine tone at this many Hz.
+        #[arg(long)]
+        tone: Option<f64>,
     },
 }
 
@@ -227,10 +245,11 @@ fn main() -> Result<()> {
             frame(project, synthetic, time, height, style, output)
         }
         Some(Cmd::CheckBackground { project, synthetic, time, height }) => check_background(project, synthetic, time, height),
+        Some(Cmd::AudioCheck { path, freq, require, min_seconds }) => audio_check(path, freq, require, min_seconds),
         Some(Cmd::Export { project, synthetic, output, format, height, fps, quality, codec, target_mb }) => {
             export_cmd(project, synthetic, output, format, height, fps, quality, codec, target_mb)
         }
-        Some(Cmd::Synth { output, duration, width, height, device }) => synth(output, duration, width, height, device),
+        Some(Cmd::Synth { output, duration, width, height, device, tone }) => synth(output, duration, width, height, device, tone),
         Some(Cmd::Record { display, window, area, device, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
             record(display, window, area, device, pattern, mic, !no_system_audio, camera, duration, fps, dir, name, (hide_icons, hide_dock))
         }
@@ -423,6 +442,45 @@ fn frame(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32, style: O
     Ok(())
 }
 
+fn audio_check(path: PathBuf, freq: f64, require: Vec<String>, min_seconds: f64) -> Result<()> {
+    let mut tracks: Vec<(String, PathBuf, usize)> = vec![];
+    if path.join("recording/meta.json").exists() {
+        let pkg = Package::new(&path);
+        let (_, rec) = pkg.load()?;
+        for (label, t) in [("system", &rec.meta.system_audio), ("mic", &rec.meta.mic)] {
+            match t {
+                Some(t) => tracks.push((label.into(), pkg.rec(&t.file), t.track)),
+                None => println!("{label}: not recorded"),
+            }
+        }
+    } else {
+        for i in 0..8 {
+            if glide::media::read_audio(&path, i).is_err() {
+                if i == 0 {
+                    println!("audio0: no audio track");
+                }
+                break;
+            }
+            tracks.push((format!("audio{i}"), path.clone(), i));
+        }
+    }
+    let mut found = std::collections::HashMap::new();
+    for (label, file, track) in &tracks {
+        let samples = glide::media::read_audio(file, *track)?;
+        let l = glide::audiocheck::analyze(&samples, freq);
+        println!(
+            "{label}: {:.1} s, {:.1} dBFS RMS; {freq:.0} Hz tone for {:.2} s at {:.1} dBFS",
+            l.seconds, l.rms_db, l.tone_seconds, l.tone_db
+        );
+        found.insert(label.clone(), l.tone_seconds);
+    }
+    let missing: Vec<_> = require.iter().filter(|r| found.get(*r).is_none_or(|s| *s < min_seconds)).collect();
+    if !missing.is_empty() {
+        bail!("no {freq:.0} Hz tone (at least {min_seconds} s) in: {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    Ok(())
+}
+
 fn check_background(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32) -> Result<()> {
     use glide::render::bgcheck;
     let mut loaded = load_for_frames(pkg, synthetic)?;
@@ -535,9 +593,12 @@ fn export_cmd(
     Ok(())
 }
 
-fn synth(output: PathBuf, duration: f64, width: u32, height: u32, device: bool) -> Result<()> {
+fn synth(output: PathBuf, duration: f64, width: u32, height: u32, device: bool, tone: Option<f64>) -> Result<()> {
     let write = if device { glide::synth::write_device_package } else { glide::synth::write_package };
     let (frames, zooms) = write(&output, duration, width, height)?;
+    if let Some(hz) = tone {
+        glide::synth::add_tone(&output, hz)?;
+    }
     println!("{} ({frames} frames, {zooms} zooms)", output.display());
     Ok(())
 }
@@ -594,6 +655,9 @@ fn record(
         name,
         hide_desktop_icons,
         hide_dock,
+        // The command line makes no sound of its own; excluding "this app"
+        // would also drop a running Glide window's audio.
+        exclude_own_audio: false,
         ..Default::default()
     };
     unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as usize) };

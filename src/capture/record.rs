@@ -93,6 +93,8 @@ pub struct Options {
     pub hide_desktop_icons: bool,
     /// Leave the Dock out of display captures.
     pub hide_dock: bool,
+    /// Leave this app's own sounds out of the system audio.
+    pub exclude_own_audio: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -116,7 +118,7 @@ pub fn check_permissions(o: &Options) -> Result<()> {
     }
     if !missing.is_empty() {
         bail!(
-            "missing permission(s): {}\n  run `rec permissions --request`, then enable Rec in System Settings > Privacy & Security",
+            "missing permission(s): {}\n  run `glide permissions --request`, then enable Glide in System Settings > Privacy & Security",
             missing.join(", ")
         );
     }
@@ -241,6 +243,7 @@ impl Session {
                     mic: sck_mic,
                     hide_desktop_icons: o.hide_desktop_icons,
                     hide_dock: o.hide_dock,
+                    exclude_own_audio: o.exclude_own_audio,
                 };
                 self.screen = Some(ScreenCapture::start(&cfg, self.shared.clone())?);
             }

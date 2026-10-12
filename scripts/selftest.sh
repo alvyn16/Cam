@@ -2,7 +2,10 @@
 # End-to-end checks on this Mac: unit + UI smoke tests, synthetic exports,
 # the background-settings pixel check, the scripted GUI run (record test
 # pattern -> pause/resume -> stop -> editor -> export -> quit) and, with
-# --screen, a real 3 s display recording + export + background check.
+# --screen, a real 3 s display recording + export + background check, and
+# the audio round trip (also alone with --audio): a tone from
+# another app is recorded, played back in the editor (and heard), and
+# exported. The audio checks play a quiet 1234 Hz tone through the speakers.
 # Outputs go to $GLIDE_TEST_DIR (default ~/Movies/glide-tests), never the repo.
 set -eu
 cd "$(dirname "$0")/.."
@@ -15,6 +18,8 @@ ok() { echo "PASS  $1"; pass=$((pass+1)); }
 ko() { echo "FAIL  $1 (see $OUT)"; fail=$((fail+1)); }
 
 cargo build --release -q
+# --audio: only the audio round trip below.
+if [ "${1:-}" != "--audio" ]; then
 if cargo test --release -q >"$OUT/tests.log" 2>&1; then ok "cargo test ($(grep -o '[0-9]* passed' "$OUT/tests.log" | awk '{s+=$1} END {print s}') tests)"; else ko "cargo test"; fi
 
 if "$G" synth "$OUT/synth.glide" --duration 6 >"$OUT/synth.log" 2>&1 \
@@ -50,6 +55,97 @@ if [ "$code" -eq 0 ] && grep -q 'selftest: PASS' "$OUT/gui.log"; then
   ok "gui app ($(grep -o 'elapsed=[0-9.]*s' "$OUT/gui.log"), $(grep -o 'frames: [0-9]*' "$OUT/gui.log"))"
 else
   ko "gui app"
+fi
+fi
+
+# Audio round trip. ScreenCaptureKit only hears apps, and treats every copy
+# of Glide as Glide itself, so the tone comes from a small helper app
+# (scripts/test-window.js under osascript). Glide records it, plays the
+# recording back in the editor (GLIDE_GUI_PLAYTEST, which also checks the
+# output follows the volume, mute and playhead) while a second recording
+# listens, and exports it. `glide audio-check` looks for the tone each time.
+helper() { osascript -l JavaScript scripts/test-window.js "$@" >/dev/null 2>&1; }
+capturing() { # name pid — wait until the recording is running
+  i=0
+  until grep -q 'recording to' "$OUT/$1-record.log" 2>/dev/null; do
+    i=$((i+1)); [ "$i" -gt 300 ] || ! kill -0 "$2" 2>/dev/null && break
+    sleep 0.1
+  done
+}
+record_with_tone() { # name [record options...] — 7 s; the helper plays the tone from 1 s in
+  name=$1; shift
+  "$G" record -t 7 --dir "$OUT" --name "$name" "$@" >"$OUT/$name-record.log" 2>&1 &
+  rpid=$!
+  capturing "$name" "$rpid"
+  helper 8 "$TONE" 1 &
+  hpid=$!
+  wait "$rpid"; r=$?
+  wait "$hpid" 2>/dev/null
+  return $r
+}
+tone() { grep "^$1" "$2" | sed 's/.*Hz tone/tone/'; }
+if [ "${1:-}" = "--screen" ] || [ "${1:-}" = "--audio" ]; then
+  if "$G" permissions 2>/dev/null | grep -q 'Screen Recording: *Granted'; then
+    "$G" synth "$OUT/tone-source.glide" --duration 8 --width 640 --height 400 --tone 1234 >/dev/null 2>&1
+    TONE="$OUT/tone-source.glide/recording/system.wav"
+    if record_with_tone tone --area 0,0,320,200 \
+       && "$G" audio-check --freq 1234 "$OUT/tone.glide" --require system >"$OUT/tone-check.log" 2>&1; then
+      ok "records another app's tone (system audio): $(tone system "$OUT/tone-check.log")"
+    else
+      ko "recording a tone"
+    fi
+    # Glide plays the recording; a second recording (started first) listens.
+    "$G" record -t 10 --dir "$OUT" --name heard --area 0,0,320,200 >"$OUT/heard-record.log" 2>&1 &
+    rpid=$!
+    capturing heard "$rpid"
+    GLIDE_GUI_PLAYTEST="$OUT/tone.glide" GLIDE_PLAYTEST_SECONDS=6 GLIDE_OUTPUT_DIR="$OUT/gui" "$G" gui >"$OUT/playtest.log" 2>&1 || true
+    wait "$rpid"
+    if grep -q 'playtest: PASS' "$OUT/playtest.log" \
+       && "$G" audio-check --freq 1234 "$OUT/heard.glide" --require system >"$OUT/heard-check.log" 2>&1; then
+      ok "editor playback is audible: $(tone system "$OUT/heard-check.log"); $(grep -o 'volume x0.25.*soundtrack' "$OUT/playtest.log")"
+    else
+      ko "editor playback of the recorded tone"
+    fi
+    if "$G" export "$OUT/tone.glide" -o "$OUT/tone.mp4" >"$OUT/tone-export.log" 2>&1 \
+       && "$G" audio-check --freq 1234 "$OUT/tone.mp4" --require audio0 >>"$OUT/tone-export.log" 2>&1; then
+      ok "export carries the tone: $(tone audio0 "$OUT/tone-export.log")"
+    else
+      ko "export of the recorded tone"
+    fi
+    # A window recording hears the whole Mac, not just the window's app:
+    # record a silent helper window while another helper plays the tone.
+    helper 40 &
+    wpid=$!
+    sleep 1.5
+    win=$("$G" devices 2>/dev/null | grep 'Glide audio test (' | grep -v '(sound)' | awk 'NR==1 {print $1}')
+    if [ -z "$win" ]; then
+      echo "SKIP  window recording audio (helper window didn't appear)"
+    elif record_with_tone window-tone --window "$win" \
+       && "$G" audio-check --freq 1234 "$OUT/window-tone.glide" --require system >"$OUT/window-check.log" 2>&1; then
+      ok "window recording hears other apps: $(tone system "$OUT/window-check.log")"
+    else
+      ko "window recording audio"
+    fi
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null || true
+    # The microphone hears the tone through the speakers unless the lid is
+    # closed or headphones are in, so that part is reported, not required.
+    if "$G" permissions 2>/dev/null | grep -q 'Microphone: *Granted'; then
+      if record_with_tone mic-tone --area 0,0,320,200 --mic --no-system-audio \
+         && "$G" audio-check --freq 1234 "$OUT/mic-tone.glide" >"$OUT/mic-check.log" 2>&1 && grep -q '^mic: .*dBFS RMS' "$OUT/mic-check.log"; then
+        if "$G" audio-check --freq 1234 "$OUT/mic-tone.glide" --require mic >/dev/null 2>&1; then
+          ok "microphone recorded the tone from the speakers: $(tone mic "$OUT/mic-check.log")"
+        else
+          ok "microphone recorded, without hearing the speakers (lid closed or headphones?): $(grep '^mic' "$OUT/mic-check.log" | cut -d';' -f1)"
+        fi
+      else
+        ko "microphone recording"
+      fi
+    else
+      echo "SKIP  microphone (no Microphone permission)"
+    fi
+  else
+    echo "SKIP  audio round trip (no Screen Recording permission)"
+  fi
 fi
 
 if [ "${1:-}" = "--screen" ]; then
