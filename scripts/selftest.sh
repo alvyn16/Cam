@@ -1,7 +1,8 @@
 #!/bin/sh
 # End-to-end checks on this Mac: unit + UI smoke tests, synthetic exports,
-# the scripted GUI run (record test pattern -> pause/resume -> stop -> editor
-# -> export -> quit) and, with --screen, a real 3 s display recording + export.
+# the background-settings pixel check, the scripted GUI run (record test
+# pattern -> pause/resume -> stop -> editor -> export -> quit) and, with
+# --screen, a real 3 s display recording + export + background check.
 # Outputs go to $GLIDE_TEST_DIR (default ~/Movies/glide-tests), never the repo.
 set -eu
 cd "$(dirname "$0")/.."
@@ -23,6 +24,14 @@ if "$G" synth "$OUT/synth.glide" --duration 6 >"$OUT/synth.log" 2>&1 \
   ok "synthetic package -> mp4 + gif"
 else
   ko "synthetic export"
+fi
+
+# Every Background setting (wallpapers, blur, gradient, colour, image) and the
+# padding, roundness and shadow around it must visibly change a rendered frame.
+if "$G" check-background "$OUT/synth.glide" >"$OUT/background.log" 2>&1; then
+  ok "background settings change the frame ($(grep -c '^ok' "$OUT/background.log") checks)"
+else
+  ko "background settings"
 fi
 
 # iPhone/iPad recordings (no device needed): portrait → phone frame → MP4.
@@ -50,6 +59,11 @@ if [ "${1:-}" = "--screen" ]; then
     ok "real display recording -> export"
   else
     ko "real display recording (Screen Recording permission?)"
+  fi
+  if [ -d "$OUT/screen.glide" ] && "$G" check-background "$OUT/screen.glide" >"$OUT/screen-background.log" 2>&1; then
+    ok "background settings on the real recording ($(grep -c '^ok' "$OUT/screen-background.log") checks)"
+  else
+    ko "background settings on the real recording"
   fi
   # Resize Glide's own window (only that exact window, by its process) through the
   # Accessibility API, as the Window source's Resize menu does.

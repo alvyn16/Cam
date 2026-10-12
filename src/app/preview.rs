@@ -64,13 +64,27 @@ impl Preview {
 
     /// Render the frame at `playback_ms` at `size` pixels (cheap when nothing changed).
     pub fn render(&mut self, egui: &mut egui_wgpu::Renderer, playback_ms: f64, size: (u32, u32)) -> Option<egui::TextureId> {
+        if self.draw(playback_ms, size) {
+            let device = &self.renderer.gpu().device;
+            let view = &self.target.as_ref().unwrap().1;
+            match self.texture_id {
+                Some(id) => egui.update_egui_texture_from_wgpu_texture(device, view, wgpu::FilterMode::Linear, id),
+                None => self.texture_id = Some(egui.register_native_texture(device, view, wgpu::FilterMode::Linear)),
+            }
+        }
+        self.texture_id
+    }
+
+    /// Render into the preview texture unless that frame is already there.
+    /// Returns whether the texture was (re)created.
+    pub fn draw(&mut self, playback_ms: f64, size: (u32, u32)) -> bool {
         let (w, h) = (size.0.max(16), size.1.max(16));
         let f = self.scene.frame_index(playback_ms);
         let key = (f, h, self.revision);
         let gpu = self.renderer.gpu().clone();
         let resized = self.target.as_ref().is_none_or(|t| t.2 != (w, h));
         if !resized && self.last == Some(key) {
-            return self.texture_id;
+            return false;
         }
         if resized {
             let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -80,14 +94,10 @@ impl Preview {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: OUTPUT_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
-            match self.texture_id {
-                Some(id) => egui.update_egui_texture_from_wgpu_texture(&gpu.device, &view, wgpu::FilterMode::Linear, id),
-                None => self.texture_id = Some(egui.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear)),
-            }
             self.target = Some((texture, view, (w, h)));
         }
         let frame = self.scene.frame(playback_ms, h as f64);
@@ -115,6 +125,19 @@ impl Preview {
         gpu.queue.submit([enc.finish()]);
         self.last = Some(key);
         self.last_frame = Some(frame);
-        self.texture_id
+        resized
+    }
+
+    /// The last rendered preview as RGBA (width, height, pixels).
+    pub fn read_pixels(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let (texture, _, (w, h)) = self.target.as_ref()?;
+        let gpu = self.renderer.gpu();
+        let enc = gpu.device.create_command_encoder(&Default::default());
+        let mut px = crate::render::gpu::read_texture(gpu, texture, *w, *h, enc);
+        // The target is BGRA.
+        for p in px.chunks_exact_mut(4) {
+            p.swap(0, 2);
+        }
+        Some((*w, *h, px))
     }
 }

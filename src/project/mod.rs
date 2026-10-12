@@ -26,7 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::engine::zoom;
-use model::{DeviceFrame, Project, Slice};
+use model::{DeviceFrame, Project, Slice, Style};
 use recording::{Recording, RecordingMeta, SourceKind};
 
 pub const EXTENSION: &str = "glide";
@@ -102,9 +102,10 @@ pub fn new_project(name: &str, rec: &Recording) -> Project {
     p.created_ms = rec.meta.created_ms;
     p.updated_ms = rec.meta.created_ms;
     if rec.meta.kind == SourceKind::Display {
-        // Full-screen recordings fill the frame; windows and areas float.
-        p.style.padding = 0.0;
-        p.style.corner_radius = 0.0;
+        // Full-screen recordings sit on the background too (a little less
+        // padding than windows), so the background settings show from the
+        // start; set Padding to 0 % for an edge-to-edge video.
+        p.style.padding = Style::REVEAL_PADDING;
     }
     if rec.meta.kind == SourceKind::Device {
         // iPhone/iPad screens get a device frame; there's no cursor to follow.
@@ -173,6 +174,16 @@ mod tests {
         assert_eq!(p.timeline.slices.len(), 1);
         assert_eq!(p.timeline.zooms.len(), 1);
         assert_eq!(p.style.padding, 10.0);
+    }
+
+    #[test]
+    fn every_kind_of_recording_starts_with_the_background_in_view() {
+        for kind in [SourceKind::Display, SourceKind::Window, SourceKind::Area, SourceKind::Device] {
+            let rec = Recording { meta: RecordingMeta { duration_ms: 1000.0, kind, ..Default::default() }, ..Default::default() };
+            let p = new_project("x", &rec);
+            assert!(p.style.padding > 0.0, "{kind:?}: padding {}", p.style.padding);
+            assert!(p.style.shadow.intensity > 0.0, "{kind:?}");
+        }
     }
 
     #[test]

@@ -72,6 +72,18 @@ fn tabs(ui: &mut Ui, tab: &mut Tab) {
     ui.separator();
 }
 
+/// Ask for a PNG or JPEG, check it decodes, and copy it into the package.
+fn choose_image(ed: &mut Editor) -> Option<String> {
+    let f = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file()?;
+    match crate::render::Image::from_png(&f).and_then(|_| ed.package.import_asset(&f, "background")) {
+        Ok(rel) => Some(rel),
+        Err(e) => {
+            ed.status = Some(format!("Couldn't use that image: {e:#}"));
+            None
+        }
+    }
+}
+
 fn swatch(ui: &mut Ui, size: egui::Vec2, selected: bool, paint: impl FnOnce(&egui::Painter, egui::Rect)) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     paint(ui.painter(), rect);
@@ -81,8 +93,12 @@ fn swatch(ui: &mut Ui, size: egui::Vec2, selected: bool, paint: impl FnOnce(&egu
 }
 
 fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
+    let before = d.style.clone();
     let s = &mut d.style;
     section(ui, "Background", |ui| {
+        if s.padding <= 0.0 && s.device == DeviceFrame::None {
+            caption(ui, "Hidden at 0 % padding. Pick a background (or raise Padding) to show it.");
+        }
         #[derive(Clone, Copy, PartialEq)]
         enum K {
             Wall,
@@ -100,8 +116,9 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             s.background = match k {
                 K::Wall => Background::Wallpaper { id: "aurora".into() },
                 K::Grad => Background::Gradient { angle: 135.0, stops: vec![(Color::rgb(255, 120, 80), 0.0), (Color::rgb(130, 70, 220), 1.0)] },
-                K::Col => Background::Color { color: Color::rgb(30, 30, 34) },
-                K::Img => Background::Image { path: String::new() },
+                K::Col => Background::Color { color: Color::rgb(52, 120, 246) },
+                // Ask for the image straight away; cancelling keeps the old background.
+                K::Img => choose_image(ed).map_or_else(|| s.background.clone(), |path| Background::Image { path }),
             };
         }
         ui.add_space(6.0);
@@ -166,12 +183,9 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             Background::Image { path } => {
                 ui.horizontal(|ui| {
                     if ui.button("Choose image…").clicked()
-                        && let Some(f) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file()
+                        && let Some(rel) = choose_image(ed)
                     {
-                        match ed.package.import_asset(&f, "background") {
-                            Ok(rel) => *path = rel,
-                            Err(e) => ed.status = Some(format!("Couldn't import image: {e:#}")),
-                        }
+                        *path = rel;
                     }
                     if ui.button("Desktop wallpaper").on_hover_text("Use your current macOS desktop picture").clicked() {
                         let tmp = std::env::temp_dir().join(format!("glide-wallpaper-{}.png", std::process::id()));
@@ -185,7 +199,10 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 caption(ui, &std::path::Path::new(path.as_str()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "No image".into()));
             }
         }
-        slider(ui, "Blur", &mut s.background_blur, 0.0..=60.0, " px");
+        // Blurring a flat colour or a gradient changes nothing.
+        if matches!(s.background, Background::Wallpaper { .. } | Background::Image { .. }) {
+            slider(ui, "Blur", &mut s.background_blur, 0.0..=60.0, " px");
+        }
     });
     section(ui, "Frame", |ui| {
         slider(ui, "Padding", &mut s.padding, 0.0..=40.0, "%");
@@ -193,7 +210,7 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             use crate::project::model::DeviceFrame as D;
             segmented(ui, &mut s.device, &[(D::None, "None"), (D::Laptop, "Laptop"), (D::Phone, "Phone"), (D::Tablet, "Tablet")]);
         });
-        if s.device == crate::project::model::DeviceFrame::None {
+        if s.device == DeviceFrame::None {
             slider(ui, "Roundness", &mut s.corner_radius, 0.0..=60.0, " px");
         }
         slider(ui, "Inset", &mut s.inset.padding, 0.0..=60.0, " px");
@@ -218,6 +235,9 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         slider(ui, "Distance", &mut s.shadow.distance, 0.0..=100.0, " px");
         slider(ui, "Blur", &mut s.shadow.blur, 0.0..=100.0, " px");
     });
+    if s.reveal_background(&before) {
+        ed.status = Some(format!("Padding was 0 %, which hides the background, so it's now {} %.", Style::REVEAL_PADDING));
+    }
     section(ui, "Crop", |ui| {
         let c = &mut s.crop;
         let (mut l, mut t, mut r, mut b) = (c.x, c.y, 1.0 - c.x - c.w, 1.0 - c.y - c.h);

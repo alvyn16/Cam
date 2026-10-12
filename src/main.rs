@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use std::sync::atomic::AtomicBool;
@@ -38,6 +38,19 @@ enum Cmd {
         style: Option<String>,
         #[arg(short, long)]
         output: PathBuf,
+    },
+    /// Check that every Background setting (and padding, roundness and
+    /// shadow) visibly changes a rendered frame of a project.
+    CheckBackground {
+        /// A .glide package (omit with --synthetic).
+        project: Option<PathBuf>,
+        #[arg(long)]
+        synthetic: bool,
+        /// Playback time in seconds.
+        #[arg(short, long, default_value_t = 1.0)]
+        time: f64,
+        #[arg(long, default_value_t = 400)]
+        height: u32,
     },
     /// Export a project to MP4 or GIF.
     Export {
@@ -213,6 +226,7 @@ fn main() -> Result<()> {
         Some(Cmd::Frame { project, synthetic, time, height, style, output }) => {
             frame(project, synthetic, time, height, style, output)
         }
+        Some(Cmd::CheckBackground { project, synthetic, time, height }) => check_background(project, synthetic, time, height),
         Some(Cmd::Export { project, synthetic, output, format, height, fps, quality, codec, target_mb }) => {
             export_cmd(project, synthetic, output, format, height, fps, quality, codec, target_mb)
         }
@@ -353,45 +367,89 @@ fn main() -> Result<()> {
     }
 }
 
-fn frame(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32, style: Option<String>, output: PathBuf) -> Result<()> {
-    let (mut proj, rec, dir) = if synthetic {
+type Loaded = (glide::project::model::Project, glide::project::recording::Recording, Option<PathBuf>);
+
+/// A project to render frames of: a package, or the synthetic recording.
+fn load_for_frames(pkg: Option<PathBuf>, synthetic: bool) -> Result<Loaded> {
+    Ok(if synthetic {
         let rec = glide::synth::recording(1920, 1080, 12_000.0);
         (project::new_project("synthetic", &rec), rec, None)
     } else {
-        let pkg = Package::new(pkg.expect("project path or --synthetic"));
+        let pkg = Package::new(pkg.context("a project path or --synthetic")?);
         let (p, r) = pkg.load()?;
         (p, r, Some(pkg.root.clone()))
-    };
-    if let Some(s) = style {
-        let mut v = serde_json::to_value(&proj)?;
-        merge(&mut v, serde_json::from_str(&s)?);
-        proj = serde_json::from_value(v)?;
-    }
-    let mut scene = Scene::new(proj.clone(), &rec, 60.0);
+    })
+}
+
+/// Render the frame at `time` seconds, `height` pixels tall.
+fn render_frame(r: &mut Renderer, (proj, rec, dir): &Loaded, time: f64, height: u32) -> Result<(glide::render::Image, f64)> {
+    let mut scene = Scene::new(proj.clone(), rec, 60.0);
     let f = scene.frame(time * 1000.0, height as f64);
-    let gpu = Gpu::headless()?;
-    let mut r = Renderer::new(gpu);
-    r.prepare(&proj.style, &rec, dir.as_deref());
-    if synthetic {
-        let (w, h) = (rec.meta.screen.width, rec.meta.screen.height);
-        let px = glide::synth::screen_bgra(w, h, f.source_ms);
-        r.set_screen(&VideoFrame { width: w, height: h, stride: (w * 4) as usize, bgra: &px });
-    } else if let Some(dir) = &dir {
-        let pkg = Package::new(dir);
-        let mut src = glide::media::FrameSource::open(&pkg.rec(&rec.meta.screen.file))?;
-        if let Some(vf) = src.frame_at(f.source_ms) {
-            vf.with_bgra(|v| r.set_screen(v));
+    r.prepare(&proj.style, rec, dir.as_deref());
+    match dir {
+        None => {
+            let (w, h) = (rec.meta.screen.width, rec.meta.screen.height);
+            let px = glide::synth::screen_bgra(w, h, f.source_ms);
+            r.set_screen(&VideoFrame { width: w, height: h, stride: (w * 4) as usize, bgra: &px });
         }
-        if let Some(cam) = &rec.meta.camera
-            && let Ok(mut c) = glide::media::FrameSource::open(&pkg.rec(&cam.file))
-            && let Some(vf) = c.frame_at(f.source_ms - cam.offset_ms)
-        {
-            vf.with_bgra(|v| r.set_camera(v));
+        Some(dir) => {
+            let pkg = Package::new(dir);
+            let mut src = glide::media::FrameSource::open(&pkg.rec(&rec.meta.screen.file))?;
+            if let Some(vf) = src.frame_at(f.source_ms) {
+                vf.with_bgra(|v| r.set_screen(v));
+            }
+            if let Some(cam) = &rec.meta.camera
+                && let Ok(mut c) = glide::media::FrameSource::open(&pkg.rec(&cam.file))
+                && let Some(vf) = c.frame_at(f.source_ms - cam.offset_ms)
+            {
+                vf.with_bgra(|v| r.set_camera(v));
+            }
         }
     }
-    let img = r.render_to_image(&f, &proj.style);
+    Ok((r.render_to_image(&f, &proj.style), f.source_ms))
+}
+
+fn frame(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32, style: Option<String>, output: PathBuf) -> Result<()> {
+    let mut loaded = load_for_frames(pkg, synthetic)?;
+    if let Some(s) = style {
+        let mut v = serde_json::to_value(&loaded.0)?;
+        merge(&mut v, serde_json::from_str(&s)?);
+        loaded.0 = serde_json::from_value(v)?;
+    }
+    let mut r = Renderer::new(Gpu::headless()?);
+    let (img, source_ms) = render_frame(&mut r, &loaded, time, height)?;
     image::save_buffer(&output, &img.rgba, img.width, img.height, image::ExtendedColorType::Rgba8)?;
-    println!("{} ({}x{}, source {:.0} ms)", output.display(), img.width, img.height, f.source_ms);
+    println!("{} ({}x{}, source {:.0} ms)", output.display(), img.width, img.height, source_ms);
+    Ok(())
+}
+
+fn check_background(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32) -> Result<()> {
+    use glide::render::bgcheck;
+    let mut loaded = load_for_frames(pkg, synthetic)?;
+    // Zoomed-in frames push the background out of view.
+    loaded.0.timeline.zooms.clear();
+    let style = loaded.0.style.clone();
+    let tmp = std::env::temp_dir().join(format!("glide-check-background-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)?;
+    let image = tmp.join("checker.png");
+    bgcheck::checkerboard(&image)?;
+    let mut r = Renderer::new(Gpu::headless()?);
+    let outcomes = bgcheck::run(&style, &image.to_string_lossy(), |s| {
+        loaded.0.style = s.clone();
+        Ok(render_frame(&mut r, &loaded, time, height)?.0)
+    });
+    let _ = std::fs::remove_dir_all(&tmp);
+    let outcomes = outcomes?;
+    let mut bad = 0;
+    for o in &outcomes {
+        let mark = if o.ok() { "ok  " } else { "FAIL" };
+        bad += usize::from(!o.ok());
+        println!("{mark} {:<22} {:>6.2}% changed (needs {:.2}%)", o.name, o.changed * 100.0, o.min * 100.0);
+    }
+    if bad > 0 {
+        bail!("{bad} of {} background settings made no visible change", outcomes.len());
+    }
+    println!("all {} background settings change the frame", outcomes.len());
     Ok(())
 }
 

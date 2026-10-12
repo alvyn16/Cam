@@ -41,7 +41,7 @@ pub struct WindowLayer {
     /// Crop of the screen video, normalised.
     pub uv: Rect,
     pub shadow: Shadow,
-    /// Output pixels per design pixel times window zoom (for shadow sizing).
+    /// Output pixels per 1080p-frame pixel times the zoom (for shadow sizing).
     pub scale: f64,
     pub blur: Blur,
 }
@@ -307,10 +307,14 @@ impl Scene {
                 wblur.velocity = d_center * (mb.amount * mb.screen_move * blur_gain);
             }
         }
+        // Roundness and shadow are px in a 1080p-tall frame at rest, whatever
+        // the recording's resolution (like the background blur), growing
+        // with the zoom.
+        let style_px = k * self.sizes.output.y / 1080.0 * zoom_scale / self.sizes.initial_zoom;
         let rscale = rect.w / self.sizes.window.x;
         let inset = self.sizes.inset * rscale;
-        let radius = style.corner_radius * rscale;
-        let inner_radius = (style.corner_radius - inset / rscale).max(4.0) * rscale;
+        let radius = style.corner_radius * style_px;
+        let inner_radius = (radius - inset).max(4.0 * style_px);
         let rec = self.sizes.recording;
         let crop = self.sizes.crop;
         let device_screen = super::device::screen_radius(style.device, rect);
@@ -325,7 +329,7 @@ impl Scene {
             inner_radius: if inset > 0.0 { inner_radius } else { radius },
             uv: Rect::new(crop.x / rec.x, crop.y / rec.y, crop.w / rec.x, crop.h / rec.y),
             shadow: style.shadow,
-            scale: k * zoom_scale,
+            scale: style_px,
             blur: wblur,
         };
 

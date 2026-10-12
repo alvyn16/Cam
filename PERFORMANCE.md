@@ -79,6 +79,10 @@ on a Retina display) — over 240 consecutive 60 fps frames.
 | Real 5K recording with a blur + highlight mask, 1600×1000 | 165 | 2.7× |
 | Synthetic 2560×1600 recording | 600 | 10× |
 
+Picking a wallpaper regenerates it (1920×1200, on the CPU, rows in
+parallel): 8–10 ms, so swatch clicks and slider drags update the canvas
+on the next frame. (Single-threaded with the glass ribbons it was 95 ms.)
+
 ## Mask checks ("data may be visible")
 
 `glide check-masks` runs the same background check the editor uses: every

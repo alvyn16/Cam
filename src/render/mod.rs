@@ -3,6 +3,7 @@
 //! effects, camera and text overlays.
 
 pub mod art;
+pub mod bgcheck;
 pub mod gpu;
 pub mod icon;
 pub mod interop;

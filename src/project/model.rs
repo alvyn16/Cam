@@ -364,6 +364,27 @@ impl Default for Style {
     }
 }
 
+impl Style {
+    /// Padding used to bring a hidden background into view.
+    pub const REVEAL_PADDING: f64 = 8.0;
+
+    /// With 0 % padding the background (and shadow) can't be seen. If an
+    /// edit since `before` changed the background, its blur or the shadow,
+    /// add padding (and soft corners) so the change shows. Returns whether
+    /// it did.
+    pub fn reveal_background(&mut self, before: &Style) -> bool {
+        let touched = self.background != before.background || self.background_blur != before.background_blur || self.shadow != before.shadow;
+        if !touched || self.padding > 0.0 || self.device != DeviceFrame::None {
+            return false;
+        }
+        self.padding = Style::REVEAL_PADDING;
+        if self.corner_radius == 0.0 {
+            self.corner_radius = 12.0;
+        }
+        true
+    }
+}
+
 /// A kept piece of the recording. Gaps between slices are cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

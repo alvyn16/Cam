@@ -19,36 +19,81 @@ pub const WALLPAPERS: [(&str, &str, [u8; 3], [Blob; 4]); 10] = [
     ("snow", "Snow", [236, 238, 243], [([255, 255, 255], 0.2, 0.2, 0.8), ([214, 220, 232], 0.85, 0.85, 0.8), ([245, 246, 250], 0.7, 0.2, 0.5), ([225, 230, 240], 0.15, 0.9, 0.6)]),
 ];
 
-/// Generate a wallpaper by blending soft colour blobs over a base colour,
-/// with light dithering to avoid banding.
+/// Generate a wallpaper: soft colour blobs over a base colour, crossed by
+/// translucent "glass" ribbons with crisp edges and a bright rim (so the art
+/// has detail a background blur visibly softens), lightly dithered against
+/// banding.
 pub fn wallpaper(id: &str, w: u32, h: u32) -> Image {
-    let (_, _, base, blobs) = WALLPAPERS.iter().find(|wp| wp.0 == id).unwrap_or(&WALLPAPERS[0]);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    use std::f32::consts::TAU;
+    let index = WALLPAPERS.iter().position(|wp| wp.0 == id).unwrap_or(0);
+    let (_, _, base, blobs) = &WALLPAPERS[index];
+    // Light wallpapers get darker glass so it still reads.
+    let light = base.iter().map(|&c| c as f32).sum::<f32>() > 3.0 * 160.0;
+    let (target, glass) = if light { (0.0, 0.16) } else { (255.0, 0.16) };
+    let phase = index as f32 * 0.37;
+    // Each ribbon's centre line and half-thickness depend only on x.
+    let ribbons: Vec<[(f32, f32); 3]> = (0..w)
+        .map(|x| {
+            let u = x as f32 / w as f32;
+            std::array::from_fn(|k| {
+                let p = phase + k as f32 * 1.9;
+                let centre = 0.22 + 0.28 * k as f32 + 0.09 * (TAU * (0.55 * u + p)).sin() + 0.035 * (TAU * (1.6 * u + 1.3 * p)).sin();
+                (centre, 0.055 + 0.025 * (TAU * (0.8 * u + 0.7 * p)).sin())
+            })
+        })
+        .collect();
     let aspect = w as f32 / h as f32;
-    let mut seed: u32 = 0x9e37_79b9;
-    for y in 0..h {
-        for x in 0..w {
-            let (u, v) = (x as f32 / w as f32, y as f32 / h as f32);
+    let px = h as f32;
+    let row = |y: u32, out: &mut [u8]| {
+        let v = y as f32 / h as f32;
+        let mut seed: u32 = 0x9e37_79b9 ^ y.wrapping_mul(0x85eb_ca6b);
+        for (x, o) in out.chunks_exact_mut(4).enumerate() {
+            let u = x as f32 / w as f32;
             let mut c = base.map(|c| c as f32);
             for &(col, bx, by, r) in blobs {
                 let dx = (u - bx) * aspect;
                 let dy = v - by;
-                let d2 = (dx * dx + dy * dy) / (r * r);
-                let wgt = (-d2 * 2.2).exp();
+                let wgt = (-(dx * dx + dy * dy) / (r * r) * 2.2).exp();
                 for i in 0..3 {
                     c[i] += (col[i] as f32 - c[i]) * wgt;
+                }
+            }
+            for &(centre, half) in &ribbons[x] {
+                // Coverage of the band, anti-aliased over about a pixel.
+                let inside = (0.5 - ((v - centre).abs() - half) * px).clamp(0.0, 1.0);
+                // A rim a few pixels wide along the band's upper edge.
+                let rim = (1.0 - ((v - (centre - half)) * px - 2.0).abs() / 2.5).clamp(0.0, 1.0);
+                if inside > 0.0 || rim > 0.0 {
+                    for ch in c.iter_mut() {
+                        *ch += (target - *ch) * inside * glass;
+                        *ch += (255.0 - *ch) * rim * 0.38;
+                    }
                 }
             }
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
             let n = (seed & 0xff) as f32 / 255.0 - 0.5;
-            for v in c {
-                rgba.push((v + n * 1.5).clamp(0.0, 255.0) as u8);
+            for i in 0..3 {
+                o[i] = (c[i] + n * 1.5).clamp(0.0, 255.0) as u8;
             }
-            rgba.push(255);
+            o[3] = 255;
         }
-    }
+    };
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let stride = (w * 4) as usize;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let rows_per = (h as usize).div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for (i, chunk) in rgba.chunks_mut(rows_per * stride.max(1)).enumerate() {
+            let row = &row;
+            sc.spawn(move || {
+                for (j, line) in chunk.chunks_exact_mut(stride).enumerate() {
+                    row((i * rows_per + j) as u32, line);
+                }
+            });
+        }
+    });
     Image { width: w, height: h, rgba }
 }
 

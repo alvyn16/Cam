@@ -38,8 +38,8 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | R13 | Resize the recorded window | ☑ | Window source shows the window's size with a Resize menu: the same preset groups, saved sizes, custom size; sizes that don't fit its display are disabled. Accessibility API (needs Accessibility permission). Verified by resizing Glide's own window (`scripts/selftest.sh --screen`). |
 | Z1–Z7 | Auto zoom, zoom model, targeting, manual target, edge snapping, spring zoom, motion blur | ☑ | Engine unit tests; manual target picked by clicking the preview. |
 | C1–C9 | Cursor re-rendering, smoothing, tilt, press, idle hide, hidden slices, click circle/ripple, click sounds, loop/freeze | ☑ | System cursor images, plus generated vector and touch skins. |
-| S1 | Backgrounds | ☑ | Generated wallpapers, gradients, colour, imported image, current desktop picture, blur. |
-| S2–S7 | Padding, roundness, shadow, inset, aspect ratio, crop | ☑ | |
+| S1 | Backgrounds | ☑ | Generated wallpapers (soft colour fields crossed by crisp "glass" ribbons, so blur visibly softens them), gradients, colour, imported PNG/JPEG (checked on import), current desktop picture, blur. Every recording, full-screen ones included, starts with padding so the background is visible; at 0 % padding a background, blur or shadow edit brings the padding back (8 %) and says so. `glide check-background` and `tests/background.rs` render each option and check the pixels change, on the editor preview and on a real 5K recording; an export test checks the exported frame matches the preview. |
+| S2–S7 | Padding, roundness, shadow, inset, aspect ratio, crop | ☑ | Roundness and shadow sizes are px in a 1080p-tall frame (like blur), whatever the recording's resolution, so they look the same on Retina and 1080p recordings. |
 | S8 | Device frames | ☑ | Generated laptop, phone, tablet frames (no artwork reused). |
 | K1–K5 | Camera bubble, shape, shrink while zoomed, layouts, auto-hide | ◐ | Bubble, circle/aspect shapes and camera-only layout verified with a generated camera clip on a real recording; live camera capture unverified (permission). |
 | T1–T7 | Slices, trim, split/delete, speed, zoom track, layout track, undo/redo/scrub/loop | ☑ | |
@@ -64,15 +64,21 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 
 ## Verification on this MacBook (M4 Pro, macOS 27)
 
-`scripts/selftest.sh --screen` (2026-10-11): 6/6 pass.
+`scripts/selftest.sh --screen` (2026-10-11): 8/8 pass.
 
-- `cargo test` (82): engine, project, presets, renderer helpers, masks,
+- `cargo test` (86): engine, project, presets, renderer helpers, masks,
   device frames, typing detection, caption editing, transcription chunking,
   Whisper transcription of synthesized speech,
   hotkeys, timeline clamping and cuts, voice isolation, masked-content
   change detection, window picking, GIF quantisation, icon, plus a
-  headless UI smoke test driving every editor panel.
+  headless UI smoke test driving every editor panel and background tests
+  that edit each Background setting through the editor, read the preview's
+  pixels back and compare them (and the exported frame) before and after.
 - Synthetic package → MP4 and GIF.
+- Background check (`glide check-background`): 22 edits (each wallpaper,
+  blur on and off, gradient, its angle and colours, two colours, an image,
+  image blur, padding, roundness, shadow) each visibly change a rendered
+  frame; run on the synthetic package and on the real recording.
 - Synthetic iPhone recording (1180×2556, kind = device) → phone frame → MP4.
 - Scripted GUI run (`GLIDE_GUI_SELFTEST=1`): launch (opens on recording
   setup) → area picker opens over the display (screenshotted) and is
@@ -81,7 +87,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
   stop → editor opens the new project → export → Back to recording setup →
   the recording heads the recents list → reopen it → quit.
 - Real 5K display recording (Screen Recording granted to the terminal) →
-  export.
+  export, and the background check on it.
 - Window resize: Glide's own window resized to 1024×700 through the
   Accessibility API and read back. Masks, device frames and voice-over mixing checked on real
   footage with `glide frame` and ffmpeg.
@@ -141,6 +147,12 @@ transcription were exercised only through their code paths and test media.
   resize the recorded window (`glide resize-window`); on-screen window
   picker covering every display; warning when the built-in mic is off with
   the lid closed; Whisper captions.
+- 2026-10-11: background settings fix (Micky's report: no visible effect).
+  Full-screen recordings defaulted to 0 % padding, which hides the
+  background entirely; blur had nothing to soften on the smooth generated
+  wallpapers; roundness and shadow were in recording pixels, so a third of
+  the intended size on Retina recordings. Pixel-checked in tests and the
+  selftest.
 - 2026-10-11: native floating recording control bar.
 - 2026-10-11: live preview of the selected source on the recording canvas.
 - 2026-10-11: editor-first window: recording setup in the editor layout,
