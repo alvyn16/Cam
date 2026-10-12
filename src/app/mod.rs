@@ -31,6 +31,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId, WindowLevel};
 
+use crate::capture::preview as livecap;
 use crate::recorder::{self, Recorder, Target};
 use crate::render::Gpu;
 use editor::Editor;
@@ -103,6 +104,20 @@ enum Which {
     Widget,
     /// The picker overlay on this display.
     Overlay(u32),
+}
+
+/// Live preview state: the stream that's running (or starting) for which
+/// source, and the texture its frames go into.
+#[derive(Default)]
+struct Live {
+    /// Wanted source and since when (changes settle before restarting).
+    want: Option<livecap::Source>,
+    want_since: Option<Instant>,
+    running: Option<(livecap::Source, livecap::LivePreview)>,
+    starting: Option<(livecap::Source, std::sync::mpsc::Receiver<Result<livecap::LivePreview, String>>)>,
+    /// A source that failed to start (not retried until the source changes).
+    failed: Option<livecap::Source>,
+    tex: Option<egui::TextureHandle>,
 }
 
 /// Area picker state, in overlay-window points (= display points).
@@ -178,6 +193,10 @@ struct App {
     thumbs: Thumbs,
     recording: Option<Recording>,
     finishing: bool,
+    /// Live preview of the selected source on the recording-setup canvas.
+    live: Live,
+    /// The main window is minimised, hidden or fully covered.
+    main_occluded: bool,
     finished: Arc<Mutex<Option<Finished>>>,
     error: Option<String>,
     menubar: Option<menubar::MenuBar>,
@@ -219,6 +238,8 @@ impl App {
             thumbs: Thumbs::default(),
             recording: None,
             finishing: false,
+            live: Live::default(),
+            main_occluded: false,
             finished: Arc::new(Mutex::new(None)),
             error: None,
             menubar: None,
@@ -598,6 +619,7 @@ impl App {
         for c in cmds {
             self.handle(el, c);
         }
+        self.update_live();
         if let Some(rec) = &self.recording
             && rec.rec.is_none()
             && rec.countdown_until.is_some_and(|t| Instant::now() >= t)
@@ -652,9 +674,20 @@ impl App {
         match st.phase {
             0 if since > Duration::from_millis(800) => {
                 let start = matches!(self.view, View::Start);
-                log(&format!("launched main_window={} menubar={} start_view={start}", self.main.is_some(), self.menubar.is_some()));
+                // The display's live preview fills the canvas (when Screen
+                // Recording is allowed); give it a few seconds to arrive.
+                self.settings.source = SourceKind::Display;
+                let screen = crate::capture::tcc::screen_status() == crate::capture::tcc::Status::Granted;
+                if screen && self.live.tex.is_none() && since < Duration::from_secs(6) {
+                    return;
+                }
+                let live = self.live.tex.as_ref().map(|t| t.size());
+                log(&format!("launched main_window={} menubar={} start_view={start} live_preview={live:?}", self.main.is_some(), self.menubar.is_some()));
                 if !start {
                     fail("didn't open on recording setup".into());
+                }
+                if screen && live.is_none() {
+                    fail("no live preview frames".into());
                 }
                 st.phase = 10;
                 st.at = Instant::now();
@@ -741,7 +774,11 @@ impl App {
                         _ => {}
                     }
                     if st.resumed && r.elapsed() >= 3.0 {
-                        log(&format!("recording widget={} elapsed={:.1}s", self.widget.is_some(), r.elapsed()));
+                        let live = self.live.running.is_some() || self.live.starting.is_some();
+                        log(&format!("recording widget={} elapsed={:.1}s live_preview_running={live}", self.widget.is_some(), r.elapsed()));
+                        if live {
+                            fail("live preview kept running while recording".into());
+                        }
                         st.phase = 2;
                         push(Cmd::ToggleRecording);
                     }
@@ -835,7 +872,19 @@ impl App {
         let was = home::CAPTURING_SHORTCUT.swap(false, Ordering::Relaxed);
         let note = self.permission_note.clone();
         let action = match &mut self.view {
-            View::Start => home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref()),
+            View::Start => {
+                if let Some((_, p)) = &self.live.running
+                    && let Some(f) = p.take_frame()
+                {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                    match &mut self.live.tex {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => self.live.tex = Some(ui.ctx().load_texture("live-preview", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
+                let live = self.live.tex.as_ref().filter(|_| self.live.running.is_some()).map(|t| (t.id(), t.size_vec2()));
+                home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref(), live)
+            }
             View::Editor(ed) => {
                 let mut chrome = home::Chrome {
                     settings: &mut self.settings,
@@ -891,6 +940,73 @@ impl App {
             }
             home::Action::Back => self.close_project(),
             home::Action::None => {}
+        }
+    }
+
+    /// The source to preview live, if the recording-setup canvas is showing
+    /// and nothing is being recorded.
+    fn live_source(&self) -> Option<livecap::Source> {
+        let visible = self.main.as_ref().is_some_and(|w| w.window.is_visible() != Some(false)) && !self.main_occluded;
+        if !matches!(self.view, View::Start) || !visible || self.recording.is_some() || self.finishing {
+            return None;
+        }
+        if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted {
+            return None;
+        }
+        let s = &self.settings;
+        match s.source {
+            SourceKind::Display => Some(livecap::Source::Display { id: s.display }),
+            SourceKind::Area if s.area[2] >= 8.0 && s.area[3] >= 8.0 => Some(livecap::Source::Area { display: s.display, rect: s.area }),
+            SourceKind::Window => s.window.map(|id| livecap::Source::Window { id }),
+            _ => None,
+        }
+    }
+
+    /// Start, switch or stop the live preview to match what's on screen.
+    /// Streams start and stop on background threads.
+    fn update_live(&mut self) {
+        let want = self.live_source();
+        let live = &mut self.live;
+        if want != live.want {
+            live.want = want.clone();
+            live.want_since = Some(Instant::now());
+            live.failed = None;
+        }
+        if live.running.as_ref().is_some_and(|(src, _)| Some(src) != want.as_ref()) {
+            let (_, p) = live.running.take().unwrap();
+            std::thread::spawn(move || drop(p));
+            live.tex = None;
+        }
+        if let Some((src, rx)) = &live.starting
+            && let Ok(result) = rx.try_recv()
+        {
+            let src = src.clone();
+            live.starting = None;
+            match result {
+                Ok(p) if Some(&src) == want.as_ref() && live.running.is_none() => live.running = Some((src, p)),
+                Ok(p) => drop(std::thread::spawn(move || drop(p))),
+                Err(e) => {
+                    eprintln!("glide: live preview: {e}");
+                    live.failed = Some(src);
+                }
+            }
+        }
+        // Wait for edits (an area being typed in) to settle before starting.
+        let settled = live.want_since.is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
+        if let Some(src) = want
+            && settled
+            && live.running.is_none()
+            && live.starting.is_none()
+            && live.failed.as_ref() != Some(&src)
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let start = src.clone();
+            std::thread::spawn(move || {
+                let r = objc2::rc::autoreleasepool(|_| livecap::LivePreview::start(&start, 1280, 10, wake)).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(r);
+                wake();
+            });
+            live.starting = Some((src, rx));
         }
     }
 
@@ -1425,6 +1541,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(which) = self.which(id) else { return };
+        if let (Which::Main, WindowEvent::Occluded(o)) = (which, &event) {
+            self.main_occluded = *o;
+            self.update_live();
+        }
         if matches!(event, WindowEvent::CloseRequested) {
             match which {
                 Which::Main => {

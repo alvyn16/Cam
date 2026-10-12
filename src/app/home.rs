@@ -747,8 +747,17 @@ impl Chrome<'_> {
 
 /// The window with no recording open: the editor's layout with recording
 /// setup in the inspector, a big Record button on the canvas and an empty
-/// timeline.
-pub fn start_view(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, projects: &[ProjectEntry], thumbs: &mut Thumbs, permission_note: Option<&str>) -> Action {
+/// timeline. `live` is the selected source's live preview (texture and
+/// size), drawn filling the canvas under the Record button.
+pub fn start_view(
+    ui: &mut Ui,
+    s: &mut Settings,
+    dev: &mut Devices,
+    projects: &[ProjectEntry],
+    thumbs: &mut Thumbs,
+    permission_note: Option<&str>,
+    live: Option<(egui::TextureId, egui::Vec2)>,
+) -> Action {
     let mut chrome = Chrome { settings: s, devices: dev, projects, thumbs, action: Action::None };
     let p = pal(ui);
     egui::Panel::top("editor-toolbar")
@@ -811,32 +820,63 @@ pub fn start_view(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, projects: &[
         .show(ui, |ui| {
             let s = &*chrome.settings;
             let mut a = Action::None;
-            ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() / 2.0 - 130.0).max(16.0));
-                let hk = s.hotkeys.record_label();
-                if widgets::record_button(ui, 96.0, false).on_hover_text(format!("Start recording {hk}")).clicked() {
-                    a = Action::Record;
-                }
-                ui.add_space(14.0);
-                ui.label(RichText::new(format!("Record {}", source_name(s.source).to_lowercase())).font(theme::semibold(20.0)));
-                ui.add_space(4.0);
-                caption(ui, &source_summary(s, chrome.devices));
-                let next = match s.source {
-                    SourceKind::Area => "You'll drag to select the area next.",
-                    SourceKind::Window if s.window.is_none() => "You'll pick the window on screen next.",
-                    _ if s.countdown => "Recording starts after a 3 s countdown.",
-                    _ => "",
+            let canvas = ui.available_rect_before_wrap();
+            if let Some((tex, size)) = live {
+                // The source, live, as large as the canvas allows.
+                let area = canvas.shrink(24.0);
+                let fit = (area.width() / size.x).min(area.height() / size.y);
+                let rect = egui::Rect::from_center_size(area.center(), size * fit);
+                let shadow = egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(60) };
+                ui.painter().add(shadow.as_shape(rect, CornerRadius::same(6)));
+                egui::Image::new((tex, size)).corner_radius(6).paint_at(ui, rect);
+                let badge = egui::Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(104.0, 22.0));
+                ui.painter().rect_filled(badge, CornerRadius::same(11), Color32::from_black_alpha(150));
+                ui.painter().circle_filled(badge.left_center() + vec2(12.0, 0.0), 4.0, Color32::from_rgb(255, 69, 58));
+                ui.painter().text(badge.left_center() + vec2(22.0, 0.0), egui::Align2::LEFT_CENTER, "Live preview", egui::FontId::proportional(11.0), Color32::WHITE);
+            }
+            // Record button and what it will capture, on a card over the
+            // preview (or on its own without one).
+            let card = egui::Rect::from_center_size(canvas.center(), vec2(440.0, 300.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+                let frame = if live.is_some() {
+                    egui::Frame::new().fill(Color32::from_black_alpha(200)).corner_radius(CornerRadius::same(18)).inner_margin(egui::Margin::same(22))
+                } else {
+                    egui::Frame::new().inner_margin(egui::Margin::same(22))
                 };
-                if !next.is_empty() {
-                    caption(ui, next);
-                }
-                caption(ui, &format!("Shortcut {hk}"));
-                ui.add_space(18.0);
-                if ui.button("Open a recording…").clicked()
-                    && let Some(f) = rfd::FileDialog::new().set_directory(s.dir()).pick_folder()
-                {
-                    a = Action::Open(f);
-                }
+                frame.show(ui, |ui| {
+                    ui.set_width(card.width() - 44.0);
+                    // On the dark card the text is always light.
+                    let (strong, weak) = if live.is_some() { (Color32::WHITE, Color32::from_white_alpha(190)) } else { (pal(ui).text, pal(ui).secondary) };
+                    let sub = |ui: &mut Ui, t: &str| {
+                        ui.label(RichText::new(t).size(12.0).color(weak));
+                    };
+                    ui.vertical_centered(|ui| {
+                        let hk = s.hotkeys.record_label();
+                        if widgets::record_button(ui, 88.0, false).on_hover_text(format!("Start recording {hk}")).clicked() {
+                            a = Action::Record;
+                        }
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(format!("Record {}", source_name(s.source).to_lowercase())).font(theme::semibold(20.0)).color(strong));
+                        ui.add_space(4.0);
+                        sub(ui, &source_summary(s, chrome.devices));
+                        let next = match s.source {
+                            SourceKind::Area => "You'll drag to select the area next.",
+                            SourceKind::Window if s.window.is_none() => "You'll pick the window on screen next.",
+                            _ if s.countdown => "Recording starts after a 3 s countdown.",
+                            _ => "",
+                        };
+                        if !next.is_empty() {
+                            sub(ui, next);
+                        }
+                        sub(ui, &format!("Shortcut {hk}"));
+                        ui.add_space(14.0);
+                        if ui.button("Open a recording…").clicked()
+                            && let Some(f) = rfd::FileDialog::new().set_directory(s.dir()).pick_folder()
+                        {
+                            a = Action::Open(f);
+                        }
+                    });
+                });
             });
             chrome.set(a);
         });

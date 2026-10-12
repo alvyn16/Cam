@@ -97,6 +97,10 @@ pub fn windows() -> Result<Vec<WindowInfo>> {
 /// Find a window by numeric ID, or case-insensitive substring of
 /// "<app> <title>". Prefers the largest match.
 pub fn find_window(sel: &str) -> Result<WindowInfo> {
+    // An empty selector would match every window.
+    if sel.trim().is_empty() {
+        bail!("no window given (use an id from `glide devices` or part of its name)");
+    }
     let ws = windows()?;
     if let Ok(id) = sel.parse::<u32>() {
         if let Some(w) = ws.into_iter().find(|w| w.id == id) {

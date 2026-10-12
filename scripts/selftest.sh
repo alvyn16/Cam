@@ -51,18 +51,18 @@ if [ "${1:-}" = "--screen" ]; then
   else
     ko "real display recording (Screen Recording permission?)"
   fi
-  # Resize Glide's own window (only that exact window, by id) through the
+  # Resize Glide's own window (only that exact window, by its process) through the
   # Accessibility API, as the Window source's Resize menu does.
   if "$G" permissions 2>/dev/null | grep -q 'Accessibility: *Authorized'; then
     GLIDE_OUTPUT_DIR="$OUT/gui" "$G" gui >"$OUT/resize.log" 2>&1 &
     gpid=$!
-    wid=""
+    # Find its window by process id (CoreGraphics; no ScreenCaptureKit).
+    resized=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       sleep 1
-      wid=$("$G" devices 2>/dev/null | sed -n 's/^ *\([0-9][0-9]*\)  glide — Glide (.*/\1/p' | head -1)
-      [ -n "$wid" ] && break
+      if "$G" resize-window "pid:$gpid" 1024x700 >>"$OUT/resize.log" 2>&1; then resized=1; break; fi
     done
-    if [ -n "$wid" ] && "$G" resize-window "$wid" 1024x700 >>"$OUT/resize.log" 2>&1 && grep -q '→ 1024×700' "$OUT/resize.log"; then
+    if [ -n "$resized" ] && grep -q '→ 1024×700' "$OUT/resize.log"; then
       ok "window resize (Accessibility)"
     else
       ko "window resize"

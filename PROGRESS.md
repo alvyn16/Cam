@@ -57,6 +57,7 @@ Milestones and parity track the checklist in `analysis/SCREEN_STUDIO.md`.
 | E7 | Progress, cancel, quick export | ☑ | "Export & copy" banner after recording. |
 | E8 | Size-targeted export | ☑ | Not in Screen Studio 3.7.1; Glide's "Fit to file size" (MP4) stays at or under the target, re-encoding once if the first pass overshoots. |
 | P1 | Projects library | ☑ | `~/Movies/Glide`, autosave. Editor-first window (Micky's request): no separate library or New-recording screen; recent recordings (with rendered thumbnails) are a popover off the window title, plus Open… and the projects folder. |
+| P5 | Live source preview | ☑ | Recording setup shows the selected display, area or window live, filling the canvas under the Record button (Micky's request; Screen Studio does the same). Separate ScreenCaptureKit stream at 10 fps, 1280 px, cursor shown, Glide's own windows excluded; restarts when the source changes (after 300 ms of no edits), stops while recording, when the window is hidden, minimised or covered, and when a recording is open. iPhone sources show no preview. The GUI selftest checks frames arrive and that it's off while recording. |
 | P2 | Style presets | ☑ | Save/apply/delete, default preset for new recordings. |
 | P3 | Editor sidebar + selection inspector | ☑ | |
 | P4 | Menu bar | ☑ | Record display/window/area, pause, status with elapsed time. |
@@ -140,6 +141,7 @@ transcription were exercised only through their code paths and test media.
   resize the recorded window (`glide resize-window`); on-screen window
   picker covering every display; warning when the built-in mic is off with
   the lid closed; Whisper captions.
+- 2026-10-11: live preview of the selected source on the recording canvas.
 - 2026-10-11: editor-first window: recording setup in the editor layout,
   recents popover off the title, compact Record + source menu in the
   editor's title bar; no separate library screen.

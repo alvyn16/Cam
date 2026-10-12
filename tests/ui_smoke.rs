@@ -126,12 +126,19 @@ fn editor_and_home_render_every_panel() {
 
     // Start view (no recording open) with this folder as the library, every
     // source, the recents popover and the permission note.
-    for source in [home::SourceKind::Display, home::SourceKind::Window, home::SourceKind::Area, home::SourceKind::Device] {
+    // With and without a live preview texture under the Record button.
+    let tex = ctx.load_texture("live", egui::ColorImage::new([64, 40], vec![egui::Color32::DARK_GRAY; 64 * 40]), egui::TextureOptions::LINEAR);
+    for (source, live) in [
+        (home::SourceKind::Display, Some((tex.id(), tex.size_vec2()))),
+        (home::SourceKind::Window, None),
+        (home::SourceKind::Area, Some((tex.id(), tex.size_vec2()))),
+        (home::SourceKind::Device, None),
+    ] {
         settings.source = source;
         for _ in 0..2 {
             t += 0.016;
             frame(&ctx, t, |ui| {
-                let a = home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, Some("permission note"));
+                let a = home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, Some("permission note"), live);
                 assert!(matches!(a, home::Action::None));
             });
         }

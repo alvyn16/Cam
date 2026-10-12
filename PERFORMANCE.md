@@ -98,6 +98,13 @@ time; all 20 words correct. The first run also downloads the model
 (148 MB, ~8 s here), and the first run of a newly built binary takes
 about 6 s while Metal compiles whisper.cpp's shaders.
 
+## Live source preview
+
+Recording setup shows the selected source live (ScreenCaptureKit, 10 fps,
+1280 px long edge, copied into an egui texture): the release build used
+6.1 % of one core over 10 s with it on screen, and 0 % with the window
+hidden (the stream stops). It starts in about 0.2 s (`glide preview`).
+
 ## Idle
 
 With a project open in the editor and nothing playing, the app used 0.00 s

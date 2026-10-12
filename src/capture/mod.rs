@@ -8,6 +8,7 @@ pub mod camera;
 pub mod compose;
 pub mod mixer;
 pub mod pattern;
+pub mod preview;
 pub mod record;
 pub mod screen;
 pub mod tcc;

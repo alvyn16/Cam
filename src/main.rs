@@ -129,6 +129,9 @@ enum Cmd {
         /// Also draw the recent-recordings popover.
         #[arg(long)]
         recents: bool,
+        /// Start view: show a live preview (display or synthetic).
+        #[arg(long, value_parser = ["display", "synthetic"])]
+        live: Option<String>,
         #[arg(short, long)]
         output: PathBuf,
     },
@@ -161,7 +164,20 @@ enum Cmd {
         #[arg(long, default_value = "whisper-base")]
         engine: String,
     },
-    /// Resize a window (id or name, see `glide devices`) to WxH points before recording it.
+    /// Run the live source preview for a while; save the last frame as PNG.
+    #[command(hide = true)]
+    Preview {
+        #[arg(long)]
+        window: Option<String>,
+        /// x,y,w,h in points on the main display.
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long, default_value_t = 2.0)]
+        secs: f64,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Resize a window (id, name, or pid:<process id>; see `glide devices`) to WxH points.
     ResizeWindow { window: String, size: String },
     /// List where content under a blur/pixelate mask moves ("data may be visible").
     CheckMasks { project: PathBuf },
@@ -234,7 +250,7 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, window, recents, output }) => {
+        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, window, recents, live, output }) => {
             use glide::app::editor::Tab;
             let tab = tab.map(|t| {
                 Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
@@ -250,17 +266,64 @@ fn main() -> Result<()> {
                 size: (1320.0, 840.0),
                 window,
                 recents,
+                live,
             };
             glide::app::snapshot::render(&shot, &output)?;
             println!("{}", output.display());
             Ok(())
         }
+        Some(Cmd::Preview { window, area, secs, output }) => {
+            use glide::capture::preview::{LivePreview, Source};
+            let source = if let Some(w) = window {
+                Source::Window { id: glide::capture::screen::find_window(&w)?.id }
+            } else if let Some(a) = area {
+                let v: Vec<f64> = a.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
+                anyhow::ensure!(v.len() == 4, "--area expects x,y,w,h");
+                Source::Area { display: 0, rect: [v[0], v[1], v[2], v[3]] }
+            } else {
+                Source::Display { id: 0 }
+            };
+            let frames = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counter = frames.clone();
+            let t0 = Instant::now();
+            let p = LivePreview::start(&source, 1280, 10, move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })?;
+            let started = t0.elapsed().as_secs_f64();
+            let mut last = None;
+            let until = Instant::now() + std::time::Duration::from_secs_f64(secs);
+            while Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Some(f) = p.take_frame() {
+                    last = Some(f);
+                }
+            }
+            drop(p);
+            let n = frames.load(std::sync::atomic::Ordering::Relaxed);
+            let f = last.ok_or_else(|| anyhow::anyhow!("no preview frames"))?;
+            image::save_buffer(&output, &f.rgba, f.width, f.height, image::ExtendedColorType::Rgba8)?;
+            println!("{source:?}: started in {started:.2} s, {n} frames in {secs:.1} s, {}x{} → {}", f.width, f.height, output.display());
+            Ok(())
+        }
         Some(Cmd::ResizeWindow { window, size }) => {
             let (w, h) = size.split_once(['x', '×']).ok_or_else(|| anyhow::anyhow!("size must look like 1920x1080"))?;
             let (w, h): (f64, f64) = (w.trim().parse()?, h.trim().parse()?);
-            let win = glide::capture::screen::find_window(&window)?;
-            let got = glide::capture::winsize::resize(win.id, w, h)?;
-            println!("{} — {}: {:.0}×{:.0} → {:.0}×{:.0}", win.app, win.title, win.size.0, win.size.1, got.0, got.1);
+            // A window id needs no ScreenCaptureKit lookup (which can stall).
+            let pid = window.strip_prefix("pid:").and_then(|p| p.parse::<i32>().ok());
+            let (id, label) = match (pid, window.parse::<u32>()) {
+                (Some(pid), _) => {
+                    let id = glide::capture::winsize::window_of_pid(pid).ok_or_else(|| anyhow::anyhow!("process {pid} has no window on screen"))?;
+                    (id, format!("window {id}"))
+                }
+                (None, Ok(id)) => (id, format!("window {id}")),
+                (None, Err(_)) => {
+                    let w = glide::capture::screen::find_window(&window)?;
+                    (w.id, format!("{} — {}", w.app, w.title))
+                }
+            };
+            let before = glide::capture::winsize::window_size(id)?;
+            let got = glide::capture::winsize::resize(id, w, h)?;
+            println!("{label}: {:.0}×{:.0} → {:.0}×{:.0}", before.0, before.1, got.0, got.1);
             Ok(())
         }
         Some(Cmd::CheckMasks { project }) => {

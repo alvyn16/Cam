@@ -27,6 +27,9 @@ pub struct Shot<'a> {
     pub window: bool,
     /// Draw the recent-recordings popover under the title.
     pub recents: bool,
+    /// Start view: show a live preview, of the main display ("display") or
+    /// of Glide's synthetic demo screen ("synthetic").
+    pub live: Option<String>,
 }
 
 pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
@@ -69,6 +72,32 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
     }
     let projects = home::scan_projects(&settings.dir());
     let mut thumbs = Thumbs::default();
+    // A real frame from the live preview stream (main display).
+    let live_tex = match shot.live.as_deref().filter(|_| editor.is_none()) {
+        Some("synthetic") => {
+            let (w, h) = (1440u32, 900u32);
+            let mut px = crate::synth::screen_bgra(w, h, 0.0);
+            for p in px.chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+            Some(ctx.load_texture("live-preview", egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px), egui::TextureOptions::LINEAR))
+        }
+        Some(_) => {
+            let p = crate::capture::preview::LivePreview::start(&crate::capture::preview::Source::Display { id: 0 }, 1280, 10, || {})?;
+            let t0 = std::time::Instant::now();
+            let frame = loop {
+                if let Some(f) = p.take_frame() {
+                    break f;
+                }
+                anyhow::ensure!(t0.elapsed().as_secs() < 5, "no live preview frame");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
+            Some(ctx.load_texture("live-preview", img, egui::TextureOptions::LINEAR))
+        }
+        None => None,
+    };
+    let live = live_tex.as_ref().map(|t| (t.id(), t.size_vec2()));
 
     let mut last = None;
     for i in 0..8 {
@@ -105,7 +134,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
                     ed.ui(ui, &mut renderer, &mut chrome);
                 }
                 None => {
-                    home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, None);
+                    home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, None, live);
                 }
             }
             // The popover itself (a menu only opens from a click).

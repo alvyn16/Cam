@@ -167,8 +167,102 @@ fn display_in(bounds: &[CGRect], r: CGRect) -> Option<CGRect> {
 }
 
 fn display_for(r: CGRect) -> Option<CGRect> {
-    let ds = screen::displays().ok()?;
-    display_in(&ds.iter().map(|d| CGDisplayBounds(d.id)).collect::<Vec<_>>(), r)
+    display_in(&display_bounds(), r)
+}
+
+/// Bounds of the active displays, straight from CoreGraphics (no
+/// ScreenCaptureKit round trip, which can stall for seconds).
+fn display_bounds() -> Vec<CGRect> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    }
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    // SAFETY: the buffer holds 16 ids; n says how many were filled.
+    if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != 0 {
+        return vec![];
+    }
+    ids[..n as usize].iter().map(|&id| CGDisplayBounds(id)).collect()
+}
+
+/// The frontmost normal on-screen window of process `pid`, from the
+/// CoreGraphics window list.
+pub fn window_of_pid(pid: i32) -> Option<u32> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> AxRef;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: AxRef, key: AxRef) -> AxRef;
+        fn CFNumberGetValue(number: AxRef, kind: isize, out: *mut c_void) -> bool;
+    }
+    const ON_SCREEN_ONLY: u32 = 1;
+    const SINT32: isize = 3;
+    // SAFETY: a +1 array of dictionaries; values are borrowed while it lives,
+    // and the key strings outlive the lookups.
+    unsafe {
+        let list = Owned(CGWindowListCopyWindowInfo(ON_SCREEN_ONLY, 0));
+        if list.0.is_null() {
+            return None;
+        }
+        let keys = [attr("kCGWindowOwnerPID"), attr("kCGWindowLayer"), attr("kCGWindowNumber")];
+        let int = |info: AxRef, k: usize| {
+            let v = CFDictionaryGetValue(info, CFRetained::as_ptr(&keys[k]).as_ptr() as AxRef);
+            let mut n = 0i32;
+            (!v.is_null() && CFNumberGetValue(v, SINT32, &mut n as *mut i32 as *mut c_void)).then_some(n)
+        };
+        (0..CFArrayGetCount(list.0))
+            .map(|i| CFArrayGetValueAtIndex(list.0, i))
+            .find(|&info| int(info, 0) == Some(pid) && int(info, 1) == Some(0))
+            .and_then(|info| int(info, 2))
+            .map(|n| n as u32)
+    }
+}
+
+/// Size (points) of window `id`, from the CoreGraphics window list.
+pub fn window_size(id: u32) -> Result<(f64, f64)> {
+    owner_and_frame(id).map(|(_, f)| (f.size.width, f.size.height))
+}
+
+/// Owning process and frame (points, top-left origin) of window `id`, from
+/// the CoreGraphics window list.
+fn owner_and_frame(id: u32) -> Result<(i32, CGRect)> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> AxRef;
+        fn CGRectMakeWithDictionaryRepresentation(dict: AxRef, rect: *mut CGRect) -> bool;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dict: AxRef, key: AxRef) -> AxRef;
+        fn CFNumberGetValue(number: AxRef, kind: isize, out: *mut c_void) -> bool;
+    }
+    const INCLUDING_WINDOW: u32 = 1 << 3;
+    const SINT32: isize = 3;
+    // SAFETY: CGWindowListCopyWindowInfo returns a +1 array of dictionaries;
+    // values read from them are borrowed while `list` is alive.
+    unsafe {
+        let list = Owned(CGWindowListCopyWindowInfo(INCLUDING_WINDOW, id));
+        if list.0.is_null() || CFArrayGetCount(list.0) == 0 {
+            bail!("that window is no longer on screen");
+        }
+        let info = CFArrayGetValueAtIndex(list.0, 0);
+        // The key strings must outlive the lookups.
+        let (pid_key, bounds_key) = (attr("kCGWindowOwnerPID"), attr("kCGWindowBounds"));
+        let pid_ref = CFDictionaryGetValue(info, CFRetained::as_ptr(&pid_key).as_ptr() as AxRef);
+        let bounds_ref = CFDictionaryGetValue(info, CFRetained::as_ptr(&bounds_key).as_ptr() as AxRef);
+        let mut pid = 0i32;
+        if pid_ref.is_null() || !CFNumberGetValue(pid_ref, SINT32, &mut pid as *mut i32 as *mut c_void) {
+            bail!("window has no owning app");
+        }
+        let mut frame = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0));
+        if bounds_ref.is_null() || !CGRectMakeWithDictionaryRepresentation(bounds_ref, &mut frame) {
+            bail!("couldn't read the window's frame");
+        }
+        Ok((pid, frame))
+    }
 }
 
 /// Size (points) of the display showing each window, to rule out sizes
@@ -208,11 +302,10 @@ pub fn raise(id: u32) -> Result<()> {
     if !trusted(true) {
         bail!("Glide needs Accessibility access to bring windows to the front");
     }
-    let info = screen::windows()?.into_iter().find(|w| w.id == id).context("that window is no longer on screen")?;
-    // SAFETY: SCWindow/SCRunningApplication accessors and plain AX calls.
+    let (pid, frame) = owner_and_frame(id)?;
+    // SAFETY: plain AX calls on elements we hold.
     unsafe {
-        let pid = info.window.owningApplication().map(|a| a.processID()).context("window has no owning app")?;
-        let (app, win) = find_ax_window(pid, id, info.window.frame()).context("couldn't find that window through Accessibility")?;
+        let (app, win) = find_ax_window(pid, id, frame).context("couldn't find that window through Accessibility")?;
         AXUIElementPerformAction(win.0, CFRetained::as_ptr(&attr("AXRaise")).as_ptr() as AxRef);
         AXUIElementSetAttributeValue(app.0, CFRetained::as_ptr(&attr("AXFrontmost")).as_ptr() as AxRef, kCFBooleanTrue);
     }
@@ -226,11 +319,7 @@ pub fn resize(id: u32, width: f64, height: f64) -> Result<(f64, f64)> {
     if !trusted(true) {
         bail!("Glide needs Accessibility access to resize windows (System Settings › Privacy & Security › Accessibility)");
     }
-    let info = screen::windows()?.into_iter().find(|w| w.id == id).context("that window is no longer on screen")?;
-    // SAFETY: SCWindow accessors.
-    let (pid, frame) = unsafe {
-        (info.window.owningApplication().map(|a| a.processID()).context("window has no owning app")?, info.window.frame())
-    };
+    let (pid, frame) = owner_and_frame(id)?;
     let (_app, win) = find_ax_window(pid, id, frame).context("couldn't find that window through Accessibility")?;
     let current = get_rect(win.0).unwrap_or(frame);
     let mut origin = current.origin;
