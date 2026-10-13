@@ -25,6 +25,18 @@ pub const TRAFFIC_LIGHTS: (f64, f64) = (14.0, TOOLBAR_H as f64);
 /// Horizontal room the traffic lights need from the window's left edge.
 pub const TRAFFIC_LIGHTS_W: f32 = 88.0;
 
+/// Whether the main window is in full screen, where AppKit hides the traffic
+/// lights (set from redraw).
+pub static FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The display the main window is full screen on (0 when it isn't).
+pub static FULLSCREEN_DISPLAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Left inset of the toolbar's content: past the traffic lights, or a plain
+/// margin in full screen, where there are none.
+pub fn toolbar_left() -> i8 {
+    if FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) { 16 } else { TRAFFIC_LIGHTS_W as i8 }
+}
+
 static ACCENT: AtomicU32 = AtomicU32::new(u32::from_be_bytes([0x00, 0x7a, 0xff, 0xff]));
 
 pub fn accent() -> Color32 {

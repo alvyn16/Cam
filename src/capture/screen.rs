@@ -49,6 +49,14 @@ fn shareable_content() -> Result<Retained<SCShareableContent>> {
     }
 }
 
+/// This process as ScreenCaptureKit sees it (None before it has a window), to
+/// exclude every window it owns, including ones it opens later (AppKit's
+/// full-screen titlebar window, menus, popovers).
+pub fn own_app() -> Result<Option<Retained<SCRunningApplication>>> {
+    let me = std::process::id() as i32;
+    Ok(unsafe { shareable_content()?.applications() }.iter().find(|a| unsafe { a.processID() } == me))
+}
+
 pub fn displays() -> Result<Vec<DisplayInfo>> {
     let content = shareable_content()?;
     let mut out = vec![];

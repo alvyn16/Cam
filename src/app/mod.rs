@@ -1386,6 +1386,7 @@ impl App {
             system_level: Some(live.levels[0]),
             mic_level: Some(live.levels[1]),
             note,
+            covered: covered_note(s),
         }
     }
 
@@ -1765,6 +1766,11 @@ impl App {
         let Some(which) = self.which(id) else { return };
         let Some(gpu) = self.gpu.clone() else { return };
         let Some(mut win) = self.take_window(which) else { return };
+        if which == Which::Main {
+            let fs = macos::fullscreen_display(&win.window);
+            theme::FULLSCREEN.store(fs.is_some() || macos::is_fullscreen(&win.window), std::sync::atomic::Ordering::Relaxed);
+            theme::FULLSCREEN_DISPLAY.store(fs.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        }
         let input = win.egui.take_egui_input(&win.window);
         let ctx = win.ctx.clone();
         let renderer = &mut win.renderer;
@@ -1992,4 +1998,13 @@ pub fn run(open: Option<PathBuf>) -> Result<()> {
     let mut app = App::new(open);
     el.run_app(&mut app)?;
     Ok(())
+}
+
+/// When Glide is full screen on the display it would record, that display
+/// shows nothing but Glide (left out of the capture): say so over the preview.
+fn covered_note(s: &home::Settings) -> Option<String> {
+    let fs = theme::FULLSCREEN_DISPLAY.load(std::sync::atomic::Ordering::Relaxed);
+    let target = if s.display == 0 { macos::main_display() } else { s.display };
+    (fs != 0 && matches!(s.source, SourceKind::Display | SourceKind::Area) && fs == target)
+        .then(|| "Glide is full screen on this display, so there's nothing else to show.\nExit full screen to see what you'll record.".into())
 }

@@ -122,6 +122,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         system_level: synthetic.then_some(0.3),
         mic_level: synthetic.then_some(0.6),
         note: None,
+        covered: None,
     };
 
     let mut last = None;

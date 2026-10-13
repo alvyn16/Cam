@@ -835,6 +835,8 @@ pub struct LiveView {
     pub system_level: Option<f32>,
     pub mic_level: Option<f32>,
     pub note: Option<String>,
+    /// Shown over the live screen (e.g. Glide itself covers the display).
+    pub covered: Option<String>,
 }
 
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
@@ -898,7 +900,7 @@ pub fn start_view(
     let p = pal(ui);
     egui::Panel::top("start-toolbar")
         .exact_size(theme::TOOLBAR_H)
-        .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::TRAFFIC_LIGHTS_W as i8, right: 12, top: 0, bottom: 0 }))
+        .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::toolbar_left(), right: 12, top: 0, bottom: 0 }))
         .show(ui, |ui| {
             super::toolbar_drag(ui);
             ui.horizontal_centered(|ui| {
@@ -995,6 +997,13 @@ pub fn start_view(
                     let min = area.center() - size * fit / 2.0;
                     let rect = egui::Rect::from_min_size(egui::pos2(snap(min.x), snap(min.y)), size * fit);
                     egui::Image::new((tex, size)).corner_radius(6).paint_at(ui, rect);
+                    if let Some(note) = &live.covered {
+                        let font = egui::FontId::proportional(13.0);
+                        let galley = ui.painter().layout(note.clone(), font, p.secondary, rect.width() - 48.0);
+                        let card = egui::Rect::from_center_size(rect.center(), galley.size() + vec2(32.0, 20.0));
+                        ui.painter().rect_filled(card, CornerRadius::same(8), Color32::from_black_alpha(150));
+                        ui.painter().galley(card.min + vec2(16.0, 10.0), galley, p.secondary);
+                    }
                     rect
                 }
                 None => {

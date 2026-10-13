@@ -760,7 +760,7 @@ impl Editor {
         // Toolbar.
         egui::Panel::top("editor-toolbar")
             .exact_size(theme::TOOLBAR_H)
-            .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::TRAFFIC_LIGHTS_W as i8, right: 12, top: 0, bottom: 0 }))
+            .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::toolbar_left(), right: 12, top: 0, bottom: 0 }))
             .show(ui, |ui| {
                 super::toolbar_drag(ui);
                 ui.horizontal_centered(|ui| {

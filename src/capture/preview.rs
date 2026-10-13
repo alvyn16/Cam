@@ -251,13 +251,17 @@ impl LivePreview {
             let (filter, size, px) = match source {
                 Source::Display { id } | Source::Area { display: id, .. } => {
                     let d = display_for(*id)?;
-                    let me = std::process::id() as i32;
-                    let mine: Vec<Retained<SCWindow>> = screen::windows()?
-                        .into_iter()
-                        .filter(|w| w.window.owningApplication().is_some_and(|a| a.processID() == me))
-                        .map(|w| w.window)
-                        .collect();
-                    let filter = SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &d.display, &NSArray::from_retained_slice(&mine));
+                    // Our own windows stay out, by application so windows
+                    // opened later (the full-screen titlebar) do too.
+                    let filter = match screen::own_app()? {
+                        Some(app) => SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                            SCContentFilter::alloc(),
+                            &d.display,
+                            &NSArray::from_retained_slice(&[app]),
+                            &NSArray::new(),
+                        ),
+                        None => SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &d.display, &NSArray::new()),
+                    };
                     let size = match source {
                         Source::Area { rect, .. } => {
                             conf.setSourceRect(CGRect::new(CGPoint::new(rect[0], rect[1]), CGSize::new(rect[2], rect[3])));

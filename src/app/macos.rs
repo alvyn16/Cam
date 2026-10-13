@@ -17,12 +17,41 @@ fn ns_window(window: &Window) -> Option<objc2::rc::Retained<NSWindow>> {
 }
 
 
+/// Whether the window is in (native) full screen.
+pub fn is_fullscreen(window: &Window) -> bool {
+    ns_window(window).is_some_and(|w| w.styleMask().contains(objc2_app_kit::NSWindowStyleMask::FullScreen))
+}
+
+/// The display the window is full screen on, if it is (display 0 for the
+/// main display is resolved to its ID).
+pub fn fullscreen_display(window: &Window) -> Option<u32> {
+    use objc2_foundation::NSNumber;
+    if !is_fullscreen(window) {
+        return None;
+    }
+    let screen = ns_window(window)?.screen()?;
+    let n = screen.deviceDescription().objectForKey(&crate::util::ns("NSScreenNumber"))?;
+    n.downcast::<NSNumber>().ok().map(|n| n.unsignedIntValue())
+}
+
+/// The main display's ID (what display 0 means).
+pub fn main_display() -> u32 {
+    // SAFETY: plain CoreGraphics query.
+    unsafe { CGMainDisplayID() }
+}
+
 /// Move the close/minimise/zoom buttons so they start `x` points from the left and are
 /// vertically centred in a titlebar area `bar_h` points tall (our toolbar). AppKit lays the
 /// titlebar out again on show, resize and fullscreen changes, so this is re-applied from
 /// redraw; it returns early when the buttons are already in place.
 pub fn inset_traffic_lights(window: &Window, x: f64, bar_h: f64) {
     let Some(win) = ns_window(window) else { return };
+    // In full screen the titlebar lives in AppKit's own reveal window, which
+    // slides down over the content; moving its views there leaves a stray
+    // band and line at the top of the screen.
+    if win.styleMask().contains(objc2_app_kit::NSWindowStyleMask::FullScreen) {
+        return;
+    }
     let (Some(close), Some(mini), Some(zoom)) = (
         win.standardWindowButton(NSWindowButton::CloseButton),
         win.standardWindowButton(NSWindowButton::MiniaturizeButton),

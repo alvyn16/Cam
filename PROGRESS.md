@@ -197,3 +197,13 @@ transcription were exercised only through their code paths and test media.
   on the GPU (MPS) to exactly the canvas's pixels, and drawn 1:1,
   pixel-aligned, from the frame's IOSurface (no CPU copy or upload). Camera
   bubble at 720 px / 30 fps.
+
+- Full screen fix (Micky's report: the UI breaks in full screen). The
+  traffic-light inset moved AppKit's full-screen titlebar views, leaving a
+  stray band and line at the top; the toolbar kept 88 pt for traffic lights
+  that full screen hides; and the preview excluded only the windows Glide had
+  at start, so the full-screen titlebar window showed up in it. Now the inset
+  skips full screen, the toolbar margin follows it, the preview excludes
+  Glide by application, and when Glide covers the display it would record the
+  preview says so instead of showing a black void. Checked at min size,
+  maximised, full screen and back.
