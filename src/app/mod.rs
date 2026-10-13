@@ -192,7 +192,14 @@ struct Live {
     camera: Slot<livecap::Source, livecap::LivePreview>,
     /// Microphone name (None = default input).
     mic: Slot<Option<String>, crate::capture::meter::MicMeter>,
-    tex: Option<egui::TextureHandle>,
+    /// The screen preview: a native texture over the newest frame's
+    /// IOSurface (no copies) and its size in pixels.
+    tex: Option<(egui::TextureId, [u32; 2])>,
+    /// Frames whose IOSurfaces back textures that may still be drawn.
+    frames: std::collections::VecDeque<crate::render::interop::Wrapped>,
+    interop: Option<crate::render::interop::TextureCache>,
+    /// The registered native texture, reused across sources.
+    tex_id: Option<egui::TextureId>,
     cam_tex: Option<egui::TextureHandle>,
     /// Displayed levels (peak hold with decay).
     levels: [f32; 2],
@@ -979,7 +986,7 @@ impl App {
                 if screen && self.live.tex.is_none() && since < Duration::from_secs(6) {
                     return;
                 }
-                let live = self.live.tex.as_ref().map(|t| t.size());
+                let live = self.live.tex.map(|t| t.1);
                 log(&format!("launched main_window={} menubar={} start_view={start} live_preview={live:?}", self.main.is_some(), self.menubar.is_some()));
                 if !start {
                     fail("didn't open on recording setup".into());
@@ -1186,7 +1193,7 @@ impl App {
         let note = self.permission_note.clone();
         let action = match &mut self.view {
             View::Start => {
-                let live = self.live_view(ui.ctx());
+                let live = self.live_view(ui.ctx(), renderer);
                 home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref(), &live)
             }
             View::Editor(ed) => {
@@ -1290,10 +1297,11 @@ impl App {
         let camera = (visible && s.camera).then(|| livecap::Source::Camera { id: s.camera_id.clone() });
         let mic = (visible && s.mic && self.selftest.is_none()).then(|| s.mic_id.as_ref().and_then(|id| self.devices.mics.iter().find(|m| &m.id == id)).map(|m| m.name.clone()));
         let live = &mut self.live;
-        if live.screen.update(screen, "live preview", |(src, audio)| livecap::LivePreview::start(src, 1280, 10, *audio, wake).map_err(|e| format!("{e:#}"))) {
+        // Screens at native resolution, scaled to the canvas (30 fps, as Rec).
+        if live.screen.update(screen, "live preview", |(src, audio)| livecap::LivePreview::start(src, 0, 30, *audio, wake).map_err(|e| format!("{e:#}"))) {
             live.tex = None;
         }
-        if live.camera.update(camera, "camera preview", |src| livecap::LivePreview::start(src, 640, 15, false, wake).map_err(|e| format!("{e:#}"))) {
+        if live.camera.update(camera, "camera preview", |src| livecap::LivePreview::start(src, 720, 30, false, wake).map_err(|e| format!("{e:#}"))) {
             live.cam_tex = None;
         }
         live.mic.update(mic, "mic meter", |name| crate::capture::meter::MicMeter::start(name.as_deref()).map_err(|e| format!("{e:#}")));
@@ -1301,8 +1309,37 @@ impl App {
 
     /// Newest preview frames into their textures, levels into the meters,
     /// and what the start view should show.
-    fn live_view(&mut self, ctx: &egui::Context) -> home::LiveView {
+    fn live_view(&mut self, ctx: &egui::Context, renderer: &mut egui_wgpu::Renderer) -> home::LiveView {
         let live = &mut self.live;
+        if let (Some((_, p)), Some(gpu)) = (&live.screen.running, &self.gpu) {
+            // Scaled to the canvas the start view last laid out, in pixels.
+            let [w, h] = home::canvas_px();
+            p.set_target(w, h);
+            if live.interop.is_none() {
+                live.interop = crate::render::interop::TextureCache::new(&gpu.device);
+            }
+            if let (Some(pb), Some(cache)) = (p.take_buffer(), &live.interop)
+                && let Some(f) = cache.wrap(&pb, wgpu::TextureUsages::TEXTURE_BINDING)
+            {
+                // Drawn pixel-aligned at its own size: nearest is exact, and
+                // avoids a blur while the canvas is mid-resize (as Rec).
+                let filter = wgpu::FilterMode::Nearest;
+                let id = match live.tex_id {
+                    Some(id) => {
+                        renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &f.view, filter, id);
+                        id
+                    }
+                    None => renderer.register_native_texture(&gpu.device, &f.view, filter),
+                };
+                live.tex_id = Some(id);
+                live.tex = Some((id, [f.size.0, f.size.1]));
+                live.frames.push_back(f);
+                while live.frames.len() > 3 {
+                    live.frames.pop_front();
+                }
+                cache.flush();
+            }
+        }
         let upload = |slot: &mut Option<egui::TextureHandle>, p: &livecap::LivePreview, name: &str| {
             if let Some(f) = p.take_frame() {
                 let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
@@ -1312,9 +1349,6 @@ impl App {
                 }
             }
         };
-        if let Some((_, p)) = &live.screen.running {
-            upload(&mut live.tex, p, "live-preview");
-        }
         if let Some((_, p)) = &live.camera.running {
             upload(&mut live.cam_tex, p, "camera-preview");
         }
@@ -1328,7 +1362,8 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let s = &self.settings;
-        let screen = live.tex.as_ref().filter(|_| live.screen.running.is_some()).map(|t| (t.id(), t.size_vec2()));
+        let ppp = ctx.pixels_per_point();
+        let screen = live.tex.filter(|_| live.screen.running.is_some()).map(|(id, [w, h])| (id, egui::vec2(w as f32, h as f32) / ppp));
         let note = if screen.is_some() {
             None
         } else if let Some(e) = live.screen.error() {

@@ -191,3 +191,9 @@ transcription were exercised only through their code paths and test media.
 - 2026-10-11: "Fit to file size", Enhance voice (ML isolation + AGC),
   fixes from a full code review (preview audio lifecycle, timeline clamps,
   area bounds, voice-over/editor lifecycle, quit and restart behaviour).
+
+- Live preview is Retina-sharp, as in Rec: screens are captured at native
+  pixel size (`SCCaptureResolutionType::Best`, sRGB, 30 fps), Lanczos-scaled
+  on the GPU (MPS) to exactly the canvas's pixels, and drawn 1:1,
+  pixel-aligned, from the frame's IOSurface (no CPU copy or upload). Camera
+  bubble at 720 px / 30 fps.

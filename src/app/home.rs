@@ -333,6 +333,15 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
 
 /// True while a shortcut button waits for keys (global hotkeys are paused
 /// so the old combination reaches the field instead of starting a recording).
+/// The start view's canvas in pixels (w << 32 | h), as last laid out; the
+/// live preview is scaled to it.
+static CANVAS_PX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn canvas_px() -> [u32; 2] {
+    let v = CANVAS_PX.load(std::sync::atomic::Ordering::Relaxed);
+    [(v >> 32) as u32, v as u32]
+}
+
 pub static CAPTURING_SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A shortcut button that records the next key combination when clicked.
@@ -974,11 +983,17 @@ pub fn start_view(
             let area = ui.available_rect_before_wrap();
             let backdrop = if ui.visuals().dark_mode { Color32::from_rgb(0x1c, 0x1c, 0x1e) } else { Color32::from_rgb(0xe4, 0xe4, 0xe7) };
             ui.painter().rect_filled(area, CornerRadius::same(8), backdrop);
-            // The source, live, as large as the canvas allows.
+            // The source, live, as large as the canvas allows: frames come
+            // scaled to the canvas's pixels and are drawn 1:1, pixel-aligned.
+            let ppp = ui.ctx().pixels_per_point();
+            let px = |v: f32| (v * ppp).floor().max(0.0) as u64;
+            CANVAS_PX.store(px(area.width()) << 32 | px(area.height()), std::sync::atomic::Ordering::Relaxed);
             let rect = match live.screen {
                 Some((tex, size)) => {
-                    let fit = (area.width() / size.x).min(area.height() / size.y);
-                    let rect = egui::Rect::from_center_size(area.center(), size * fit);
+                    let fit = (area.width() / size.x).min(area.height() / size.y).min(1.0);
+                    let snap = |v: f32| (v * ppp).round() / ppp;
+                    let min = area.center() - size * fit / 2.0;
+                    let rect = egui::Rect::from_min_size(egui::pos2(snap(min.x), snap(min.y)), size * fit);
                     egui::Image::new((tex, size)).corner_radius(6).paint_at(ui, rect);
                     rect
                 }
