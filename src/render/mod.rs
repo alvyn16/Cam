@@ -621,14 +621,20 @@ impl Renderer {
         // Camera.
         if self.has_camera {
             if let Some(cam) = &frame.camera {
-                if style.shadow.intensity > 0.0 {
-                    let sigma = (style.shadow.blur * k).max(1.0) * 0.6;
-                    let a = style.shadow.angle.to_radians();
-                    let off = v2(a.cos(), a.sin()) * (style.shadow.distance * k * 0.6);
+                if cam.shadow {
+                    // The screen's shadow, or a soft one when that is off.
+                    let (blur, angle, distance, intensity) = if style.shadow.intensity > 0.0 {
+                        (style.shadow.blur * k, style.shadow.angle, style.shadow.distance * k, style.shadow.intensity * 0.85)
+                    } else {
+                        (size.y * 0.03, 90.0, size.y * 0.008, 0.45)
+                    };
+                    let sigma = blur.max(1.0) * 0.6;
+                    let a = angle.to_radians();
+                    let off = v2(a.cos(), a.sin()) * (distance * 0.6);
                     let shape = cam.rect.translate(off);
                     let mut d = Draw::new(MODE_SHADOW, shape.inset(-(sigma * 3.0 + 2.0)), size);
                     d.shape = r4(shape);
-                    d.color = [0.0, 0.0, 0.0, (style.shadow.intensity * 0.85 * cam.alpha) as f32];
+                    d.color = [0.0, 0.0, 0.0, (intensity * cam.alpha) as f32];
                     d.p0[0] = cam.radius as f32;
                     d.p2[0] = sigma as f32;
                     main.push((d, TexId::Dummy));
@@ -725,7 +731,8 @@ fn camera_draw(cam: &CameraLayer, size: Vec2, rounded: bool) -> Draw {
     let mut d = Draw::new(MODE_TEXTURE, cam.rect, size);
     d.uv = r4(cam.uv);
     d.shape = r4(cam.rect);
-    d.p0 = [cam.radius as f32, 0.0, 0.0, cam.alpha as f32];
+    d.p0 = [cam.radius as f32, cam.border as f32, cam.squircle as f32, cam.alpha as f32];
+    d.p4 = cam.border_color;
     let flags = (cam.mirror as u32) | if rounded { 2 } else { 0 };
     d.p2 = [cam.blur as f32, 0.0, 0.0, flags as f32];
     d.xform[3] = 1.0;

@@ -217,3 +217,97 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool) -> Response {
     }
     resp
 }
+
+/// Outline of a camera bubble filling `rect`, clockwise: a rounded rect with
+/// corner radius `radius`, or a superellipse when `n` > 0.
+pub fn bubble_outline(rect: egui::Rect, radius: f32, n: f32) -> Vec<egui::Pos2> {
+    let c = rect.center();
+    let (hw, hh) = (rect.width() / 2.0, rect.height() / 2.0);
+    if n > 0.0 {
+        return (0..128)
+            .map(|i| {
+                let t = i as f32 / 128.0 * std::f32::consts::TAU;
+                let (ct, st) = (t.cos(), t.sin());
+                c + vec2(ct.signum() * ct.abs().powf(2.0 / n) * hw, st.signum() * st.abs().powf(2.0 / n) * hh)
+            })
+            .collect();
+    }
+    let r = radius.clamp(0.0, hw.min(hh));
+    let mut pts = Vec::with_capacity(4 * 17);
+    // Corner centres, starting top right and going clockwise (y down).
+    for (k, (sx, sy)) in [(1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)].into_iter().enumerate() {
+        let cc = c + vec2(sx * (hw - r), sy * (hh - r));
+        let a0 = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::FRAC_PI_2;
+        for j in 0..=16 {
+            let a = a0 + j as f32 / 16.0 * std::f32::consts::FRAC_PI_2;
+            pts.push(cc + vec2(a.cos(), a.sin()) * r);
+        }
+    }
+    pts
+}
+
+/// A small icon of a camera shape (with the current roundness).
+fn shape_icon(ui: &Ui, rect: egui::Rect, c: &crate::project::model::CameraStyle, color: Color32) {
+    let (w, h) = if c.shape.is_square() { (16.0, 16.0) } else { (22.0, 13.0) };
+    let r = egui::Rect::from_center_size(rect.center(), vec2(w, h));
+    let pts = bubble_outline(r, c.radius(w as f64, h as f64) as f32, c.squircle_exponent() as f32);
+    ui.painter().add(egui::Shape::closed_line(pts, Stroke::new(1.5, color)));
+}
+
+/// The camera bubble's look and position, as in Rec: shape, size,
+/// roundness, border, corner, shadow and mirror. Returns true when changed.
+pub fn camera_look(ui: &mut Ui, c: &mut crate::project::model::CameraStyle) -> bool {
+    use crate::project::model::{CameraShape, CameraStyle};
+    let before = *c;
+    let p = pal(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let bw = ((ui.available_width() - 16.0) / 5.0).max(30.0);
+        for shape in CameraShape::ALL {
+            let sel = c.shape == shape;
+            let (rect, resp) = ui.allocate_exact_size(vec2(bw, 30.0), Sense::click());
+            let fill = if sel { theme::accent() } else if resp.hovered() { p.hover } else { p.control };
+            ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+            shape_icon(ui, rect, &CameraStyle { shape, ..*c }, if sel { Color32::WHITE } else { p.text });
+            if resp.on_hover_text(shape.label()).clicked() {
+                c.shape = shape;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    let pct = |ui: &mut Ui, label: &str, v: &mut f64, range: std::ops::RangeInclusive<f64>, scale: f64, enabled: bool| {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut x = *v * scale;
+                let r = (*range.start() * scale)..=(*range.end() * scale);
+                if ui.add_enabled(enabled, egui::Slider::new(&mut x, r).suffix(" %").integer().trailing_fill(true)).changed() {
+                    *v = x / scale;
+                }
+            });
+        });
+    };
+    pct(ui, "Size", &mut c.size, 0.1..=0.8, 100.0, true);
+    // Roundness 0..0.5 of the short side shows as 0..100 %.
+    pct(ui, "Roundness", &mut c.roundness, 0.0..=0.5, 200.0, c.shape.uses_roundness());
+    ui.horizontal(|ui| {
+        ui.label("Border");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled_ui(c.border > 0.0, |ui| color_edit(ui, &mut c.border_color));
+            ui.add(egui::Slider::new(&mut c.border, 0.0..=20.0).suffix(" px").integer().trailing_fill(true));
+        });
+    });
+    row(ui, "Position", |ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        // Right to left: the last corner is drawn first.
+        for (label, tip, pos) in [("↘", "Bottom right", (1.0, 1.0)), ("↙", "Bottom left", (0.0, 1.0)), ("↗", "Top right", (1.0, 0.0)), ("↖", "Top left", (0.0, 0.0))] {
+            let sel = (c.position.x, c.position.y) == pos;
+            if ui.add(egui::Button::selectable(sel, label).min_size(vec2(26.0, 22.0))).on_hover_text(tip).clicked() {
+                c.position = crate::engine::geom::v2(pos.0, pos.1);
+            }
+        }
+    });
+    toggle_row(ui, "Shadow", &mut c.shadow);
+    toggle_row(ui, "Mirror", &mut c.mirror);
+    *c != before
+}

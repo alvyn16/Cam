@@ -569,6 +569,7 @@ impl App {
             system_audio: s.system_audio,
             mic: s.mic.then(|| s.mic_id.clone()),
             camera: s.camera.then(|| s.camera_id.clone()),
+            camera_style: Some(s.camera_style),
             fps: s.fps,
             keys: s.keys,
             dir: s.dir(),
@@ -1233,6 +1234,11 @@ impl App {
             home::Action::HotkeysChanged => {
                 self.settings.save();
                 self.bind_hotkeys();
+            }
+            home::Action::SaveSettings => {
+                if !self.scripted() {
+                    self.settings.save();
+                }
             }
             home::Action::Open(p) => push(Cmd::Open(p)),
             home::Action::RequestPermissions => {

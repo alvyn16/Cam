@@ -353,22 +353,15 @@ fn camera(ui: &mut Ui, d: &mut Project, has: bool) {
     let c = &mut d.style.camera;
     section(ui, "Camera", |ui| {
         toggle_row(ui, "Hide camera", &mut c.hide);
-        toggle_row(ui, "Mirror", &mut c.mirror);
-        slider(ui, "Size", &mut c.size, 0.1..=0.8, "");
-        slider(ui, "Roundness", &mut c.roundness, 0.0..=0.5, "");
-        row(ui, "Shape", |ui| {
-            segmented(ui, &mut c.aspect, &[(CameraAspect::Horizontal, "16:9"), (CameraAspect::Vertical, "9:16"), (CameraAspect::Square, "1:1"), (CameraAspect::Original, "Auto")]);
-        });
+        widgets::camera_look(ui, c);
+        if !c.shape.is_square() {
+            row(ui, "Aspect", |ui| {
+                segmented(ui, &mut c.aspect, &[(CameraAspect::Horizontal, "16:9"), (CameraAspect::Vertical, "9:16"), (CameraAspect::Square, "1:1"), (CameraAspect::Original, "Auto")]);
+            });
+        }
         slider(ui, "Size while zoomed", &mut c.zoom_scale, 0.3..=1.0, "×");
     });
-    section(ui, "Position", |ui| {
-        ui.horizontal(|ui| {
-            for (name, p) in crate::engine::camera::CORNERS {
-                if ui.selectable_label(c.position == p, name).clicked() {
-                    c.position = p;
-                }
-            }
-        });
+    section(ui, "Fine position", |ui| {
         slider(ui, "Horizontal", &mut c.position.x, 0.0..=1.0, "");
         slider(ui, "Vertical", &mut c.position.y, 0.0..=1.0, "");
     });

@@ -81,6 +81,12 @@ pub struct RippleFx {
 pub struct CameraLayer {
     pub rect: Rect,
     pub radius: f64,
+    /// Superellipse exponent of the outline (0 = rounded rectangle).
+    pub squircle: f64,
+    /// Border width in output pixels and its colour.
+    pub border: f64,
+    pub border_color: [f32; 4],
+    pub shadow: bool,
     pub alpha: f64,
     pub blur: f64,
     pub mirror: bool,
@@ -433,7 +439,11 @@ impl Scene {
             if vis[0] > 0.002 {
                 cam = Some(CameraLayer {
                     rect: r,
-                    radius: cs.roundness * r.w.min(r.h),
+                    radius: cs.radius(r.w, r.h),
+                    squircle: cs.squircle_exponent(),
+                    border: cs.border_px(size.y),
+                    border_color: cs.border_color.to_f32(),
+                    shadow: cs.shadow,
                     alpha: vis[0].clamp(0.0, 1.0),
                     blur: vis[1].max(0.0) * k,
                     mirror: cs.mirror,
@@ -450,6 +460,10 @@ impl Scene {
                 cam_full = Some(CameraLayer {
                     rect: grown,
                     radius: 0.0,
+                    squircle: 0.0,
+                    border: 0.0,
+                    border_color: [0.0; 4],
+                    shadow: false,
                     alpha: full[0].clamp(0.0, 1.0),
                     blur: full[1].max(0.0) * k,
                     mirror: cs.mirror,

@@ -17,6 +17,9 @@ pub fn kind_at(layouts: &[LayoutRange], t: f64) -> LayoutKind {
 
 /// Aspect ratio (w/h) of the bubble.
 pub fn aspect(style: &CameraStyle, video: Vec2) -> f64 {
+    if style.shape.is_square() {
+        return 1.0;
+    }
     match style.aspect {
         CameraAspect::Square => 1.0,
         CameraAspect::Vertical => 9.0 / 16.0,

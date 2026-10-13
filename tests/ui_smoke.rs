@@ -142,6 +142,7 @@ fn editor_and_home_render_every_panel() {
             system_level: live.map(|_| 0.4),
             mic_level: None,
             note: live.is_none().then(|| "Choose a window to see it here.".into()),
+            covered: None,
         };
         for _ in 0..2 {
             t += 0.016;

@@ -211,11 +211,58 @@ pub enum CameraAspect {
     Horizontal,
 }
 
+/// The camera bubble's outline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CameraShape {
+    /// Rounded rectangle in the chosen aspect (radius from roundness).
+    #[default]
+    Rounded,
+    /// Circle (centre square crop).
+    Circle,
+    /// Square, rounded by roundness (centre square crop).
+    Square,
+    /// Capsule in the chosen aspect, fully round ends.
+    Pill,
+    /// Superellipse square (continuous corners); roundness sets the curve.
+    Squircle,
+}
+
+impl CameraShape {
+    pub const ALL: [CameraShape; 5] = [CameraShape::Circle, CameraShape::Rounded, CameraShape::Square, CameraShape::Pill, CameraShape::Squircle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraShape::Rounded => "Rounded",
+            CameraShape::Circle => "Circle",
+            CameraShape::Square => "Square",
+            CameraShape::Pill => "Pill",
+            CameraShape::Squircle => "Squircle",
+        }
+    }
+
+    /// Crops the camera to a centred square.
+    pub fn is_square(self) -> bool {
+        matches!(self, CameraShape::Circle | CameraShape::Square | CameraShape::Squircle)
+    }
+
+    /// The roundness setting applies.
+    pub fn uses_roundness(self) -> bool {
+        matches!(self, CameraShape::Rounded | CameraShape::Square | CameraShape::Squircle)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraStyle {
     pub hide: bool,
     pub mirror: bool,
+    pub shape: CameraShape,
+    /// Border width in pixels at 1080p (scaled with the output height).
+    pub border: f64,
+    pub border_color: Color,
+    /// Soft drop shadow under the bubble.
+    pub shadow: bool,
     /// Fraction of the safe frame the bubble may occupy.
     pub size: f64,
     /// Corner radius as a fraction of the bubble's short side (0.5 = round).
@@ -227,11 +274,42 @@ pub struct CameraStyle {
     pub zoom_scale: f64,
 }
 
+impl CameraStyle {
+    /// Corner radius in pixels for a `w`x`h` bubble.
+    pub fn radius(&self, w: f64, h: f64) -> f64 {
+        let short = w.min(h);
+        match self.shape {
+            CameraShape::Circle | CameraShape::Pill => short / 2.0,
+            CameraShape::Rounded | CameraShape::Square => self.roundness.clamp(0.0, 0.5) * short,
+            CameraShape::Squircle => short / 2.0,
+        }
+    }
+
+    /// Superellipse exponent (0 = not a squircle): 2 (a circle) at the
+    /// roundest, 4 (the classic squircle) halfway, 10 (nearly square) at 0.
+    pub fn squircle_exponent(&self) -> f64 {
+        if self.shape != CameraShape::Squircle {
+            return 0.0;
+        }
+        let r = (self.roundness / 0.5).clamp(0.0, 1.0);
+        2.0 + 8.0 * (1.0 - r).powi(2)
+    }
+
+    /// Border width in pixels for an output `out_h` pixels tall.
+    pub fn border_px(&self, out_h: f64) -> f64 {
+        (self.border.max(0.0) * out_h / 1080.0).round()
+    }
+}
+
 impl Default for CameraStyle {
     fn default() -> Self {
         CameraStyle {
             hide: false,
             mirror: false,
+            shape: CameraShape::Rounded,
+            border: 0.0,
+            border_color: Color::WHITE,
+            shadow: true,
             size: 0.35,
             roundness: 0.25,
             position: v2(1.0, 1.0),

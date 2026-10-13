@@ -44,6 +44,8 @@ pub struct Options {
     pub mic: Option<Option<String>>,
     /// None = off; Some(None) = default camera.
     pub camera: Option<Option<String>>,
+    /// The camera bubble's look for the new project (None = the default).
+    pub camera_style: Option<crate::project::model::CameraStyle>,
     pub fps: u32,
     /// Log key presses (needs Input Monitoring permission).
     pub keys: bool,
@@ -66,6 +68,7 @@ impl Default for Options {
             system_audio: true,
             mic: None,
             camera: None,
+            camera_style: None,
             fps: 60,
             keys: true,
             dir: project::projects_dir(),
@@ -569,6 +572,10 @@ impl Recorder {
             for z in &mut proj.timeline.zooms {
                 z.scale = proj.style.default_zoom;
             }
+        }
+        // The camera bubble as set up before recording.
+        if let Some(cs) = self.opts.camera_style {
+            proj.style.camera = crate::project::model::CameraStyle { zoom_scale: proj.style.camera.zoom_scale, hide: false, ..cs };
         }
         pkg.save_project(&proj)?;
         Ok(())

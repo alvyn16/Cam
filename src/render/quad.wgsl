@@ -86,6 +86,16 @@ fn sd_round_rect(p: vec2<f32>, center: vec2<f32>, half: vec2<f32>, r: f32) -> f3
     return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - rr;
 }
 
+// Rounded rect, or a superellipse with exponent `n` when n > 0.
+fn sd_shape(p: vec2<f32>, center: vec2<f32>, half: vec2<f32>, r: f32, n: f32) -> f32 {
+    if n > 0.0 {
+        let q = abs(p - center) / max(half, vec2<f32>(0.001));
+        let k = pow(pow(q.x, n) + pow(q.y, n), 1.0 / n);
+        return (k - 1.0) * min(half.x, half.y);
+    }
+    return sd_round_rect(p, center, half, r);
+}
+
 fn coverage(dist: f32) -> f32 {
     return clamp(0.5 - dist, 0.0, 1.0);
 }
@@ -198,9 +208,18 @@ fn mode_texture(local: vec2<f32>) -> vec4<f32> {
     // Texture is premultiplied; apply tint and opacity.
     c = vec4<f32>(c.rgb * d.color.rgb, c.a) * d.color.a * d.p0.w;
     if (u32(d.p2.w) & 2u) != 0u {
+        // p0.y = border width, p0.z = superellipse exponent, p4 = border colour.
         let half = d.shape.zw * 0.5;
-        let dist = sd_round_rect(local, d.shape.xy + half, half, d.p0.x);
-        c = c * coverage(dist);
+        let center = d.shape.xy + half;
+        let outer = coverage(sd_shape(local, center, half, d.p0.x, d.p0.z));
+        let bw = d.p0.y;
+        if bw > 0.0 {
+            let inner_half = max(half - vec2<f32>(bw), vec2<f32>(0.0));
+            let inner = coverage(sd_shape(local, center, inner_half, max(d.p0.x - bw, 0.0), d.p0.z));
+            let border = vec4<f32>(d.p4.rgb * d.p4.a, d.p4.a) * d.p0.w;
+            c = mix(border, c, inner);
+        }
+        c = c * outer;
     }
     return c;
 }

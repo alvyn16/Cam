@@ -42,6 +42,9 @@ pub struct Settings {
     pub mic_id: Option<String>,
     pub camera: bool,
     pub camera_id: Option<String>,
+    /// The camera bubble's look and place, shown live in the preview and
+    /// given to each new recording.
+    pub camera_style: crate::project::model::CameraStyle,
     pub keys: bool,
     pub countdown: bool,
     pub fps: u32,
@@ -94,6 +97,7 @@ impl Default for Settings {
             mic_id: None,
             camera: false,
             camera_id: None,
+            camera_style: crate::project::model::CameraStyle { mirror: true, ..Default::default() },
             keys: true,
             countdown: true,
             fps: 60,
@@ -402,6 +406,8 @@ pub enum Action {
     ResizeWindow { id: u32, width: u32, height: u32 },
     /// Pick a window on screen.
     SelectWindow,
+    /// Remember the settings now (e.g. the camera bubble was restyled).
+    SaveSettings,
 }
 
 /// Outcome of the last window resize, shown under the window picker.
@@ -638,6 +644,12 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
     combo(ui, "cam", &mut s.camera_id, &cams, s.camera);
     if !s.camera {
         caption(ui, "Pick Screen + Cam to record the camera too.");
+    } else {
+        ui.add_space(6.0);
+        if widgets::camera_look(ui, &mut s.camera_style) && !ui.ctx().input(|i| i.pointer.any_down()) {
+            action = Action::SaveSettings;
+        }
+        caption(ui, "Drag the camera in the preview to move it; it snaps to corners.");
     }
 
     heading(ui, "AUDIO");
@@ -875,12 +887,105 @@ fn meter(ui: &mut Ui, label: &str, level: Option<f32>) {
     });
 }
 
-/// UV rect showing the centre square of a `size` image, mirrored like a
-/// mirror (as cameras are usually previewed).
-fn square_uv(size: egui::Vec2, mirror: bool) -> egui::Rect {
-    let (u, v) = if size.x > size.y { ((1.0 - size.y / size.x) / 2.0, 0.0) } else { (0.0, (1.0 - size.x / size.y) / 2.0) };
-    let (u0, u1) = if mirror { (1.0 - u, u) } else { (u, 1.0 - u) };
-    egui::Rect::from_min_max(egui::pos2(u0, v), egui::pos2(u1, 1.0 - v))
+/// The bubble's rect for `style` over a preview of the screen at `frame`,
+/// laid out as the editor lays it out over the output.
+fn bubble_rect(style: &crate::project::model::CameraStyle, frame: egui::Rect, cam: egui::Vec2) -> egui::Rect {
+    use crate::engine::{camera, geom::v2};
+    let out = v2(frame.width() as f64, frame.height() as f64);
+    let aspect = camera::aspect(style, v2(cam.x as f64, cam.y as f64));
+    let r = camera::bubble_rect(out, aspect, style.size, style.position);
+    egui::Rect::from_min_size(frame.min + vec2(r.x as f32, r.y as f32), vec2(r.w as f32, r.h as f32))
+}
+
+/// Anti-aliased mesh filling the convex outline `pts` (centre `c`): a 1 px
+/// ramp to transparent along the edge, as egui feathers its own shapes.
+fn outline_mesh(pts: &[egui::Pos2], c: egui::Pos2, tex: egui::TextureId, color: Color32, uv: impl Fn(egui::Pos2) -> egui::Pos2) -> egui::Mesh {
+    let mut m = egui::Mesh::with_texture(tex);
+    let n = pts.len() as u32;
+    m.colored_vertex(c, color);
+    m.vertices[0].uv = uv(c);
+    for (i, &p) in pts.iter().enumerate() {
+        let (prev, next) = (pts[(i + pts.len() - 1) % pts.len()], pts[(i + 1) % pts.len()]);
+        let t = next - prev;
+        let mut normal = vec2(t.y, -t.x).normalized();
+        if normal.dot(p - c) < 0.0 {
+            normal = -normal;
+        }
+        for (q, col) in [(p - normal * 0.5, color), (p + normal * 0.5, Color32::TRANSPARENT)] {
+            m.vertices.push(egui::epaint::Vertex { pos: q, uv: uv(q), color: col });
+        }
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (ai, ao, bi, bo) = (1 + 2 * i, 2 + 2 * i, 1 + 2 * j, 2 + 2 * j);
+        m.add_triangle(0, ai, bi);
+        m.add_triangle(ai, ao, bi);
+        m.add_triangle(bi, ao, bo);
+    }
+    m
+}
+
+/// The live camera over the preview `frame` in its bubble (shape, border,
+/// shadow, mirror), draggable: it moves while dragged and snaps to a corner
+/// when released near one.
+fn camera_bubble(ui: &mut Ui, style: &mut crate::project::model::CameraStyle, frame: egui::Rect, tex: egui::TextureId, cam: egui::Vec2) -> Action {
+    use crate::engine::{camera, geom::v2};
+    const SNAP: f64 = 0.12;
+    let mut action = Action::None;
+    let bubble = bubble_rect(style, frame, cam);
+    let resp = ui.interact(bubble, ui.id().with("camera-drag"), Sense::drag());
+    if resp.dragged() {
+        // Position is the bubble's place in the room the safe frame leaves.
+        let m = frame.width().min(frame.height()) * camera::SAFE_MARGIN as f32;
+        let room = (frame.size() - vec2(2.0 * m, 2.0 * m) - bubble.size()).max(vec2(1.0, 1.0));
+        let min = bubble.min + resp.drag_delta() - frame.min - vec2(m, m);
+        style.position = v2((min.x / room.x).clamp(0.0, 1.0) as f64, (min.y / room.y).clamp(0.0, 1.0) as f64);
+    }
+    let snap = |p: f64| if p < SNAP { Some(0.0) } else if p > 1.0 - SNAP { Some(1.0) } else { None };
+    let corner = snap(style.position.x).zip(snap(style.position.y)).map(|(x, y)| v2(x, y));
+    if resp.drag_stopped() {
+        if let Some(c) = corner {
+            style.position = c;
+        }
+        action = Action::SaveSettings;
+    }
+    let bubble = bubble_rect(style, frame, cam);
+    let k = frame.height() / 1080.0;
+    let radius = style.radius(bubble.width() as f64, bubble.height() as f64) as f32;
+    let n = style.squircle_exponent() as f32;
+    let painter = ui.painter_at(frame);
+    if style.shadow {
+        let r = if n > 0.0 { bubble.width().min(bubble.height()) * 0.3 } else { radius };
+        let shadow = egui::epaint::Shadow { offset: [0, (8.0 * k).round() as i8], blur: (32.0 * k).clamp(4.0, 60.0) as u8, spread: 0, color: Color32::from_black_alpha(115) };
+        painter.add(shadow.as_shape(bubble, CornerRadius::same(r.min(255.0) as u8)));
+    }
+    let bw = (style.border.max(0.0) as f32 * k).round().min(bubble.width().min(bubble.height()) / 2.0);
+    if bw > 0.0 {
+        let [r, g, b, _] = style.border_color.0;
+        let pts = widgets::bubble_outline(bubble, radius, n);
+        painter.add(outline_mesh(&pts, bubble.center(), egui::TextureId::default(), Color32::from_rgb(r, g, b), |_| egui::epaint::WHITE_UV));
+    }
+    let inner = bubble.shrink(bw);
+    // Centre crop of the camera to the bubble's aspect, mirrored if asked.
+    let crop = crate::engine::scene::centre_crop((cam.x / cam.y) as f64, (inner.width() / inner.height()) as f64);
+    let uv = |p: egui::Pos2| {
+        let (fx, fy) = ((p.x - inner.min.x) / inner.width(), (p.y - inner.min.y) / inner.height());
+        let fx = if style.mirror { 1.0 - fx } else { fx };
+        egui::pos2(crop.x as f32 + fx * crop.w as f32, crop.y as f32 + fy * crop.h as f32)
+    };
+    let pts = widgets::bubble_outline(inner, (radius - bw).max(0.0), n);
+    painter.add(outline_mesh(&pts, inner.center(), tex, Color32::WHITE, uv));
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    }
+    if resp.dragged()
+        && let Some(c) = corner
+    {
+        // Where it will snap.
+        let ghost = bubble_rect(&crate::project::model::CameraStyle { position: c, ..*style }, frame, cam);
+        painter.rect_stroke(ghost, CornerRadius::same(6), Stroke::new(1.5, theme::accent().gamma_multiply(0.8)), egui::StrokeKind::Outside);
+    }
+    action
 }
 
 /// The window with no recording open, laid out like Rec: the selected
@@ -1012,14 +1117,12 @@ pub fn start_view(
                     area
                 }
             };
-            // The camera in a round bubble at the bottom right.
-            if let Some((cam, cam_size)) = live.camera {
-                let d = (rect.height().min(rect.width()) * 0.24).clamp(64.0, 220.0);
-                let bubble = egui::Rect::from_min_size(rect.right_bottom() - vec2(d + 18.0, d + 18.0), vec2(d, d));
-                let shadow = egui::epaint::Shadow { offset: [0, 4], blur: 18, spread: 0, color: Color32::from_black_alpha(90) };
-                ui.painter().add(shadow.as_shape(bubble, CornerRadius::same((d / 2.0) as u8)));
-                egui::Image::new((cam, cam_size)).uv(square_uv(cam_size, true)).corner_radius(d / 2.0).paint_at(ui, bubble);
-                ui.painter().circle_stroke(bubble.center(), d / 2.0, Stroke::new(2.0, Color32::from_white_alpha(200)));
+            // The camera bubble, styled and placed as it will be recorded.
+            if let Some((cam, cam_size)) = live.camera
+                && chrome.settings.camera
+            {
+                let a = camera_bubble(ui, &mut chrome.settings.camera_style, rect, cam, cam_size);
+                chrome.set(a);
             }
         });
     chrome.action
