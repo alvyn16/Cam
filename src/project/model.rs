@@ -698,7 +698,19 @@ pub enum Quality {
 impl Quality {
     pub const ALL: [Quality; 4] = [Quality::Studio, Quality::Social, Quality::Web, Quality::WebLow];
 
-    /// Encoder bits per pixel per frame.
+    /// VideoToolbox constant-quality setting (0..1): the encoder spends what
+    /// each frame needs, so fine text stays crisp through motion while static
+    /// screens stay small.
+    pub fn encoder_quality(self) -> f64 {
+        match self {
+            Quality::Studio => 0.95,
+            Quality::Social => 0.85,
+            Quality::Web => 0.7,
+            Quality::WebLow => 0.55,
+        }
+    }
+
+    /// Bits per pixel per frame, for size estimates (and GIF effort).
     pub fn bits_per_pixel(self) -> f64 {
         match self {
             Quality::Studio => 0.3,
@@ -723,6 +735,9 @@ pub enum Codec {
     #[default]
     H264,
     Hevc,
+    /// Apple ProRes 4444 in a .mov: visually lossless, full 4:4:4 colour,
+    /// for masters and further editing (large files).
+    Prores,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -730,6 +745,7 @@ pub enum Codec {
 pub struct ExportSettings {
     pub format: ExportFormat,
     /// Output height in pixels; width follows the project's aspect ratio.
+    /// 0 = native: the recording's own pixels, unscaled.
     pub height: u32,
     pub fps: u32,
     pub quality: Quality,
@@ -743,7 +759,7 @@ impl Default for ExportSettings {
     fn default() -> Self {
         ExportSettings {
             format: ExportFormat::Mp4,
-            height: 1080,
+            height: Self::NATIVE,
             fps: 60,
             quality: Quality::Social,
             codec: Codec::H264,
@@ -756,11 +772,25 @@ impl Default for ExportSettings {
 impl ExportSettings {
     pub const MP4_FPS: [u32; 7] = [60, 50, 30, 25, 24, 20, 10];
     pub const GIF_FPS: [u32; 6] = [50, 30, 25, 20, 15, 10];
-    pub const MP4_HEIGHTS: [u32; 3] = [720, 1080, 2160];
+    /// `height` for the recording's native resolution.
+    pub const NATIVE: u32 = 0;
+    pub const MP4_HEIGHTS: [u32; 5] = [Self::NATIVE, 2160, 1440, 1080, 720];
     pub const GIF_HEIGHTS: [u32; 3] = [480, 720, 1080];
 
     pub fn gif_default() -> Self {
         ExportSettings { format: ExportFormat::Gif, height: 480, fps: 15, quality: Quality::Studio, ..Default::default() }
+    }
+
+    /// Whether "fit to file size" applies (not to GIF or ProRes).
+    pub fn fits_size(&self) -> bool {
+        self.format == ExportFormat::Mp4 && self.codec != Codec::Prores
+    }
+
+    /// The codec actually used at a size: VideoToolbox's H.264 encoder stops
+    /// at 4096x2304, so bigger (e.g. native Retina) exports use HEVC.
+    pub fn codec_for(&self, width: u32, height: u32) -> Codec {
+        let (long, short) = (width.max(height), width.min(height));
+        if self.codec == Codec::H264 && (long > 4096 || short > 2304) { Codec::Hevc } else { self.codec }
     }
 
     /// Audio bitrate assumed for size estimates (AAC stereo).
@@ -770,16 +800,17 @@ impl ExportSettings {
     /// target size the bitrate fills that size (minus audio and container
     /// overhead); otherwise it follows the quality preset.
     pub fn bitrate(&self, width: u32, height: u32, secs: f64) -> u64 {
-        if let Some(mb) = self.target_mb.filter(|_| self.format == ExportFormat::Mp4)
+        if let Some(mb) = self.target_mb.filter(|_| self.fits_size())
             && secs > 0.0
         {
             let total = mb as f64 * 8e6 * 0.96 / secs;
             return (total - Self::AUDIO_BPS).max(250_000.0) as u64;
         }
-        let bpp = self.quality.bits_per_pixel();
+        // ProRes 4444 is fixed-quality intra-frame (~2-3 bits/pixel on screens).
+        let bpp = if self.codec == Codec::Prores { 2.5 } else { self.quality.bits_per_pixel() };
         let base = width as f64 * height as f64 * self.fps as f64 * bpp;
         // HEVC reaches the same quality with ~40% fewer bits.
-        let codec = if self.codec == Codec::Hevc { 0.6 } else { 1.0 };
+        let codec = if self.codec_for(width, height) == Codec::Hevc { 0.6 } else { 1.0 };
         (base * codec).max(250_000.0) as u64
     }
 
@@ -848,15 +879,25 @@ mod tests {
         assert_eq!(p.style.padding, 3.0);
         assert_eq!(p.style.corner_radius, 12.0);
         assert_eq!(p.export.fps, 60);
+        assert_eq!(p.export.height, ExportSettings::NATIVE);
     }
 
     #[test]
     fn bitrate_formula() {
-        let e = ExportSettings::default();
+        let e = ExportSettings { height: 1080, ..Default::default() };
         assert_eq!(e.bitrate(1920, 1080, 10.0), (1920.0 * 1080.0 * 60.0 * 0.05) as u64);
         // Fit to 10 MB over 20 s: ~3.84 Mbit/s total minus audio.
         let t = ExportSettings { target_mb: Some(10), ..e };
         assert_eq!(t.bitrate(1920, 1080, 20.0), (10.0 * 8e6 * 0.96 / 20.0 - ExportSettings::AUDIO_BPS) as u64);
         assert!((t.estimate_mb(1920, 1080, 20.0) - 9.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn big_exports_switch_to_hevc() {
+        let e = ExportSettings::default();
+        assert_eq!(e.codec_for(3840, 2160), Codec::H264);
+        assert_eq!(e.codec_for(4654, 3200), Codec::Hevc);
+        assert_eq!(e.codec_for(2160, 3840), Codec::H264);
+        assert_eq!(ExportSettings { codec: Codec::Hevc, ..e }.codec_for(1280, 720), Codec::Hevc);
     }
 }

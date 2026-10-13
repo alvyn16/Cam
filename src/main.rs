@@ -76,13 +76,14 @@ enum Cmd {
         output: Option<PathBuf>,
         #[arg(long, value_parser = ["mp4", "gif"])]
         format: Option<String>,
+        /// Output height in pixels; 0 = native (the recording's own pixels).
         #[arg(long)]
         height: Option<u32>,
         #[arg(long)]
         fps: Option<u32>,
         #[arg(long, value_parser = ["studio", "social", "web", "web-low"])]
         quality: Option<String>,
-        #[arg(long, value_parser = ["h264", "hevc"])]
+        #[arg(long, value_parser = ["h264", "hevc", "prores"])]
         codec: Option<String>,
         /// MP4: aim for a file of about this many MB.
         #[arg(long)]
@@ -571,7 +572,11 @@ fn export_cmd(
         };
     }
     if let Some(c) = codec {
-        settings.codec = if c == "hevc" { Codec::Hevc } else { Codec::H264 };
+        settings.codec = match c.as_str() {
+            "hevc" => Codec::Hevc,
+            "prores" => Codec::Prores,
+            _ => Codec::H264,
+        };
     }
     let output = output.unwrap_or_else(|| export::default_output(&base, &settings));
     let job = Job { project: proj, recording: rec, source, settings, output: output.clone() };

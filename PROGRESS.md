@@ -207,3 +207,20 @@ transcription were exercised only through their code paths and test media.
   Glide by application, and when Glide covers the display it would record the
   preview says so instead of showing a black void. Checked at min size,
   maximised, full screen and back.
+
+- Export quality (Micky's report: exports look soft). Exports default to
+  Native: the recording's own pixels, unscaled (e.g. 4654×3200 for a
+  4112×2658 Retina display with padding; up to 8192×4320), with 4K, 1440p,
+  1080p and 720p presets. Above H.264's 4096×2304 limit the export uses HEVC
+  (HEVC Main, auto level). Quality presets are VideoToolbox constant quality
+  (Studio 0.95, Social 0.85, …) instead of bits-per-pixel, and ProRes 4444
+  (.mov, 4:4:4) is offered for lossless-looking masters. Downscaled exports
+  resample the screen with a Catmull-Rom filter stretched to the footprint
+  instead of bilinear (which aliased text into moiré). Exports are tagged
+  BT.709 primaries/matrix with the sRGB transfer function — what the pixels
+  are — so QuickTime/Safari show them without a gamma shift. Recordings use
+  constant-quality HEVC (0.95). Measured on a full-display fine-text
+  recording (export frame vs the recording, Lanczos-scaled for presets):
+  1080p 31.4 → 33.9 dB, 4K preset 37.2 → 39.3 dB (now at the 4:2:0 ceiling),
+  default 1080p → native 48.3 dB / SSIM 0.992; ProRes 49.2 dB / 0.996.
+  `tests/resample.rs` checks native is pixel exact and downscales don't alias.

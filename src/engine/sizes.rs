@@ -7,8 +7,9 @@ use super::device::{self, Margins};
 use super::geom::{Rect, Vec2, v2};
 use crate::project::model::Style;
 
-/// Largest design size; bigger recordings are scaled down.
-pub const MAX_OUTPUT: Vec2 = v2(3840.0, 2160.0);
+/// Largest output (VideoToolbox HEVC's limit); bigger designs are scaled
+/// down. Native Retina and 5K/6K recordings fit unscaled.
+pub const MAX_OUTPUT: Vec2 = v2(8192.0, 4320.0);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sizes {
@@ -60,14 +61,16 @@ impl Sizes {
         Rect::from_min_size(self.aspect_pad, self.window)
     }
 
-    /// Even pixel dimensions for an encoder at a given height.
+    /// Even pixel dimensions for an encoder at a given height (0 = native).
     pub fn render_size(&self, height: u32) -> (u32, u32) {
+        let height = if height == 0 { self.native_height() } else { height };
         let s = height as f64 / self.output.y;
         let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
         (even(self.output.x * s), even(height as f64))
     }
 
-    /// Native render height (design pixels, capped to 4K).
+    /// Native render height: design pixels, one per recorded pixel (capped
+    /// to MAX_OUTPUT).
     pub fn native_height(&self) -> u32 {
         let cap = (MAX_OUTPUT.x / self.output.x).min(MAX_OUTPUT.y / self.output.y).min(1.0);
         (self.output.y * cap).round() as u32

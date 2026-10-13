@@ -977,13 +977,14 @@ impl Editor {
                     });
                     if s.format == ExportFormat::Mp4 {
                         widgets::row(ui, "Codec", |ui| {
-                            widgets::segmented(ui, &mut s.codec, &[(Codec::H264, "H.264"), (Codec::Hevc, "HEVC")]);
+                            widgets::segmented(ui, &mut s.codec, &[(Codec::H264, "H.264"), (Codec::Hevc, "HEVC"), (Codec::Prores, "ProRes")]);
                         });
+                        let fits = s.fits_size();
                         let mut fit = s.target_mb.is_some();
-                        if widgets::toggle_row(ui, "Fit to file size", &mut fit) {
+                        if fits && widgets::toggle_row(ui, "Fit to file size", &mut fit) {
                             s.target_mb = fit.then_some(10);
                         }
-                        if let Some(mb) = &mut s.target_mb {
+                        if let Some(mb) = s.target_mb.as_mut().filter(|_| fits) {
                             widgets::row(ui, "Target size", |ui| {
                                 ui.add(egui::DragValue::new(mb).range(1..=4000).suffix(" MB"));
                             });
@@ -995,6 +996,9 @@ impl Editor {
                     let secs = self.duration() / 1000.0;
                     let mb = s.estimate_mb(w, h, secs);
                     widgets::caption(ui, &format!("{w}×{h} • {:.1} s • about {:.0} MB", secs, mb.max(0.1)));
+                    if s.format == ExportFormat::Mp4 && s.codec_for(w, h) != s.codec {
+                        widgets::caption(ui, "HEVC at this size (H.264 stops at 4096×2304)");
+                    }
                 });
                 if s != self.project.export {
                     let mut d = self.project.clone();
@@ -1055,5 +1059,10 @@ impl Editor {
 }
 
 fn res_label(h: u32) -> String {
-    if h == 2160 { "4K".into() } else { format!("{h}p") }
+    match h {
+        ExportSettings::NATIVE => "Native".into(),
+        2160 => "4K".into(),
+        1440 => "1440p (2K)".into(),
+        _ => format!("{h}p"),
+    }
 }

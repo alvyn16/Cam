@@ -253,7 +253,7 @@ pub fn run(job: &Job, progress: ProgressFn, cancel: &AtomicBool) -> Result<Stats
     let stats = run_pass(job, None, progress, cancel)?;
     // "Fit to size" means at most that size: VideoToolbox's average bitrate
     // can overshoot, so re-encode once with a corrected bitrate if it did.
-    if s.format == ExportFormat::Mp4
+    if s.fits_size()
         && let Some(mb) = s.target_mb
     {
         let target = mb as f64 * 1e6;
@@ -297,7 +297,16 @@ fn run_pass(job: &Job, bitrate: Option<u64>, progress: ProgressFn, cancel: &Atom
             let soundtrack = audio::mix(&job.project, &job.recording, dir, &scene.map);
             let mut writer = MovieWriter::create(
                 &job.output,
-                &WriterSpec { width: w, height: h, fps: s.fps, codec: s.codec, bitrate: bitrate.unwrap_or_else(|| s.bitrate(w, h, scene.duration() / 1000.0)), audio: soundtrack.is_some() },
+                &WriterSpec {
+                    width: w,
+                    height: h,
+                    fps: s.fps,
+                    codec: s.codec_for(w, h),
+                    bitrate: bitrate.unwrap_or_else(|| s.bitrate(w, h, scene.duration() / 1000.0)),
+                    // Fit to size needs a bitrate; otherwise encode for quality.
+                    quality: (bitrate.is_none() && !(s.target_mb.is_some() && s.fits_size())).then(|| s.quality.encoder_quality()),
+                    audio: soundtrack.is_some(),
+                },
             )?;
             if let Some(m) = soundtrack {
                 writer.set_soundtrack(Arc::new(m));
@@ -448,7 +457,11 @@ fn mp4_readback(
 
 /// Default output path next to the package.
 pub fn default_output(package: &Path, settings: &ExportSettings) -> PathBuf {
-    let ext = if settings.format == ExportFormat::Gif { "gif" } else { "mp4" };
+    let ext = match (settings.format, settings.codec) {
+        (ExportFormat::Gif, _) => "gif",
+        (_, crate::project::model::Codec::Prores) => "mov",
+        _ => "mp4",
+    };
     let name = package.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into());
     package.with_file_name(format!("{name}.{ext}"))
 }

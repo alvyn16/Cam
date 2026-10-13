@@ -90,14 +90,14 @@ struct CameraRec {
 
 impl CameraRec {
     fn start(sel: Option<&str>, path: &std::path::Path) -> Result<Self> {
-        let spec = VideoSpec { width: 1280, height: 720, fps: 30, codec: CapCodec::H264, bitrate: 8_000_000, pixel_format: PIX_BGRA };
+        let spec = VideoSpec { width: 1280, height: 720, fps: 30, codec: CapCodec::H264, bitrate: 8_000_000, quality: None, pixel_format: PIX_BGRA };
         Self::start_spec(path, &spec, |shared| Camera::start_with(sel, shared, true))
     }
 
     /// An iOS device's screen at its native size.
     fn start_ios(id: &str, path: &std::path::Path, size: (usize, usize)) -> Result<Self> {
         let bitrate = ((size.0 * size.1) as f64 * 60.0 * 0.08) as u64;
-        let spec = VideoSpec { width: size.0, height: size.1, fps: 60, codec: CapCodec::Hevc, bitrate: bitrate.max(4_000_000), pixel_format: PIX_BGRA };
+        let spec = VideoSpec { width: size.0, height: size.1, fps: 60, codec: CapCodec::Hevc, bitrate: bitrate.max(4_000_000), quality: None, pixel_format: PIX_BGRA };
         Self::start_spec(path, &spec, |shared| Camera::start_ios(id, shared))
     }
 
@@ -179,6 +179,9 @@ fn display_bounds(id: u32) -> Rect {
     Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
 }
 
+/// VideoToolbox quality for screen recordings (see `Quality::encoder_quality`).
+const RECORD_QUALITY: f64 = 0.95;
+
 fn even(v: f64) -> usize {
     ((v / 2.0).round() as usize * 2).max(2)
 }
@@ -227,7 +230,11 @@ impl Recorder {
             Target::Window { id } => {
                 let w = screen::find_window(&id.to_string())?;
                 let b = input::window_bounds(*id).unwrap_or(Rect::new(0.0, 0.0, w.size.0, w.size.1));
-                let scale = screen::displays()?.first().map_or(2.0, |d| d.pixels.0 as f64 / d.points.0 as f64);
+                // Native pixels of the display the window is on.
+                let on = w.display.as_ref().map(|d| unsafe { d.displayID() });
+                let ds = screen::displays()?;
+                let d = ds.iter().find(|d| Some(d.id) == on).or(ds.first());
+                let scale = d.map_or(2.0, |d| d.pixels.0 as f64 / d.points.0 as f64);
                 let px = (even(w.size.0 * scale), even(w.size.1 * scale));
                 let app = Some(w.app.clone());
                 (Some(screen::Target::Window(w)), SourceKind::Window, b, px, Some(*id), app)
@@ -257,7 +264,8 @@ impl Recorder {
                 app_name: Some("iPhone".into()),
             });
         }
-        // High-quality HEVC: generous bits so re-encoding on export stays clean.
+        // Near-transparent constant-quality HEVC at native pixels, so fine
+        // text survives scrolling and re-encoding on export stays clean.
         let bitrate = ((size.0 * size.1) as f64 * opts.fps as f64 * 0.08) as u64;
         let cap = CapOptions {
             output: package.rec("screen.mov"),
@@ -265,6 +273,7 @@ impl Recorder {
             fps: opts.fps,
             codec: CapCodec::Hevc,
             bitrate: bitrate.max(4_000_000),
+            quality: Some(RECORD_QUALITY),
             system_audio: opts.system_audio,
             mic: opts.mic.clone(),
             webcam: None,

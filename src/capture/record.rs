@@ -73,6 +73,8 @@ pub struct Options {
     pub fps: u32,
     pub codec: Codec,
     pub bitrate: u64,
+    /// Constant quality 0..1 instead of `bitrate`.
+    pub quality: Option<f64>,
     pub system_audio: bool,
     pub mic: Option<Option<String>>,
     pub webcam: Option<Option<String>>,
@@ -146,7 +148,7 @@ impl Session {
     pub fn start(o: &Options, target: Option<screen::Target>, write: bool, preview: Option<PreviewFn>) -> Result<Session> {
         let (w, h) = o.size;
         let pixel_format = if o.webcam.is_some() { PIX_BGRA } else { PIX_420V };
-        let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
+        let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, quality: o.quality, pixel_format };
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
         let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.gains_db, compositor, o.scene, preview)?;
@@ -393,7 +395,11 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             h,
             o.fps,
             o.codec,
-            if o.codec == Codec::Prores { String::new() } else { format!(" {} Mb/s", o.bitrate / 1_000_000) },
+            match (o.codec, o.quality) {
+                (Codec::Prores, _) => String::new(),
+                (_, Some(q)) => format!(" quality {q}"),
+                _ => format!(" {} Mb/s", o.bitrate / 1_000_000),
+            },
             if o.system_audio { "on" } else { "off" },
             mic_desc,
             sess.camera_name().unwrap_or("off"),

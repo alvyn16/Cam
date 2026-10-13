@@ -26,7 +26,10 @@ pub struct WriterSpec {
     pub height: u32,
     pub fps: u32,
     pub codec: Codec,
+    /// Average bitrate, used when `quality` is None (fit to a file size).
     pub bitrate: u64,
+    /// Constant quality 0..1 (VideoToolbox spends what each frame needs).
+    pub quality: Option<f64>,
     pub audio: bool,
 }
 
@@ -48,8 +51,12 @@ unsafe impl Send for MovieWriter {}
 
 fn video_settings(s: &WriterSpec) -> Retained<Dict> {
     unsafe {
+        let rate = match s.quality {
+            Some(q) => (AVVideoQualityKey.unwrap(), num_f(q)),
+            None => (AVVideoAverageBitRateKey.unwrap(), num_i(s.bitrate as i64)),
+        };
         let mut compression = vec![
-            (AVVideoAverageBitRateKey.unwrap(), num_i(s.bitrate as i64)),
+            rate,
             (AVVideoExpectedSourceFrameRateKey.unwrap(), num_i(s.fps as i64)),
             (AVVideoMaxKeyFrameIntervalDurationKey.unwrap(), num_f(2.0)),
             (AVVideoAllowFrameReorderingKey.unwrap(), num_b(true)),
@@ -60,20 +67,35 @@ fn video_settings(s: &WriterSpec) -> Retained<Dict> {
                     .push((AVVideoProfileLevelKey.unwrap(), obj(AVVideoProfileLevelH264HighAutoLevel.unwrap())));
                 AVVideoCodecTypeH264.unwrap()
             }
-            Codec::Hevc => AVVideoCodecTypeHEVC.unwrap(),
+            Codec::Prores => AVVideoCodecTypeAppleProRes4444.unwrap(),
+            Codec::Hevc => {
+                // kVTProfileLevel_HEVC_Main_AutoLevel: 8-bit 4:2:0, level
+                // chosen from the size and frame rate.
+                compression.push((AVVideoProfileLevelKey.unwrap(), obj(&*ns("HEVC_Main_AutoLevel"))));
+                AVVideoCodecTypeHEVC.unwrap()
+            }
         };
+        // Frames are sRGB-encoded screen pixels (ScreenCaptureKit captures
+        // in sRGB and nothing in between converts): BT.709 primaries and
+        // matrix with the sRGB transfer function, so players show exactly
+        // the recorded colours. A BT.709 transfer tag would make QuickTime
+        // and Safari decode with a different curve and lift the shadows.
         let color = dict(vec![
             (AVVideoColorPrimariesKey.unwrap(), obj(AVVideoColorPrimaries_ITU_R_709_2.unwrap())),
-            (AVVideoTransferFunctionKey.unwrap(), obj(AVVideoTransferFunction_ITU_R_709_2.unwrap())),
+            (AVVideoTransferFunctionKey.unwrap(), obj(AVVideoTransferFunction_IEC_sRGB.unwrap())),
             (AVVideoYCbCrMatrixKey.unwrap(), obj(AVVideoYCbCrMatrix_ITU_R_709_2.unwrap())),
         ]);
-        dict(vec![
+        let mut settings = vec![
             (AVVideoCodecKey.unwrap(), obj(codec)),
             (AVVideoWidthKey.unwrap(), num_i(s.width as i64)),
             (AVVideoHeightKey.unwrap(), num_i(s.height as i64)),
             (AVVideoColorPropertiesKey.unwrap(), obj(&*color)),
-            (AVVideoCompressionPropertiesKey.unwrap(), obj(&*dict(compression))),
-        ])
+        ];
+        // ProRes is fixed-quality intra-frame: no rate or GOP settings.
+        if s.codec != Codec::Prores {
+            settings.push((AVVideoCompressionPropertiesKey.unwrap(), obj(&*dict(compression))));
+        }
+        dict(settings)
     }
 }
 

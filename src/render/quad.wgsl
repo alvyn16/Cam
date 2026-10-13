@@ -112,6 +112,59 @@ fn sample_at(uv: vec2<f32>, lod: f32) -> vec4<f32> {
     return textureSampleLevel(tex, samp, uv, lod);
 }
 
+// Catmull-Rom cubic (bicubic B=0, C=0.5): sharp without the ringing of
+// Lanczos; zero at the integers, so it reproduces texels exactly at 1:1.
+fn cubic_w(x: f32) -> f32 {
+    let t = abs(x);
+    if t < 1.0 {
+        return (1.5 * t - 2.5) * t * t + 1.0;
+    }
+    if t < 2.0 {
+        return ((-0.5 * t + 2.5) * t - 4.0) * t + 2.0;
+    }
+    return 0.0;
+}
+
+// Resample the texture for one output pixel covering `foot` texels. When
+// minified, a Catmull-Rom kernel stretched to the footprint (a proper
+// downscale filter: text stays sharp and doesn't alias); when magnified,
+// bilinear. At exactly 1:1 on the texel grid this is the texel itself.
+fn sample_area(uv: vec2<f32>, foot: vec2<f32>) -> vec4<f32> {
+    if foot.x <= 1.001 && foot.y <= 1.001 {
+        return sample_at(uv, 0.0);
+    }
+    let dims = vec2<f32>(textureDimensions(tex, 0));
+    let f = max(foot, vec2<f32>(1.0));
+    if f.x > 4.0 || f.y > 4.0 {
+        // Very small: an 8x8 grid of bilinear taps over the footprint.
+        var acc = vec4<f32>(0.0);
+        for (var y = 0; y < 8; y++) {
+            for (var x = 0; x < 8; x++) {
+                let o = (vec2<f32>(f32(x), f32(y)) + 0.5) / 8.0 - 0.5;
+                acc += sample_at(uv + o * f / dims, 0.0);
+            }
+        }
+        return acc / 64.0;
+    }
+    let c = uv * dims - 0.5;
+    let r = 2.0 * f;
+    let lo = vec2<i32>(ceil(c - r));
+    let hi = vec2<i32>(floor(c + r));
+    let maxi = vec2<i32>(dims) - vec2<i32>(1);
+    var acc = vec4<f32>(0.0);
+    var wsum = 0.0;
+    for (var y = lo.y; y <= hi.y; y++) {
+        let wy = cubic_w((f32(y) - c.y) / f.y);
+        for (var x = lo.x; x <= hi.x; x++) {
+            let w = cubic_w((f32(x) - c.x) / f.x) * wy;
+            let t = clamp(vec2<i32>(x, y), vec2<i32>(0), maxi);
+            acc += textureLoad(tex, t, 0) * w;
+            wsum += w;
+        }
+    }
+    return clamp(acc / max(wsum, 1e-6), vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
 // Sample with an optional blur radius given in texture pixels.
 fn sample_blur(uv: vec2<f32>, radius_px: f32) -> vec4<f32> {
     if radius_px < 0.5 {
@@ -269,7 +322,9 @@ fn mode_window(local: vec2<f32>) -> vec4<f32> {
         let p = local - ripple_offset(local);
         let lo = center - inner_half;
         let t = clamp((p - lo) / (inner_half * 2.0), vec2<f32>(0.0), vec2<f32>(1.0));
-        screen = sample_at(d.uv.xy + t * d.uv.zw, 0.0);
+        let dims = vec2<f32>(textureDimensions(tex, 0));
+        let foot = d.uv.zw * dims / max(inner_half * 2.0, vec2<f32>(1.0));
+        screen = sample_area(d.uv.xy + t * d.uv.zw, foot);
         screen = vec4<f32>(screen.rgb, 1.0);
     }
     let inset_col = premul(d.p1);

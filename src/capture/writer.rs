@@ -46,6 +46,8 @@ pub struct VideoSpec {
     pub fps: u32,
     pub codec: Codec,
     pub bitrate: u64,
+    /// Constant quality 0..1 instead of `bitrate` (H.264/HEVC).
+    pub quality: Option<f64>,
     /// Pixel format of buffers handed to the encoder.
     pub pixel_format: u32,
 }
@@ -228,8 +230,12 @@ pub const LAG_SECS: f64 = 0.05;
 
 fn video_settings(v: &VideoSpec) -> Retained<Dict> {
     unsafe {
+        let rate = match v.quality {
+            Some(q) => (AVVideoQualityKey.unwrap(), num_f(q)),
+            None => (AVVideoAverageBitRateKey.unwrap(), num_i(v.bitrate as i64)),
+        };
         let mut compression = vec![
-            (AVVideoAverageBitRateKey.unwrap(), num_i(v.bitrate as i64)),
+            rate,
             (AVVideoExpectedSourceFrameRateKey.unwrap(), num_i(v.fps as i64)),
             (AVVideoMaxKeyFrameIntervalDurationKey.unwrap(), num_f(2.0)),
             (AVVideoAllowFrameReorderingKey.unwrap(), num_b(false)),
@@ -247,6 +253,9 @@ fn video_settings(v: &VideoSpec) -> Retained<Dict> {
         };
         let color = dict(vec![
             (AVVideoColorPrimariesKey.unwrap(), obj(AVVideoColorPrimaries_ITU_R_709_2.unwrap())),
+            // Keep the tags ScreenCaptureKit attaches to its buffers: any
+            // other transfer function makes VideoToolbox convert the pixels
+            // (a visible tone shift). The editor reads the values as is.
             (AVVideoTransferFunctionKey.unwrap(), obj(AVVideoTransferFunction_ITU_R_709_2.unwrap())),
             (AVVideoYCbCrMatrixKey.unwrap(), obj(AVVideoYCbCrMatrix_ITU_R_709_2.unwrap())),
         ]);
