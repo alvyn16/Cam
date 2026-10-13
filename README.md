@@ -2,6 +2,8 @@
 
 # Glide
 
+**An open-source Screen Studio, built in Rust.**
+
 A fast, fully open-source, native Rust screen recorder for polished product
 videos on macOS. Record your screen, a window, an area or an iPhone; Glide
 re-renders the cursor, zooms into what you click with spring animations, adds
