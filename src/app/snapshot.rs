@@ -83,7 +83,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
             Some(ctx.load_texture("live-preview", egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px), egui::TextureOptions::LINEAR))
         }
         Some(_) => {
-            let p = crate::capture::preview::LivePreview::start(&crate::capture::preview::Source::Display { id: 0 }, 1280, 10, || {})?;
+            let p = crate::capture::preview::LivePreview::start(&crate::capture::preview::Source::Display { id: 0 }, 1280, 10, false, || {})?;
             let t0 = std::time::Instant::now();
             let frame = loop {
                 if let Some(f) = p.take_frame() {
@@ -97,7 +97,32 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         }
         None => None,
     };
-    let live = live_tex.as_ref().map(|t| (t.id(), t.size_vec2()));
+    // With a synthetic preview, show a camera bubble and meters too.
+    let synthetic = shot.live.as_deref() == Some("synthetic") && editor.is_none();
+    let cam_tex = synthetic.then(|| {
+        let (w, h) = (640usize, 480usize);
+        let mut px = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f32 - 320.0, y as f32 - 200.0);
+                let face = dx * dx / 1.0 + dy * dy / 1.4 < 110.0 * 110.0;
+                let c = if face { [224, 182, 150] } else { [60 + (y / 8) as u8, 80, 110] };
+                px.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            }
+        }
+        ctx.load_texture("camera-preview", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)
+    });
+    if synthetic {
+        settings.camera = true;
+        settings.mic = true;
+    }
+    let live = home::LiveView {
+        screen: live_tex.as_ref().map(|t| (t.id(), t.size_vec2())),
+        camera: cam_tex.as_ref().map(|t| (t.id(), t.size_vec2())),
+        system_level: synthetic.then_some(0.3),
+        mic_level: synthetic.then_some(0.6),
+        note: None,
+    };
 
     let mut last = None;
     for i in 0..8 {
@@ -134,7 +159,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
                     ed.ui(ui, &mut renderer, &mut chrome);
                 }
                 None => {
-                    home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, None, live);
+                    home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, None, &live);
                 }
             }
             // The popover itself (a menu only opens from a click).

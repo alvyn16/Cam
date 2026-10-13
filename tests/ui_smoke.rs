@@ -126,7 +126,7 @@ fn editor_and_home_render_every_panel() {
 
     // Start view (no recording open) with this folder as the library, every
     // source, the recents popover and the permission note.
-    // With and without a live preview texture under the Record button.
+    // With and without live preview textures (source and camera) and meters.
     let tex = ctx.load_texture("live", egui::ColorImage::new([64, 40], vec![egui::Color32::DARK_GRAY; 64 * 40]), egui::TextureOptions::LINEAR);
     for (source, live) in [
         (home::SourceKind::Display, Some((tex.id(), tex.size_vec2()))),
@@ -135,10 +135,18 @@ fn editor_and_home_render_every_panel() {
         (home::SourceKind::Device, None),
     ] {
         settings.source = source;
+        settings.camera = live.is_some();
+        let live = home::LiveView {
+            screen: live,
+            camera: live,
+            system_level: live.map(|_| 0.4),
+            mic_level: None,
+            note: live.is_none().then(|| "Choose a window to see it here.".into()),
+        };
         for _ in 0..2 {
             t += 0.016;
             frame(&ctx, t, |ui| {
-                let a = home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, Some("permission note"), live);
+                let a = home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, Some("permission note"), &live);
                 assert!(matches!(a, home::Action::None));
             });
         }

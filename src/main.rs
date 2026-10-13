@@ -200,6 +200,9 @@ enum Cmd {
         /// x,y,w,h in points on the main display.
         #[arg(long)]
         area: Option<String>,
+        /// A camera ("default", or a unique id / name from `glide devices`).
+        #[arg(long)]
+        camera: Option<String>,
         #[arg(long, default_value_t = 2.0)]
         secs: f64,
         #[arg(short, long)]
@@ -305,9 +308,11 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Preview { window, area, secs, output }) => {
+        Some(Cmd::Preview { window, area, camera, secs, output }) => {
             use glide::capture::preview::{LivePreview, Source};
-            let source = if let Some(w) = window {
+            let source = if let Some(c) = camera {
+                Source::Camera { id: (c != "default").then_some(c) }
+            } else if let Some(w) = window {
                 Source::Window { id: glide::capture::screen::find_window(&w)?.id }
             } else if let Some(a) = area {
                 let v: Vec<f64> = a.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
@@ -319,7 +324,7 @@ fn main() -> Result<()> {
             let frames = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let counter = frames.clone();
             let t0 = Instant::now();
-            let p = LivePreview::start(&source, 1280, 10, move || {
+            let p = LivePreview::start(&source, 1280, 10, false, move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             })?;
             let started = t0.elapsed().as_secs_f64();

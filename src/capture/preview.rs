@@ -1,7 +1,10 @@
 //! Live preview of a capture source for the recording-setup canvas: a
 //! separate, low-rate ScreenCaptureKit stream (small frames, a few per
-//! second) that only keeps the newest frame, copied out as RGBA.
+//! second), or an AVCaptureSession for a camera or iPhone, that only keeps
+//! the newest frame, copied out as RGBA. Screen previews can also report the
+//! level of the audio they'd record.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -10,12 +13,13 @@ use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_media::{CMSampleBuffer, CMTime};
+use objc2_av_foundation::*;
 use objc2_core_video::*;
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::*;
 use dispatch2::DispatchQueue;
 
-use super::screen;
+use super::{camera, screen};
 
 /// What to preview (display ids as CoreGraphics reports them; 0 = main).
 #[derive(Clone, Debug, PartialEq)]
@@ -24,6 +28,10 @@ pub enum Source {
     /// A region of a display in points (x, y, w, h, top-left origin).
     Area { display: u32, rect: [f64; 4] },
     Window { id: u32 },
+    /// A camera (None = the default one).
+    Camera { id: Option<String> },
+    /// A USB-connected iPhone or iPad's screen.
+    Device { id: String },
 }
 
 /// One preview frame, RGBA.
@@ -38,6 +46,8 @@ type Callback = Box<dyn Fn() + Send + Sync>;
 pub struct Ivars {
     latest: Arc<Mutex<Option<Frame>>>,
     on_frame: Callback,
+    /// Peak audio level (f32 bits, 0..1) since it was last read.
+    level: Arc<AtomicU32>,
 }
 
 define_class!(
@@ -53,14 +63,27 @@ define_class!(
         unsafe fn did_output(&self, _stream: &SCStream, sb: &CMSampleBuffer, kind: SCStreamOutputType) {
             if kind == SCStreamOutputType::Screen {
                 self.handle(sb);
+            } else if kind == SCStreamOutputType::Audio
+                && let Some((_, _, frames)) = super::mixer::decode(sb)
+            {
+                let peak = frames.iter().fold(0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
+                // Non-negative f32 bits order like the floats.
+                self.ivars().level.fetch_max(peak.min(1.0).to_bits(), Ordering::Relaxed);
             }
+        }
+    }
+
+    unsafe impl AVCaptureVideoDataOutputSampleBufferDelegate for PreviewOutput {
+        #[unsafe(method(captureOutput:didOutputSampleBuffer:fromConnection:))]
+        unsafe fn camera_output(&self, _o: &AVCaptureOutput, sb: &CMSampleBuffer, _c: &AVCaptureConnection) {
+            self.handle(sb);
         }
     }
 );
 
 impl PreviewOutput {
-    fn create(latest: Arc<Mutex<Option<Frame>>>, on_frame: Callback) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(Ivars { latest, on_frame });
+    fn create(latest: Arc<Mutex<Option<Frame>>>, level: Arc<AtomicU32>, on_frame: Callback) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(Ivars { latest, on_frame, level });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -93,12 +116,18 @@ impl PreviewOutput {
     }
 }
 
+enum Capture {
+    Screen(Retained<SCStream>),
+    Camera(Retained<AVCaptureSession>),
+}
+
 /// A running preview stream; stops when dropped.
 pub struct LivePreview {
-    stream: Retained<SCStream>,
+    capture: Capture,
     _output: Retained<PreviewOutput>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
     latest: Arc<Mutex<Option<Frame>>>,
+    level: Arc<AtomicU32>,
 }
 
 // SAFETY: the stream is only started and stopped through thread-safe
@@ -108,8 +137,14 @@ unsafe impl Send for LivePreview {}
 impl LivePreview {
     /// Start previewing `source` at most `max_px` on the long edge and `fps`
     /// frames per second, calling `on_frame` (from a capture queue) after each
-    /// new frame. Glide's own windows are left out.
-    pub fn start(source: &Source, max_px: u32, fps: u32, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
+    /// new frame. Glide's own windows are left out. With `audio`, a screen
+    /// preview also measures the system audio it would record (`level`).
+    pub fn start(source: &Source, max_px: u32, fps: u32, audio: bool, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
+        match source {
+            Source::Camera { id } => return Self::start_camera(camera::find_camera(id.as_deref())?, on_frame),
+            Source::Device { id } => return Self::start_camera(camera::find_ios(id)?, on_frame),
+            _ => {}
+        }
         let displays = screen::displays()?;
         let display_for = |id: u32| displays.iter().find(|d| d.id == id || id == 0).context("display not found");
         // SAFETY: ScreenCaptureKit configuration on objects we own.
@@ -138,6 +173,7 @@ impl LivePreview {
                     let w = screen::windows()?.into_iter().find(|w| w.id == *id).context("that window is no longer on screen")?;
                     (SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w.window), w.size)
                 }
+                Source::Camera { .. } | Source::Device { .. } => unreachable!(),
             };
             if size.0 < 2.0 || size.1 < 2.0 {
                 bail!("nothing to preview");
@@ -152,19 +188,76 @@ impl LivePreview {
             conf.setShowsCursor(true);
             conf.setScalesToFit(true);
             conf.setPreservesAspectRatio(true);
-            conf.setCapturesAudio(false);
+            conf.setCapturesAudio(audio);
+            conf.setExcludesCurrentProcessAudio(true);
 
             let latest = Arc::new(Mutex::new(None));
-            let output = PreviewOutput::create(latest.clone(), Box::new(on_frame));
+            let level = Arc::new(AtomicU32::new(0));
+            let output = PreviewOutput::create(latest.clone(), level.clone(), Box::new(on_frame));
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, None);
             let queue = DispatchQueue::new("glide.preview", None);
             let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Screen, Some(&queue))
                 .map_err(|e| anyhow::anyhow!("preview output: {}", e.localizedDescription()))?;
+            if audio {
+                stream
+                    .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Audio, Some(&queue))
+                    .map_err(|e| anyhow::anyhow!("preview audio: {}", e.localizedDescription()))?;
+            }
             wait(|b| stream.startCaptureWithCompletionHandler(Some(b))).context("starting the preview")?;
-            Ok(LivePreview { stream, _output: output, _queue: queue, latest })
+            Ok(LivePreview { capture: Capture::Screen(stream), _output: output, _queue: queue, latest, level })
         }
+    }
+
+    /// Preview a camera or iPhone through its own capture session (low preset).
+    fn start_camera(dev: Retained<AVCaptureDevice>, on_frame: impl Fn() + Send + Sync + 'static) -> Result<LivePreview> {
+        // SAFETY: AVFoundation configuration on objects we own.
+        unsafe {
+            let name = dev.localizedName().to_string();
+            let session = AVCaptureSession::new();
+            session.beginConfiguration();
+            if session.canSetSessionPreset(AVCaptureSessionPreset640x480) {
+                session.setSessionPreset(AVCaptureSessionPreset640x480);
+            }
+            let input = AVCaptureDeviceInput::deviceInputWithDevice_error(&dev)
+                .map_err(|e| anyhow::anyhow!("{name}: {}", e.localizedDescription()))?;
+            if !session.canAddInput(&input) {
+                bail!("cannot use {name}");
+            }
+            session.addInput(&input);
+            let out = AVCaptureVideoDataOutput::new();
+            // Small frames: the output scales (keeping the aspect ratio).
+            let dims = dev.activeFormat().formatDescription();
+            let d = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&dims);
+            let scale = (640.0 / d.width.max(d.height).max(1) as f64).min(1.0);
+            let even = |v: i32| ((v as f64 * scale) as i64 / 2 * 2).max(2);
+            out.setVideoSettings(Some(&crate::util::dict(vec![
+                (crate::util::cf_ns(kCVPixelBufferPixelFormatTypeKey), crate::util::num_i(crate::util::PIX_BGRA as i64)),
+                (crate::util::cf_ns(kCVPixelBufferWidthKey), crate::util::num_i(even(d.width))),
+                (crate::util::cf_ns(kCVPixelBufferHeightKey), crate::util::num_i(even(d.height))),
+            ])));
+            out.setAlwaysDiscardsLateVideoFrames(true);
+            let latest = Arc::new(Mutex::new(None));
+            let output = PreviewOutput::create(latest.clone(), Arc::new(AtomicU32::new(0)), Box::new(on_frame));
+            let queue = DispatchQueue::new("glide.preview.camera", None);
+            out.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*output)), Some(&queue));
+            if !session.canAddOutput(&out) {
+                bail!("cannot preview {name}");
+            }
+            session.addOutput(&out);
+            session.commitConfiguration();
+            session.startRunning();
+            if !session.isRunning() {
+                bail!("{name} failed to start");
+            }
+            Ok(LivePreview { capture: Capture::Camera(session), _output: output, _queue: queue, latest, level: Arc::new(AtomicU32::new(0)) })
+        }
+    }
+
+    /// Peak audio level (0..1) since the last call; 0 without audio.
+    pub fn take_level(&self) -> f32 {
+        f32::from_bits(self.level.swap(0, Ordering::Relaxed))
     }
 
     /// The newest frame since the last call.
@@ -175,8 +268,14 @@ impl LivePreview {
 
 impl Drop for LivePreview {
     fn drop(&mut self) {
-        // SAFETY: stopping a stream we started; errors (already stopped) are fine.
-        let _ = wait(|b| unsafe { self.stream.stopCaptureWithCompletionHandler(Some(b)) });
+        match &self.capture {
+            // SAFETY: stopping a stream we started; errors (already stopped) are fine.
+            Capture::Screen(stream) => {
+                let _ = wait(|b| unsafe { stream.stopCaptureWithCompletionHandler(Some(b)) });
+            }
+            // SAFETY: stopping a session we started.
+            Capture::Camera(session) => unsafe { session.stopRunning() },
+        }
     }
 }
 

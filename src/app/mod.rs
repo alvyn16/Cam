@@ -106,18 +106,96 @@ enum Which {
     Overlay(u32),
 }
 
-/// Live preview state: the stream that's running (or starting) for which
-/// source, and the texture its frames go into.
+/// Something started on a background thread for a key (a preview stream for
+/// a source, a meter for a microphone): what's wanted, what's running and
+/// what's starting. Changes settle before restarting; a key that failed
+/// isn't retried until the wanted key changes.
+struct Slot<K, V> {
+    want: Option<K>,
+    want_since: Option<Instant>,
+    running: Option<(K, V)>,
+    starting: Option<(K, std::sync::mpsc::Receiver<Result<V, String>>)>,
+    failed: Option<(K, String)>,
+}
+
+impl<K, V> Default for Slot<K, V> {
+    fn default() -> Self {
+        Slot { want: None, want_since: None, running: None, starting: None, failed: None }
+    }
+}
+
+impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
+    /// Match `want`; `start` runs on a background thread. Returns true when
+    /// the running value was stopped (its output is stale).
+    fn update(&mut self, want: Option<K>, name: &str, start: fn(&K) -> Result<V, String>) -> bool {
+        let mut stopped = false;
+        if want != self.want {
+            self.want = want.clone();
+            self.want_since = Some(Instant::now());
+            self.failed = None;
+        }
+        if self.running.as_ref().is_some_and(|(k, _)| Some(k) != want.as_ref()) {
+            let (_, v) = self.running.take().unwrap();
+            std::thread::spawn(move || drop(v));
+            stopped = true;
+        }
+        if let Some((k, rx)) = &self.starting
+            && let Ok(result) = rx.try_recv()
+        {
+            let k = k.clone();
+            self.starting = None;
+            match result {
+                Ok(v) if Some(&k) == want.as_ref() && self.running.is_none() => self.running = Some((k, v)),
+                Ok(v) => drop(std::thread::spawn(move || drop(v))),
+                Err(e) => {
+                    eprintln!("glide: {name}: {e}");
+                    self.failed = Some((k, e));
+                }
+            }
+        }
+        // Wait for edits (an area being typed in) to settle before starting.
+        let settled = self.want_since.is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
+        if let Some(k) = want
+            && settled
+            && self.running.is_none()
+            && self.starting.is_none()
+            && self.failed.as_ref().is_none_or(|(f, _)| *f != k)
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let key = k.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(objc2::rc::autoreleasepool(|_| start(&key)));
+                wake();
+            });
+            self.starting = Some((k, rx));
+        }
+        stopped
+    }
+
+    fn active(&self) -> bool {
+        self.running.is_some() || self.starting.is_some()
+    }
+
+    /// Why the wanted key isn't running, if it failed.
+    fn error(&self) -> Option<&str> {
+        self.failed.as_ref().filter(|(k, _)| self.want.as_ref() == Some(k)).map(|(_, e)| e.as_str())
+    }
+}
+
+/// Live preview state for recording setup: the source's stream (with its
+/// system-audio level), the camera's, the microphone's meter, the textures
+/// their frames go into and the levels shown.
 #[derive(Default)]
 struct Live {
-    /// Wanted source and since when (changes settle before restarting).
-    want: Option<livecap::Source>,
-    want_since: Option<Instant>,
-    running: Option<(livecap::Source, livecap::LivePreview)>,
-    starting: Option<(livecap::Source, std::sync::mpsc::Receiver<Result<livecap::LivePreview, String>>)>,
-    /// A source that failed to start (not retried until the source changes).
-    failed: Option<livecap::Source>,
+    /// Source and whether to measure its audio.
+    screen: Slot<(livecap::Source, bool), livecap::LivePreview>,
+    camera: Slot<livecap::Source, livecap::LivePreview>,
+    /// Microphone name (None = default input).
+    mic: Slot<Option<String>, crate::capture::meter::MicMeter>,
     tex: Option<egui::TextureHandle>,
+    cam_tex: Option<egui::TextureHandle>,
+    /// Displayed levels (peak hold with decay).
+    levels: [f32; 2],
 }
 
 /// Area picker state, in overlay-window points (= display points).
@@ -999,7 +1077,7 @@ impl App {
                         _ => {}
                     }
                     if st.resumed && r.elapsed() >= 3.0 {
-                        let live = self.live.running.is_some() || self.live.starting.is_some();
+                        let live = self.live.screen.active() || self.live.camera.active() || self.live.mic.active();
                         let bar = self.bar.as_ref().map(|b| (b.window_number(), b.draggable()));
                         let at = self.bar.as_ref().map(|b| (b.origin().x.round(), b.origin().y.round()));
                         log(&format!("recording bar={bar:?} origin={at:?} elapsed={:.1}s live_preview_running={live}", r.elapsed()));
@@ -1108,17 +1186,8 @@ impl App {
         let note = self.permission_note.clone();
         let action = match &mut self.view {
             View::Start => {
-                if let Some((_, p)) = &self.live.running
-                    && let Some(f) = p.take_frame()
-                {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
-                    match &mut self.live.tex {
-                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                        None => self.live.tex = Some(ui.ctx().load_texture("live-preview", img, egui::TextureOptions::LINEAR)),
-                    }
-                }
-                let live = self.live.tex.as_ref().filter(|_| self.live.running.is_some()).map(|t| (t.id(), t.size_vec2()));
-                home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref(), live)
+                let live = self.live_view(ui.ctx());
+                home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref(), &live)
             }
             View::Editor(ed) => {
                 let mut chrome = home::Chrome {
@@ -1178,17 +1247,26 @@ impl App {
         }
     }
 
+    /// Whether recording setup is on screen with nothing being recorded
+    /// (when its previews and meters run).
+    fn setup_visible(&self) -> bool {
+        let visible = self.main.as_ref().is_some_and(|w| w.window.is_visible() != Some(false)) && !self.main_occluded;
+        matches!(self.view, View::Start) && visible && self.recording.is_none() && !self.finishing
+    }
+
     /// The source to preview live, if the recording-setup canvas is showing
     /// and nothing is being recorded.
     fn live_source(&self) -> Option<livecap::Source> {
-        let visible = self.main.as_ref().is_some_and(|w| w.window.is_visible() != Some(false)) && !self.main_occluded;
-        if !matches!(self.view, View::Start) || !visible || self.recording.is_some() || self.finishing {
+        if !self.setup_visible() {
             return None;
+        }
+        let s = &self.settings;
+        if s.source == SourceKind::Device {
+            return s.ios_device.clone().map(|id| livecap::Source::Device { id });
         }
         if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted {
             return None;
         }
-        let s = &self.settings;
         match s.source {
             SourceKind::Display => Some(livecap::Source::Display { id: s.display }),
             SourceKind::Area if s.area[2] >= 8.0 && s.area[3] >= 8.0 => Some(livecap::Source::Area { display: s.display, rect: s.area }),
@@ -1197,51 +1275,82 @@ impl App {
         }
     }
 
-    /// Start, switch or stop the live preview to match what's on screen.
-    /// Streams start and stop on background threads.
+    /// Start, switch or stop the live previews and meters to match what's on
+    /// screen. Streams start and stop on background threads.
     fn update_live(&mut self) {
-        let want = self.live_source();
-        let live = &mut self.live;
-        if want != live.want {
-            live.want = want.clone();
-            live.want_since = Some(Instant::now());
-            live.failed = None;
+        if self.settings.resolve_window(&self.devices) && !self.scripted() {
+            self.settings.save();
         }
-        if live.running.as_ref().is_some_and(|(src, _)| Some(src) != want.as_ref()) {
-            let (_, p) = live.running.take().unwrap();
-            std::thread::spawn(move || drop(p));
+        let visible = self.setup_visible();
+        let s = &self.settings;
+        let screen = self.live_source().map(|src| {
+            let audio = s.system_audio && !matches!(src, livecap::Source::Device { .. });
+            (src, audio)
+        });
+        let camera = (visible && s.camera).then(|| livecap::Source::Camera { id: s.camera_id.clone() });
+        let mic = (visible && s.mic && self.selftest.is_none()).then(|| s.mic_id.as_ref().and_then(|id| self.devices.mics.iter().find(|m| &m.id == id)).map(|m| m.name.clone()));
+        let live = &mut self.live;
+        if live.screen.update(screen, "live preview", |(src, audio)| livecap::LivePreview::start(src, 1280, 10, *audio, wake).map_err(|e| format!("{e:#}"))) {
             live.tex = None;
         }
-        if let Some((src, rx)) = &live.starting
-            && let Ok(result) = rx.try_recv()
-        {
-            let src = src.clone();
-            live.starting = None;
-            match result {
-                Ok(p) if Some(&src) == want.as_ref() && live.running.is_none() => live.running = Some((src, p)),
-                Ok(p) => drop(std::thread::spawn(move || drop(p))),
-                Err(e) => {
-                    eprintln!("glide: live preview: {e}");
-                    live.failed = Some(src);
+        if live.camera.update(camera, "camera preview", |src| livecap::LivePreview::start(src, 640, 15, false, wake).map_err(|e| format!("{e:#}"))) {
+            live.cam_tex = None;
+        }
+        live.mic.update(mic, "mic meter", |name| crate::capture::meter::MicMeter::start(name.as_deref()).map_err(|e| format!("{e:#}")));
+    }
+
+    /// Newest preview frames into their textures, levels into the meters,
+    /// and what the start view should show.
+    fn live_view(&mut self, ctx: &egui::Context) -> home::LiveView {
+        let live = &mut self.live;
+        let upload = |slot: &mut Option<egui::TextureHandle>, p: &livecap::LivePreview, name: &str| {
+            if let Some(f) = p.take_frame() {
+                let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                match slot {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => *slot = Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR)),
                 }
             }
+        };
+        if let Some((_, p)) = &live.screen.running {
+            upload(&mut live.tex, p, "live-preview");
         }
-        // Wait for edits (an area being typed in) to settle before starting.
-        let settled = live.want_since.is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
-        if let Some(src) = want
-            && settled
-            && live.running.is_none()
-            && live.starting.is_none()
-            && live.failed.as_ref() != Some(&src)
-        {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let start = src.clone();
-            std::thread::spawn(move || {
-                let r = objc2::rc::autoreleasepool(|_| livecap::LivePreview::start(&start, 1280, 10, wake)).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(r);
-                wake();
-            });
-            live.starting = Some((src, rx));
+        if let Some((_, p)) = &live.camera.running {
+            upload(&mut live.cam_tex, p, "camera-preview");
+        }
+        // Peak hold falling ~20 dB a second at 60 fps.
+        let sys = live.screen.running.as_ref().map(|(_, p)| p.take_level());
+        let mic = live.mic.running.as_ref().map(|(_, m)| m.take_level());
+        for (shown, new) in live.levels.iter_mut().zip([sys, mic]) {
+            *shown = new.map_or(0.0, |n| n.max(*shown * 0.97));
+        }
+        if live.levels.iter().any(|l| *l > 0.001) {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        let s = &self.settings;
+        let screen = live.tex.as_ref().filter(|_| live.screen.running.is_some()).map(|t| (t.id(), t.size_vec2()));
+        let note = if screen.is_some() {
+            None
+        } else if let Some(e) = live.screen.error() {
+            Some(format!("Preview unavailable: {e}"))
+        } else {
+            match s.source {
+                SourceKind::Window if s.window.is_none() => Some("Choose a window to see it here.".into()),
+                SourceKind::Device if s.ios_device.is_none() => Some("Connect an iPhone or iPad to see it here.".into()),
+                SourceKind::Device => None,
+                _ if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted => {
+                    Some("Allow Screen Recording for Glide to see a live preview.".into())
+                }
+                _ => None,
+            }
+        };
+        home::LiveView {
+            screen,
+            camera: live.cam_tex.as_ref().filter(|_| live.camera.running.is_some()).map(|t| (t.id(), t.size_vec2())),
+            // Inputs that are on show a (possibly empty) meter.
+            system_level: Some(live.levels[0]),
+            mic_level: Some(live.levels[1]),
+            note,
         }
     }
 
@@ -1550,6 +1659,7 @@ impl App {
             Some(id) => {
                 self.settings.source = SourceKind::Window;
                 self.settings.window = Some(id);
+                self.settings.window_label = None;
                 if !self.scripted() {
                     self.settings.save();
                 }

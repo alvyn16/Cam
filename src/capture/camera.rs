@@ -198,6 +198,37 @@ pub fn resolve_mic(sel: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no microphone matches {sel:?} (see `glide devices`)"))
 }
 
+/// The camera `sel` names: None = the system-preferred camera (what FaceTime
+/// would use), else the built-in camera, else anything; Some = unique ID or
+/// name substring.
+pub fn find_camera(sel: Option<&str>) -> Result<Retained<AVCaptureDevice>> {
+    let cams = cameras_raw();
+    match sel {
+        None => unsafe { AVCaptureDevice::systemPreferredCamera() }
+            .or_else(|| {
+                cams.iter()
+                    .find(|d| unsafe { d.deviceType().to_string() == AVCaptureDeviceTypeBuiltInWideAngleCamera.to_string() })
+                    .cloned()
+            })
+            .or_else(|| cams.into_iter().next()),
+        Some(s) => {
+            let lower = s.to_lowercase();
+            cams.into_iter().find(|d| unsafe {
+                d.uniqueID().to_string() == s || d.localizedName().to_string().to_lowercase().contains(&lower)
+            })
+        }
+    }
+    .ok_or_else(|| anyhow!("no camera found (see `glide devices`)"))
+}
+
+/// A connected iPhone/iPad by unique id.
+pub fn find_ios(id: &str) -> Result<Retained<AVCaptureDevice>> {
+    ios_raw()
+        .into_iter()
+        .find(|d| unsafe { d.uniqueID().to_string() } == id)
+        .ok_or_else(|| anyhow!("the iPhone/iPad is no longer connected"))
+}
+
 pub struct CamIvars {
     shared: Arc<Shared>,
     /// Deliver frames as the sink's primary ("screen") video, for a
@@ -248,35 +279,12 @@ impl Camera {
 
     /// Record a connected iOS device's screen as the sink's main video.
     pub fn start_ios(id: &str, shared: Arc<Shared>) -> Result<Self> {
-        let dev = ios_raw()
-            .into_iter()
-            .find(|d| unsafe { d.uniqueID().to_string() } == id)
-            .ok_or_else(|| anyhow!("the iPhone/iPad is no longer connected"))?;
-        Self::run(dev, shared, true, false)
+        Self::run(find_ios(id)?, shared, true, false)
     }
 
     /// Like `start`; `as_screen` routes frames to the sink's main video.
     pub fn start_with(sel: Option<&str>, shared: Arc<Shared>, as_screen: bool) -> Result<Self> {
-        let cams = cameras_raw();
-        let dev = match sel {
-            // System-preferred camera (what FaceTime would use), else the
-            // built-in camera, else anything.
-            None => unsafe { AVCaptureDevice::systemPreferredCamera() }
-                .or_else(|| {
-                    cams.iter()
-                        .find(|d| unsafe { d.deviceType().to_string() == AVCaptureDeviceTypeBuiltInWideAngleCamera.to_string() })
-                        .cloned()
-                })
-                .or_else(|| cams.into_iter().next()),
-            Some(s) => {
-                let lower = s.to_lowercase();
-                cams.into_iter().find(|d| unsafe {
-                    d.uniqueID().to_string() == s || d.localizedName().to_string().to_lowercase().contains(&lower)
-                })
-            }
-        }
-        .ok_or_else(|| anyhow!("no camera found (see `glide devices`)"))?;
-        Self::run(dev, shared, as_screen, true)
+        Self::run(find_camera(sel)?, shared, as_screen, true)
     }
 
     fn run(dev: Retained<AVCaptureDevice>, shared: Arc<Shared>, as_screen: bool, preset_720: bool) -> Result<Self> {

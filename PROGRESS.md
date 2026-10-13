@@ -143,6 +143,15 @@ transcription were exercised only through their code paths and test media.
 
 ## Log
 
+- 2026-10-12: recording setup redesigned after Rec (Micky's request): the
+  selected source live fills the canvas, with the camera in a round bubble;
+  a right sidebar with SCENE / SCREEN / CAMERA / AUDIO / OPTIONS and recent
+  recordings (Open a recording…); a bottom bar with a small record button,
+  timer and live System / Mic meters. Camera and iPhone previews
+  (AVCaptureSession, 640 px); system level from the preview stream, mic
+  level from CoreAudio. Window fix: a saved window id that went stale
+  (app relaunched) is found again by app and title, else cleared so Record
+  asks; untitled windows the picker offers now show in the window list.
 - 2026-10-11: REA analysis of Screen Studio 3.7.1; engine core with tests.
 - 2026-10-11: wgpu renderer, AVFoundation decode, VideoToolbox/GIF export,
   recorder with input logging; zero-copy export path.
