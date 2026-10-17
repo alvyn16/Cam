@@ -34,7 +34,7 @@ pub static FULLSCREEN_DISPLAY: std::sync::atomic::AtomicU32 = std::sync::atomic:
 /// Left inset of the toolbar's content: past the traffic lights, or a plain
 /// margin in full screen, where there are none.
 pub fn toolbar_left() -> i8 {
-    if FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed) { 16 } else { TRAFFIC_LIGHTS_W as i8 }
+    12
 }
 
 static ACCENT: AtomicU32 = AtomicU32::new(u32::from_be_bytes([0x00, 0x7a, 0xff, 0xff]));

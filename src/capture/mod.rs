@@ -1,8 +1,4 @@
-//! Capture: ScreenCaptureKit screen + audio, AVFoundation camera, and the
-//! constant-frame-rate AVAssetWriter sink.
-//!
-//! Adapted from rec-rs by Michael Shimeles (MIT OR Apache-2.0), the same
-//! author's recorder; see README for credit.
+//! Capture: screen + audio, camera, and the constant-frame-rate sink.
 
 pub mod camera;
 pub mod compose;

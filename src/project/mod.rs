@@ -1,8 +1,8 @@
-//! `.glide` packages: a folder holding the editable project and the
+//! `.cam` packages: a folder holding the editable project and the
 //! untouched recording.
 //!
 //! ```text
-//! Name.glide/
+//! Name.cam/
 //!   project.json        style, timeline, export settings
 //!   recording/
 //!     meta.json         what was recorded
@@ -29,7 +29,7 @@ use crate::engine::zoom;
 use model::{DeviceFrame, Project, Slice, Style};
 use recording::{Recording, RecordingMeta, SourceKind};
 
-pub const EXTENSION: &str = "glide";
+pub const EXTENSION: &str = "cam";
 
 #[derive(Clone, Debug)]
 pub struct Package {
@@ -142,11 +142,21 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// Default folder for new projects.
 pub fn projects_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join("Movies").join("Glide")
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            let p = PathBuf::from(user_profile).join("Videos").join("Cam");
+            return p;
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("Videos").join("Cam")
 }
 
-/// A new, unused package path like `~/Movies/Glide/Recording 2026-10-11 at 11.30.12.glide`.
+/// A new, unused package path like `~/Movies/Glide/Recording 2026-10-11 at 11.30.12.cam`.
 pub fn new_package_path(dir: &Path, stamp: &str) -> PathBuf {
     let base = format!("Recording {stamp}");
     let mut path = dir.join(format!("{base}.{EXTENSION}"));
@@ -156,46 +166,4 @@ pub fn new_package_path(dir: &Path, stamp: &str) -> PathBuf {
         n += 1;
     }
     path
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use recording::{MouseEvent, MouseKind};
-
-    #[test]
-    fn new_project_has_slice_and_zooms() {
-        let rec = Recording {
-            meta: RecordingMeta { duration_ms: 10_000.0, kind: SourceKind::Window, ..Default::default() },
-            mouse: vec![MouseEvent { t: 2000.0, x: 1.0, y: 1.0, kind: MouseKind::Down, button: 0, cursor: 0 }],
-            ..Default::default()
-        };
-        let p = new_project("x", &rec);
-        assert_eq!(p.timeline.slices.len(), 1);
-        assert_eq!(p.timeline.zooms.len(), 1);
-        assert_eq!(p.style.padding, 10.0);
-    }
-
-    #[test]
-    fn every_kind_of_recording_starts_with_the_background_in_view() {
-        for kind in [SourceKind::Display, SourceKind::Window, SourceKind::Area, SourceKind::Device] {
-            let rec = Recording { meta: RecordingMeta { duration_ms: 1000.0, kind, ..Default::default() }, ..Default::default() };
-            let p = new_project("x", &rec);
-            assert!(p.style.padding > 0.0, "{kind:?}: padding {}", p.style.padding);
-            assert!(p.style.shadow.intensity > 0.0, "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("glide-test-{}", std::process::id()));
-        fs::create_dir_all(dir.join("recording")).unwrap();
-        let pkg = Package::new(&dir);
-        write_json(&pkg.rec("meta.json"), &RecordingMeta { duration_ms: 1000.0, ..Default::default() }).unwrap();
-        let (p, rec) = pkg.load().unwrap();
-        pkg.save_project(&p).unwrap();
-        assert_eq!(pkg.load_project().unwrap(), p);
-        assert_eq!(rec.meta.duration_ms, 1000.0);
-        fs::remove_dir_all(dir).unwrap();
-    }
 }

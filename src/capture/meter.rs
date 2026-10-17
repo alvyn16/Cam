@@ -1,4 +1,4 @@
-//! Microphone level for the recording-setup meters: a CoreAudio (cpal)
+//! Microphone level for the recording-setup meters: a cpal
 //! input stream on its own thread that only tracks the peak.
 
 use std::sync::Arc;
@@ -15,8 +15,7 @@ pub struct MicMeter {
 }
 
 impl MicMeter {
-    /// Meter the input device named `name` (as AVFoundation names it), or the
-    /// default input.
+    /// Meter the input device named `name`, or the default input.
     pub fn start(name: Option<&str>) -> Result<MicMeter> {
         let level = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -44,12 +43,6 @@ impl MicMeter {
     }
 }
 
-impl Drop for MicMeter {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 fn open(name: Option<&str>, level: Arc<AtomicU32>) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = match name {
@@ -59,10 +52,10 @@ fn open(name: Option<&str>, level: Arc<AtomicU32>) -> Result<cpal::Stream> {
             .or_else(|| host.default_input_device()),
         None => host.default_input_device(),
     }
-    .context("no microphone")?;
+    .context("no microphone found")?;
     let supported = device.default_input_config()?;
     let config = supported.config();
-    let err = |e| eprintln!("glide: mic meter: {e}");
+    let err = |e| eprintln!("cam: mic meter: {e}");
     use cpal::SampleFormat as F;
     let stream = match supported.sample_format() {
         F::F32 => device.build_input_stream(config.clone(), move |d: &[f32], _: &_| peak(&level, d.iter().copied()), err, None)?,
@@ -75,7 +68,6 @@ fn open(name: Option<&str>, level: Arc<AtomicU32>) -> Result<cpal::Stream> {
 }
 
 fn peak(level: &AtomicU32, samples: impl Iterator<Item = f32>) {
-    let p = samples.fold(0f32, |m, x| m.max(x.abs())).min(1.0);
-    // Non-negative f32 bits order like the floats.
+    let p = samples.fold(0.0f32, |m, s| m.max(s.abs()));
     level.fetch_max(p.to_bits(), Ordering::Relaxed);
 }

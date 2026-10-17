@@ -187,9 +187,9 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                     {
                         *path = rel;
                     }
-                    if ui.button("Desktop wallpaper").on_hover_text("Use your current macOS desktop picture").clicked() {
-                        let tmp = std::env::temp_dir().join(format!("glide-wallpaper-{}.png", std::process::id()));
-                        match super::macos::save_desktop_wallpaper(&tmp).and_then(|_| ed.package.import_asset(&tmp, "wallpaper")) {
+                    if ui.button("Desktop wallpaper").on_hover_text("Use your current Windows desktop wallpaper").clicked() {
+                        let tmp = std::env::temp_dir().join(format!("cam-wallpaper-{}.png", std::process::id()));
+                        match super::os::save_desktop_wallpaper(&tmp).and_then(|_| ed.package.import_asset(&tmp, "wallpaper")) {
                             Ok(rel) => *path = rel,
                             Err(e) => ed.status = Some(format!("Couldn't use the desktop wallpaper: {e:#}")),
                         }
@@ -429,7 +429,6 @@ fn transcribe_controls(ui: &mut Ui, ed: &mut Editor) {
         let text = match (ed.caption_engine, p.phase.load(Ordering::Relaxed)) {
             (Engine::Whisper(m), 0) if !m.is_downloaded() => format!("Downloading Whisper {}… {pct:.0}%", m.name()),
             (Engine::Whisper(_), _) => format!("Transcribing on device… {pct:.0}%"),
-            (Engine::Apple, _) => "Transcribing on device…".into(),
         };
         ui.horizontal(|ui| {
             ui.spinner();
@@ -437,15 +436,6 @@ fn transcribe_controls(ui: &mut Ui, ed: &mut Editor) {
         });
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         return;
-    }
-    let mut whisper = matches!(ed.caption_engine, Engine::Whisper(_));
-    row(ui, "Engine", |ui| {
-        segmented(ui, &mut whisper, &[(true, "Whisper"), (false, "Apple")]);
-    });
-    match (whisper, ed.caption_engine) {
-        (true, Engine::Apple) => ed.caption_engine = Engine::Whisper(crate::whisper::best_downloaded().unwrap_or(Model::Base)),
-        (false, Engine::Whisper(_)) => ed.caption_engine = Engine::Apple,
-        _ => {}
     }
     if let Engine::Whisper(mut model) = ed.caption_engine {
         let label = |m: Model| {
@@ -459,9 +449,7 @@ fn transcribe_controls(ui: &mut Ui, ed: &mut Editor) {
             });
         });
         ed.caption_engine = Engine::Whisper(model);
-        caption(ui, "Runs on this Mac with Whisper. Larger models are more accurate but slower.");
-    } else {
-        caption(ui, "Uses Apple's on-device speech recognition (asks for Speech Recognition access).");
+        caption(ui, "Runs on device with Whisper. Larger models are more accurate but slower.");
     }
     if ui.button("Transcribe microphone").clicked() {
         ed.start_transcription();
@@ -528,9 +516,7 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 if ui.button("Record from playhead").on_hover_text("Narrate over the video; the preview plays silently").clicked() {
                     ed.deferred = Some(Deferred::StartVoice);
                 }
-                if crate::capture::camera::builtin_mic_off(None) {
-                    caption(ui, "The lid is closed, so the built-in microphone only records silence. Pick another input in System Settings › Sound.");
-                }
+                
             }
         }
         if !d.timeline.voiceovers.is_empty() {
@@ -562,7 +548,7 @@ fn shortcuts(ui: &mut Ui, d: &mut Project, keys: usize) {
         toggle_row(ui, "Include single keys", &mut s.single_keys);
         slider(ui, "Size", &mut s.size, 0.5..=2.0, "×");
         if keys == 0 {
-            caption(ui, "No key presses were recorded. Grant Glide Input Monitoring in System Settings › Privacy & Security to capture them.");
+            caption(ui, "No key presses were recorded. Key logging requires appropriate permissions on Windows.");
         } else {
             caption(ui, &format!("{keys} key events recorded"));
         }

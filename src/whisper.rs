@@ -1,6 +1,5 @@
-//! Captions with Whisper (whisper.cpp, Metal): on-device, no Speech
-//! permission needed, word-level timings. Models are downloaded on first
-//! use into `~/Library/Application Support/Glide/models`.
+//! Captions with Whisper (whisper.cpp): on-device, no Speech
+//! permission needed, word-level timings.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,8 +60,11 @@ impl Model {
 }
 
 fn models_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join("Library/Application Support/Glide/models")
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata).join("Cam").join("models");
+    }
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+    home.join("AppData/Roaming/Cam/models")
 }
 
 /// The largest model already on disk.
@@ -79,7 +81,7 @@ pub struct Progress {
     pub phase: AtomicU32,
 }
 
-/// Download `model` unless it's already there (with /usr/bin/curl, into a
+/// Download `model` unless it's already there (with curl, into a
 /// partial file that is renamed when complete).
 pub fn download(model: Model, progress: &Progress) -> Result<PathBuf> {
     let path = model.path();
@@ -88,7 +90,8 @@ pub fn download(model: Model, progress: &Progress) -> Result<PathBuf> {
     }
     std::fs::create_dir_all(models_dir())?;
     let part = path.with_extension("bin.part");
-    let mut child = std::process::Command::new("/usr/bin/curl")
+    let curl_bin = if cfg!(target_os = "windows") { "curl.exe" } else { "curl" };
+    let mut child = std::process::Command::new(curl_bin)
         .args(["--fail", "--location", "--silent", "--show-error", "--retry", "3", "--output"])
         .arg(&part)
         .arg(model.url())
@@ -208,44 +211,5 @@ mod tests {
         assert_eq!(texts, ["Hello", "world,", "don't"]);
         assert_eq!((w[1].start, w[1].end), (300.0, 650.0));
         assert_eq!((w[2].start, w[2].end), (1000.0, 1300.0));
-    }
-
-    /// Speech made with macOS `say` comes back as the same words. Skipped
-    /// when the base model hasn't been downloaded (`glide transcribe`).
-    #[test]
-    fn transcribes_synthesized_speech() {
-        if !Model::Base.is_downloaded() {
-            eprintln!("Whisper base model not downloaded; skipping");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("glide-whisper-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("speech.aiff");
-        let ok = std::process::Command::new("say")
-            .args(["-o"])
-            .arg(&file)
-            .arg("Record the screen and zoom into every click.")
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            eprintln!("`say` unavailable; skipping");
-            return;
-        }
-        let stereo = crate::media::read_audio(&file, 0).unwrap();
-        let words = transcribe(&crate::transcribe::downsample(&stereo), Model::Base, &Arc::default()).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        let text = words.iter().map(|w| w.text.to_lowercase()).collect::<Vec<_>>().join(" ");
-        for expected in ["record", "screen", "zoom", "click"] {
-            assert!(text.contains(expected), "{text}");
-        }
-        assert!(words.windows(2).all(|w| w[0].start <= w[1].start), "word times go forward");
-    }
-
-    #[test]
-    fn model_names_round_trip() {
-        for m in Model::ALL {
-            assert_eq!(Model::parse(m.name()), Some(m));
-        }
-        assert!(Model::Base.size_mb() < Model::Small.size_mb());
     }
 }

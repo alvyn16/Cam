@@ -40,7 +40,7 @@ pub fn list_all() -> Vec<PickWindow> {
     macos::display_ids().into_iter().flat_map(list).collect()
 }
 
-/// Recordable windows (not Glide's own) that show on `display`,
+/// Recordable windows (not Cam's own) that show on `display`,
 /// frontmost first.
 pub fn list(display: u32) -> Vec<PickWindow> {
     let (display_id, dx, dy, dw, dh) = macos::display_frame(display);
@@ -50,7 +50,7 @@ pub fn list(display: u32) -> Vec<PickWindow> {
     let all: Vec<_> = all
         .into_iter()
         // SAFETY: SCWindow/SCRunningApplication accessors.
-        .filter(|w| unsafe { w.window.owningApplication().is_none_or(|a| a.processID() != me) })
+        .filter(|w| w.window.owningApplication().is_none_or(|a| a.processID() != me))
         .collect();
     let displays = winsize::display_sizes(&all);
     let order = winsize::front_to_back();
@@ -59,7 +59,7 @@ pub fn list(display: u32) -> Vec<PickWindow> {
         .zip(displays)
         .filter_map(|(w, display)| {
             // SAFETY: SCWindow accessor.
-            let f = unsafe { w.window.frame() };
+            let f = w.window.frame();
             let rect = egui::Rect::from_min_size(
                 egui::pos2((f.origin.x - dx) as f32, (f.origin.y - dy) as f32),
                 egui::vec2(f.size.width as f32, f.size.height as f32),

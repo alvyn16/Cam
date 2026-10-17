@@ -1,42 +1,22 @@
 [package]
-name = "glide"
+name = "cam"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "A fast, native macOS screen recorder and editor for polished product videos"
-default-run = "glide"
+description = "Fast native Windows screen recorder and video studio"
+default-run = "cam"
 
 [lib]
-name = "glide"
+name = "cam"
 path = "src/lib.rs"
 
 [[bin]]
-name = "glide"
+name = "cam"
 path = "src/main.rs"
 
 [dependencies]
-whisper-rs = { version = "0.16", features = ["metal"] }
 anyhow = "1.0.104"
-block2 = "0.6"
 clap = { version = "4.6.7", features = ["derive"] }
-dispatch2 = "0.3"
-libc = "0.2.190"
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["objc2-quartz-core", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-image"] }
-objc2-av-foundation = { version = "0.3", features = ["block2", "dispatch2", "objc2-core-media", "objc2-core-video", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-audio-types"] }
-objc2-core-audio-types = "0.3"
-objc2-core-foundation = "0.3"
-objc2-core-graphics = "0.3"
-objc2-core-image = { version = "0.3", features = ["objc2-core-video", "objc2-core-graphics", "objc2-core-foundation", "objc2-metal"] }
-objc2-core-media = { version = "0.3", features = ["objc2-core-video", "dispatch2", "block2", "objc2-core-audio-types"] }
-objc2-core-video = { version = "0.3", features = ["objc2-core-graphics", "objc2-io-surface", "objc2-metal"] }
-objc2-metal = "0.3"
-objc2-metal-performance-shaders = "0.3"
-objc2-foundation = "0.3"
-objc2-io-surface = "0.3"
-objc2-quartz-core = "0.3"
-objc2-screen-capture-kit = { version = "0.3", features = ["block2", "dispatch2", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "objc2-av-foundation"] }
-
 egui = "0.36"
 egui-wgpu = "0.36"
 egui-winit = "0.36"
@@ -52,10 +32,27 @@ gif = "0.14"
 color_quant = "1.1"
 ab_glyph = "0.2"
 cpal = "0.18"
-
-[profile.release]
-debug = 1
-lto = "thin"
-
-[profile.dev.package."*"]
-opt-level = 2
+arboard = "3"
+whisper-rs = { version = "0.16" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Foundation",
+] }

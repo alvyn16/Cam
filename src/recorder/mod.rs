@@ -1,4 +1,4 @@
-//! Recording into a `.glide` package: the screen (without the cursor) with
+//! Recording into a `.cam` package: the screen (without the cursor) with
 //! system audio and microphone stems, the camera as its own file, and
 //! input events for re-rendering the cursor, zooms and key badges.
 
@@ -32,7 +32,7 @@ pub enum Target {
     Area { display: u32, rect: Rect },
     /// Generated test pattern (no permission needed).
     Pattern,
-    /// A USB-connected iPhone or iPad screen (unique id from `glide devices`).
+    /// A USB-connected iPhone or iPad screen (unique id from `cam devices`).
     Device { id: String },
 }
 
@@ -56,7 +56,7 @@ pub struct Options {
     pub hide_desktop_icons: bool,
     pub hide_dock: bool,
     /// Leave this app's own sounds out of the system audio. ScreenCaptureKit
-    /// treats every running copy of Glide as this app, so the command line
+    /// treats every running copy of Cam as this app, so the command line
     /// (which makes no sound) turns it off.
     pub exclude_own_audio: bool,
 }
@@ -110,7 +110,7 @@ impl CameraRec {
         let pacer = std::thread::spawn(move || {
             while !pstop.load(Ordering::SeqCst) {
                 let now = secs(host_now());
-                objc2::rc::autoreleasepool(|_| ps.with(|s| s.emit_until(now - s.lag())));
+                ps.with(|s| s.emit_until(now - s.lag()));
                 std::thread::sleep(Duration::from_millis(16));
             }
         });
@@ -148,7 +148,7 @@ impl CameraRec {
         }
         let sink = self.shared.sink.lock().unwrap().take();
         match sink {
-            Some(s) => objc2::rc::autoreleasepool(|_| s.finish(end)).map(|_| ()),
+            Some(mut s) => s.finish(end).map(|_| ()),
             None => Ok(()),
         }
     }
@@ -175,8 +175,7 @@ pub struct Recorder {
 }
 
 fn display_bounds(id: u32) -> Rect {
-    let r = unsafe { input::CGDisplayBounds(id) };
-    Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
+    input::display_bounds(id)
 }
 
 /// VideoToolbox quality for screen recordings (see `Quality::encoder_quality`).
@@ -188,15 +187,8 @@ fn even(v: f64) -> usize {
 
 impl Recorder {
     pub fn start(opts: Options) -> Result<Self> {
-        let stamp = crate::util::timestamp_name();
-        std::fs::create_dir_all(&opts.dir).with_context(|| format!("creating {}", opts.dir.display()))?;
-        let path = match &opts.name {
-            Some(n) => opts.dir.join(format!("{n}.{}", project::EXTENSION)),
-            None => project::new_package_path(&opts.dir, &stamp),
-        };
-        let package = Package::new(&path);
-
-        // Resolve the target: what to capture, at what size, where it is.
+        let name = opts.name.clone().unwrap_or_else(|| timestamp_name());
+        let package = Package::new(opts.dir.join(format!("{name}.cam")));
         let (cap_target, kind, bounds, size, window, app_name) = match &opts.target {
             Target::Pattern => (None, SourceKind::Display, Rect::new(0.0, 0.0, 1440.0, 900.0), (2880, 1800), None, None),
             Target::Device { id } => {
@@ -220,18 +212,15 @@ impl Recorder {
                 anyhow::ensure!(rect.w >= 8.0 && rect.h >= 8.0, "the selected area is outside this display");
                 let scale = d.pixels.0 as f64 / d.points.0 as f64;
                 let px = (even(rect.w * scale), even(rect.h * scale));
-                let cg = objc2_core_foundation::CGRect::new(
-                    objc2_core_foundation::CGPoint::new(rect.x, rect.y),
-                    objc2_core_foundation::CGSize::new(rect.w, rect.h),
-                );
+                let cap_target = Some(screen::Target::Display(d, Some(*rect)));
                 let global = rect.translate(db.min());
-                (Some(screen::Target::Display(d, Some(cg))), SourceKind::Area, global, px, None, None)
+                (cap_target, SourceKind::Area, global, px, None, None)
             }
             Target::Window { id } => {
                 let w = screen::find_window(&id.to_string())?;
                 let b = input::window_bounds(*id).unwrap_or(Rect::new(0.0, 0.0, w.size.0, w.size.1));
                 // Native pixels of the display the window is on.
-                let on = w.display.as_ref().map(|d| unsafe { d.displayID() });
+                let on = w.display.as_ref().map(|d| d.id);
                 let ds = screen::displays()?;
                 let d = ds.iter().find(|d| Some(d.id) == on).or(ds.first());
                 let scale = d.map_or(2.0, |d| d.pixels.0 as f64 / d.points.0 as f64);
@@ -278,48 +267,32 @@ impl Recorder {
             mic: opts.mic.clone(),
             webcam: None,
             pip: PipSpec { size: 0.2, corner: Corner::BottomRight, shape: Shape::Rounded, mirror: false },
-            cursor: false,
-            clicks: false,
-            duration: None,
-            quiet: true,
-            test_pattern: matches!(opts.target, Target::Pattern).then_some(false),
-            audio_layout: AudioLayout::Stems,
-            gains_db: [0.0, 0.0],
-            mic_backend: MicBackend::Sck,
-            scene: CapScene::Screen,
             hide_desktop_icons: opts.hide_desktop_icons,
             hide_dock: opts.hide_dock,
             exclude_own_audio: opts.exclude_own_audio,
+            mic_backend: MicBackend::Auto,
         };
-        if let Err(e) = crate::capture::record::check_permissions(&cap) {
-            let _ = std::fs::remove_dir_all(&package.root);
-            anyhow::bail!("{e}");
-        }
-        let input = InputLogger::start(package.rec("cursors"), window, opts.keys);
-        let session = match Session::start(&cap, cap_target, true, None) {
-            Ok(s) => s,
-            Err(e) => {
-                input.stop();
+        let session = match cap_target {
+            Some(t) => Some(Session::start(t, cap).inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&package.root);
-                return Err(e);
-            }
-        };
-        let camera = match &opts.camera {
-            Some(sel) => match CameraRec::start(sel.as_deref(), &package.rec("camera.mov")) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("glide: camera unavailable: {e}");
-                    None
-                }
-            },
+            })?),
             None => None,
         };
+        let camera = opts
+            .camera
+            .as_ref()
+            .map(|c| CameraRec::start(c.as_deref(), &package.rec("camera.mov")))
+            .transpose()
+            .inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&package.root);
+            })?;
+        let input = Some(InputLogger::start(package.rec("cursors"), window, opts.keys));
         Ok(Recorder {
             package,
-            session: Some(session),
+            session,
             camera,
             device: None,
-            input: Some(input),
+            input,
             kind,
             bounds,
             scale,
@@ -336,64 +309,59 @@ impl Recorder {
         self.pauses.last().is_some_and(|p| p.1.is_none())
     }
 
-    fn paused_secs(&self, now: f64) -> f64 {
-        self.pauses.iter().map(|&(a, b)| b.unwrap_or(now) - a).sum()
-    }
-
     pub fn pause(&mut self) {
-        if self.is_paused() || !self.has_frames() {
+        if self.is_paused() {
             return;
         }
         let now = secs(host_now());
-        let paused = match (&self.session, &self.device) {
-            (Some(s), _) => s.pause(),
-            (None, Some(d)) => {
-                d.pause(now);
-                true
-            }
-            _ => false,
-        };
-        if paused {
-            if let Some(c) = &self.camera {
-                c.pause(now);
-            }
-            self.pauses.push((now, None));
+        self.pauses.push((now, None));
+        if let Some(s) = &self.session {
+            s.pause(now);
+        }
+        if let Some(c) = &self.camera {
+            c.pause(now);
+        }
+        if let Some(d) = &self.device {
+            d.pause(now);
         }
     }
 
     pub fn resume(&mut self) {
-        if !self.is_paused() {
+        let Some(last) = self.pauses.last_mut() else { return };
+        if last.1.is_some() {
             return;
         }
         let now = secs(host_now());
-        let resumed = match (&self.session, &self.device) {
-            (Some(s), _) => s.resume(),
-            (None, Some(d)) => {
-                d.resume(now);
-                true
-            }
-            _ => false,
-        };
-        if resumed {
-            if let Some(c) = &self.camera {
-                c.resume(now);
-            }
-            if let Some(p) = self.pauses.last_mut() {
-                p.1 = Some(now);
-            }
+        last.1 = Some(now);
+        if let Some(s) = &self.session {
+            s.resume(now);
+        }
+        if let Some(c) = &self.camera {
+            c.resume(now);
+        }
+        if let Some(d) = &self.device {
+            d.resume(now);
         }
     }
 
-    /// Recorded seconds (excluding pauses).
-    pub fn elapsed(&self) -> f64 {
+    fn paused_secs(&self, now: f64) -> f64 {
+        self.pauses.iter().map(|&(a, b)| b.unwrap_or(now) - a).sum()
+    }
+
+    pub fn duration_secs(&self) -> f64 {
         match (&self.session, &self.device) {
             (Some(s), _) => s.recorded_secs(),
-            (None, Some(d)) => d.t0().map_or(0.0, |t0| {
-                let now = secs(host_now());
-                (now - t0 - self.paused_secs(now)).max(0.0)
-            }),
+            (None, Some(d)) => self.elapsed_with(d.t0()),
             _ => 0.0,
         }
+    }
+
+    pub fn elapsed(&self) -> f64 {
+        self.duration_secs()
+    }
+
+    pub fn keys_enabled(&self) -> bool {
+        self.input.as_ref().is_some_and(|i| i.keys_enabled())
     }
 
     pub fn error(&self) -> Option<String> {
@@ -465,7 +433,7 @@ impl Recorder {
         if let Some(c) = self.camera.take()
             && let Err(e) = c.finish()
         {
-            eprintln!("glide: camera file: {e}");
+            eprintln!("cam: camera file: {e}");
         }
         if let Some(d) = self.device.take() {
             let t0 = d.t0();

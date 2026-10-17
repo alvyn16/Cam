@@ -1,4 +1,4 @@
-//! The Glide app icon, drawn procedurally with signed distance fields: a
+//! The Cam app icon, drawn procedurally with signed distance fields: a
 //! Big Sur-style squircle in a graphite-to-black gradient, a white cursor
 //! gliding in on a tapered motion swoosh, and a small red record dot.
 //! Rendered at any size so the .icns gets crisp pixels at every resolution.

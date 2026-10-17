@@ -28,7 +28,7 @@ pub struct Shot<'a> {
     /// Draw the recent-recordings popover under the title.
     pub recents: bool,
     /// Start view: show a live preview, of the main display ("display") or
-    /// of Glide's synthetic demo screen ("synthetic").
+    /// of Cam's synthetic demo screen ("synthetic").
     pub live: Option<String>,
 }
 
@@ -62,7 +62,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         ed.seek(shot.playhead_ms);
     }
     let mut settings = Settings::default();
-    if let Some(dir) = std::env::var_os("GLIDE_OUTPUT_DIR") {
+    if let Some(dir) = std::env::var_os("CAM_OUTPUT_DIR") {
         settings.projects_dir = Some(dir.into());
     }
     let mut devices = Devices::load();
@@ -125,7 +125,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         covered: None,
     };
 
-    let mut last = None;
+    let mut last: Option<egui::FullOutput> = None;
     for i in 0..8 {
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
@@ -179,9 +179,16 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
                 renderer.update_texture(&gpu.device, &gpu.queue, *id, d);
             }
         }
+        for id in &out.textures_delta.free {
+            renderer.free_texture(id);
+        }
+        if let Some(mut prev) = last.take() {
+            prev.textures_delta.clear();
+        }
         last = Some(out);
     }
-    let out = last.unwrap();
+    let mut out = last.unwrap();
+    out.textures_delta.clear();
     let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
     let (pw, ph) = ((w * ppp) as u32, (h * ppp) as u32);
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {

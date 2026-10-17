@@ -1,5 +1,5 @@
 //! The editable project: style, timeline edits and export settings.
-//! Stored as `project.json` inside a `.glide` package.
+//! Stored as `project.json` inside a `.cam` package.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

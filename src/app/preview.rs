@@ -105,7 +105,7 @@ impl Preview {
         if let Some(s) = &mut self.screen
             && let Some(vf) = s.frame_at(src)
         {
-            match self.cache.as_ref().and_then(|c| c.wrap(&vf.pb.0, wgpu::TextureUsages::TEXTURE_BINDING)) {
+            match vf.try_wrap(self.cache.as_ref()) {
                 Some(wr) => self.renderer.set_screen_wrapped(wr),
                 None => vf.with_bgra(|v| self.renderer.set_screen(v)),
             }
@@ -113,7 +113,7 @@ impl Preview {
         if let Some(c) = &mut self.camera
             && let Some(vf) = c.frame_at(src - self.camera_offset)
         {
-            match self.cache.as_ref().and_then(|tc| tc.wrap(&vf.pb.0, wgpu::TextureUsages::TEXTURE_BINDING)) {
+            match vf.try_wrap(self.cache.as_ref()) {
                 Some(wr) => self.renderer.set_camera_wrapped(wr),
                 None => vf.with_bgra(|v| self.renderer.set_camera(v)),
             }

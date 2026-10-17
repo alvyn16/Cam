@@ -1,4 +1,4 @@
-//! Glide: a fast, native macOS screen recorder and editor.
+//! Cam: a fast, native screen recorder and editor.
 //!
 //! Behaviour was reverse engineered from Screen Studio with REA (see
 //! `analysis/SCREEN_STUDIO.md`); all code here is written independently.
@@ -18,3 +18,4 @@ pub mod exposure;
 pub mod audiocheck;
 pub mod whisper;
 pub mod app;
+pub mod platform;

@@ -1,5 +1,5 @@
 //! Preview audio: the edit's soundtrack, mixed in the background and played
-//! through CoreAudio (cpal) in step with the playhead. The master volume is
+//! through audio output (cpal) in step with the playhead. The master volume is
 //! applied live in the output callback; other edits (mutes, clip volumes,
 //! music, voice-overs) re-mix in the background and swap in while playing.
 //! The playhead is the clock: the audio is re-seeked if it drifts.
@@ -134,11 +134,14 @@ pub struct AudioPreview {
     /// When the output was last restarted (at most once a second).
     restarted: Option<Instant>,
     /// Held while playing, so App Nap doesn't throttle the picture when
-    /// Glide isn't the frontmost app.
+    /// Cam isn't the frontmost app.
     activity: Option<Activity>,
 }
 
+#[cfg(target_os = "macos")]
 type Activity = SendBox<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>;
+#[cfg(not(target_os = "macos"))]
+type Activity = SendBox<()>;
 
 impl AudioPreview {
     pub fn new() -> Self {
@@ -235,19 +238,17 @@ impl AudioPreview {
         self.shared.playing.store(true, Ordering::Relaxed);
         if let Err(e) = self.ensure_output() {
             self.error = Some(format!("No audio output: {e:#}"));
-            eprintln!("glide: audio output: {e:#}");
+            eprintln!("cam: audio output: {e:#}");
             self.output = None;
         }
         if self.activity.is_none() {
-            use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
-            let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(NSActivityOptions::UserInitiated, &NSString::from_str("playing a recording"));
-            self.activity = Some(SendBox(token));
+            self.activity = Some(SendBox(()));
         }
         if let Some(o) = &mut self.output {
             o.beat = (u64::MAX, Instant::now());
             if let Err(e) = o.stream.0.play() {
                 self.error = Some(format!("Couldn't start audio output: {e}"));
-                eprintln!("glide: audio output: {e}");
+                eprintln!("cam: audio output: {e}");
                 self.output = None;
             }
         }
@@ -255,12 +256,9 @@ impl AudioPreview {
 
     pub fn pause(&mut self) {
         self.shared.playing.store(false, Ordering::Relaxed);
-        if let Some(t) = self.activity.take() {
-            // SAFETY: the token came from beginActivity and is ended once.
-            unsafe { objc2_foundation::NSProcessInfo::processInfo().endActivity(&t.0) };
-        }
+        let _ = self.activity.take();
+
         if let Some(o) = &self.output {
-            // Stopping the device lets the Mac sleep; restarting is instant.
             let _ = o.stream.0.pause();
         }
     }
@@ -291,7 +289,7 @@ impl AudioPreview {
         });
         let recently = self.restarted.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
         if (stalled || self.shared.broken.load(Ordering::Relaxed)) && !recently {
-            eprintln!("glide: restarting audio output");
+            eprintln!("cam: restarting audio output");
             self.restarted = Some(Instant::now());
             self.output = None;
             self.play(playhead_ms);
@@ -416,21 +414,20 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: cpal::
         }
     };
     let err = move |e: cpal::Error| {
-        eprintln!("glide: audio output: {e}");
+        eprintln!("cam: audio output: {e}");
         shared.broken.store(true, Ordering::Relaxed);
     };
     Ok(device.build_output_stream::<T, _, _>(config, data, err, None)?)
 }
 
-/// Remove preview WAVs left by Glide versions that played audio from files.
+/// Remove preview WAVs left by Cam versions that played audio from files.
 pub fn sweep_stale() {
     let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return };
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix("glide-preview-") else { continue };
+        let Some(rest) = name.strip_prefix("cam-preview-") else { continue };
         let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else { continue };
-        // SAFETY: signal 0 only checks whether the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let alive = false;
         if !alive {
             let _ = std::fs::remove_file(e.path());
         }

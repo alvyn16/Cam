@@ -7,19 +7,19 @@
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use glide::app::editor::{Editor, TrackPeaks, silence_note};
-use glide::export::{self, Job, Source};
-use glide::project::model::{ExportSettings, Quality};
-use glide::render::Gpu;
+use cam::app::editor::{Editor, TrackPeaks, silence_note};
+use cam::export::{self, Job, Source};
+use cam::project::model::{ExportSettings, Quality};
+use cam::render::Gpu;
 
 fn package(name: &str, tone: Option<f64>) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("glide-audio-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("Audio.glide");
-    glide::synth::write_package(&path, 2.0, 640, 400).unwrap();
+    let path = dir.join("Audio.cam");
+    cam::synth::write_package(&path, 2.0, 640, 400).unwrap();
     if let Some(hz) = tone {
-        glide::synth::add_tone(&path, hz).unwrap();
+        cam::synth::add_tone(&path, hz).unwrap();
     }
     (dir, path)
 }
@@ -52,8 +52,8 @@ fn track_levels_explain_a_silent_recording() {
     drop(ed);
 
     // Same recording with a silent system track and no microphone.
-    let (_, mut rec) = glide::project::Package::new(&path).load().unwrap();
-    glide::app::player::write_wav(&glide::project::Package::new(&path).rec("system.wav"), &vec![[0.0; 2]; 96_000]).unwrap();
+    let (_, mut rec) = cam::project::Package::new(&path).load().unwrap();
+    cam::app::player::write_wav(&cam::project::Package::new(&path).rec("system.wav"), &vec![[0.0; 2]; 96_000]).unwrap();
     let ed = Editor::open(&path, Gpu::headless().unwrap()).unwrap();
     let p = peaks(&ed);
     assert!(TrackPeaks::silent(p.system), "{p:?}");
@@ -94,14 +94,14 @@ fn playback_mix_follows_mutes_while_open() {
 #[test]
 fn export_carries_the_recorded_sound() {
     let (dir, path) = package("export", Some(880.0));
-    let pkg = glide::project::Package::new(&path);
+    let pkg = cam::project::Package::new(&path);
     let (project, recording) = pkg.load().unwrap();
     let output = dir.join("out.mp4");
     let settings = ExportSettings { height: 240, fps: 10, quality: Quality::Web, ..Default::default() };
     let job = Job { project, recording, source: Source::Package(path.clone()), settings, output: output.clone() };
     export::run(&job, &mut |_| {}, &AtomicBool::new(false)).unwrap();
-    let audio = glide::media::read_audio(&output, 0).expect("the export has an audio track");
-    let level = glide::audiocheck::analyze(&audio, 880.0);
+    let audio = cam::media::read_audio(&output, 0).expect("the export has an audio track");
+    let level = cam::audiocheck::analyze(&audio, 880.0);
     assert!(level.tone_seconds > 1.8, "{level:?}");
     assert!((level.tone_db + 23.0).abs() < 1.5, "{level:?}");
     let _ = std::fs::remove_dir_all(&dir);

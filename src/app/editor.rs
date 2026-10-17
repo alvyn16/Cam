@@ -372,7 +372,7 @@ impl Editor {
         let progress = std::sync::Arc::new(crate::whisper::Progress::default());
         self.transcribe_progress = progress.clone();
         self.transcribing = Some(std::thread::spawn(move || {
-            objc2::rc::autoreleasepool(|_| crate::transcribe::transcribe_package(&pkg, engine, &progress)).map_err(|e| format!("{e:#}"))
+            crate::transcribe::transcribe_package(&pkg, engine, &progress).map_err(|e| format!("{e:#}"))
         }));
     }
 
@@ -556,7 +556,7 @@ impl Editor {
         let cancel = Arc::new(AtomicBool::new(false));
         let (p2, c2) = (progress.clone(), cancel.clone());
         let handle = std::thread::spawn(move || {
-            objc2::rc::autoreleasepool(|_| export::run(&job, &mut |f| p2.store(f.to_bits(), Ordering::Relaxed), &c2))
+            export::run(&job, &mut |f| p2.store(f.to_bits(), Ordering::Relaxed), &c2)
         });
         self.export.result = None;
         self.export.running = Some(ExportRun { progress, cancel, handle: Some(handle), output, started: Instant::now() });
@@ -615,7 +615,7 @@ impl Editor {
             if self.copy_when_exported {
                 self.copy_when_exported = false;
                 if let Some(Ok((path, _))) = &self.export.result {
-                    super::macos::copy_file(path);
+                    super::os::copy_file(path);
                     self.status = Some(format!("Exported and copied {} — paste it anywhere", path.file_name().unwrap_or_default().to_string_lossy()));
                 }
             }
@@ -1028,14 +1028,14 @@ impl Editor {
                             ));
                             let path = path.clone();
                             ui.horizontal(|ui| {
-                                if ui.button("Show in Finder").clicked() {
-                                    super::macos::reveal(&path);
+                                if ui.button("Show in Explorer").clicked() {
+                                    super::os::reveal(&path);
                                 }
                                 if ui.button("Copy").on_hover_text("Copy the file to the clipboard").clicked() {
-                                    super::macos::copy_file(&path);
+                                    super::os::copy_file(&path);
                                 }
                                 if ui.button("Open").clicked() {
-                                    super::macos::open(&path);
+                                    super::os::open(&path);
                                 }
                             });
                         }

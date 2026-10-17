@@ -6,11 +6,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use glide::app::editor::Editor;
-use glide::export::{self, Job, Source};
-use glide::project::model::{Aspect, Background, Color, ExportSettings, Quality, Style};
-use glide::render::bgcheck::{self, Region};
-use glide::render::{Gpu, Image};
+use cam::app::editor::Editor;
+use cam::export::{self, Job, Source};
+use cam::project::model::{Aspect, Background, Color, ExportSettings, Quality, Style};
+use cam::render::bgcheck::{self, Region};
+use cam::render::{Gpu, Image};
 
 const SIZE: (u32, u32) = (640, 400);
 
@@ -20,8 +20,8 @@ fn editor(name: &str) -> (PathBuf, Editor) {
     let dir = std::env::temp_dir().join(format!("glide-bg-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("Background.glide");
-    glide::synth::write_package(&path, 1.0, 1280, 800).unwrap();
+    let path = dir.join("Background.cam");
+    cam::synth::write_package(&path, 1.0, 1280, 800).unwrap();
     let mut ed = Editor::open(&path, Gpu::headless().unwrap()).unwrap();
     let mut d = ed.project.clone();
     d.timeline.zooms.clear();
@@ -101,7 +101,7 @@ fn export_frame(ed: &Editor, dir: &Path, name: &str) -> Image {
     let output = dir.join(format!("{name}.mp4"));
     let job = Job { project: ed.project.clone(), recording: ed.rec.clone(), source: Source::Package(ed.package.root.clone()), settings, output: output.clone() };
     export::run(&job, &mut |_| {}, &AtomicBool::new(false)).unwrap();
-    let mut src = glide::media::FrameSource::open(&output).unwrap();
+    let mut src = cam::media::FrameSource::open(&output).unwrap();
     let frame = src.frame_at(0.0).unwrap();
     frame.with_bgra(|v| {
         let mut rgba = Vec::with_capacity((v.width * v.height * 4) as usize);

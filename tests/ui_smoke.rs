@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use glide::app::editor::{Editor, Selection, Tab};
-use glide::app::home::{self, Devices, Settings, Thumbs};
-use glide::render::Gpu;
+use cam::app::editor::{Editor, Selection, Tab};
+use cam::app::home::{self, Devices, Settings, Thumbs};
+use cam::render::Gpu;
 
 fn frame(ctx: &egui::Context, t: f64, f: impl FnMut(&mut egui::Ui)) {
     let input = egui::RawInput {
@@ -15,7 +15,8 @@ fn frame(ctx: &egui::Context, t: f64, f: impl FnMut(&mut egui::Ui)) {
         time: Some(t),
         ..Default::default()
     };
-    let _ = ctx.run_ui(input, f);
+    let mut out = ctx.run_ui(input, f);
+    out.textures_delta.clear();
 }
 
 #[test]
@@ -23,13 +24,13 @@ fn editor_and_home_render_every_panel() {
     let dir = std::env::temp_dir().join(format!("glide-ui-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("Smoke.glide");
-    glide::synth::write_package(&path, 3.0, 1280, 800).unwrap();
+    let path = dir.join("Smoke.cam");
+    cam::synth::write_package(&path, 3.0, 1280, 800).unwrap();
 
     let gpu = Gpu::headless().unwrap();
     let mut renderer = egui_wgpu::Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm, egui_wgpu::RendererOptions::default());
     let ctx = egui::Context::default();
-    glide::app::theme::apply(&ctx);
+    cam::app::theme::apply(&ctx);
 
     let mut ed = Editor::open(&path, gpu).unwrap();
     let mut t = 0.0;
@@ -99,8 +100,8 @@ fn editor_and_home_render_every_panel() {
     let (ws, hs) = (1280.0 * 1080.0 / 800.0, 1080.0);
     ed.edit(|p| {
         let id = p.timeline.new_id();
-        let rect = glide::engine::geom::Rect::new(15.0 / ws, 75.0 / hs, 210.0 / ws, 32.0 / hs);
-        p.timeline.masks.push(glide::project::model::Mask { id, start: 200.0, end: 2900.0, rect, ..Default::default() });
+        let rect = cam::engine::geom::Rect::new(15.0 / ws, 75.0 / hs, 210.0 / ws, 32.0 / hs);
+        p.timeline.masks.push(cam::project::model::Mask { id, start: 200.0, end: 2900.0, rect, ..Default::default() });
     });
     let t0 = std::time::Instant::now();
     ed.tick();
@@ -111,12 +112,12 @@ fn editor_and_home_render_every_panel() {
     let found = ed.mask_watch.found.clone();
     assert_eq!(found.len(), 1, "{found:?}");
     assert!((found[0].start - 1500.0).abs() <= 100.0 && found[0].end >= 2800.0, "{found:?}");
-    assert!(glide::app::timeline::extra_height(&ed) > 0.0);
+    assert!(cam::app::timeline::extra_height(&ed) > 0.0);
     t += 0.016;
     editor_frame(&mut ed, t);
     ed.cut_exposure(found[0]);
     assert!(ed.project.timeline.slices.iter().all(|s| s.end <= found[0].start || s.start >= found[0].end), "{:?}", ed.project.timeline.slices);
-    assert_eq!(glide::app::timeline::extra_height(&ed), 0.0);
+    assert_eq!(cam::app::timeline::extra_height(&ed), 0.0);
     t += 0.016;
     editor_frame(&mut ed, t);
     ed.save();
