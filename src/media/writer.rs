@@ -81,7 +81,7 @@ impl MovieWriter {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<()> {
+    pub fn finish(self) -> Result<()> {
         let mut data = Vec::new();
         let frame = self.first_frame.unwrap_or_default();
         let soundtrack = self.soundtrack.as_deref();

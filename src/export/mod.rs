@@ -21,7 +21,7 @@ use crate::media::{FrameSource, Prefetch};
 use crate::media::writer::{MovieWriter, WriterSpec, fill_bgra};
 use crate::project::model::{ExportFormat, ExportSettings, Project};
 use crate::project::recording::Recording;
-use crate::render::interop::{TextureCache, Wrapped};
+use crate::render::interop::TextureCache;
 use crate::render::{Gpu, OUTPUT_FORMAT, Renderer, VideoFrame, gpu::padded_row};
 
 /// Frames in flight between render and encode.

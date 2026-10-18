@@ -437,20 +437,19 @@ fn transcribe_controls(ui: &mut Ui, ed: &mut Editor) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         return;
     }
-    if let Engine::Whisper(mut model) = ed.caption_engine {
-        let label = |m: Model| {
-            if m.is_downloaded() { format!("{} (downloaded)", m.name()) } else { format!("{} ({} MB download)", m.name(), m.size_mb()) }
-        };
-        row(ui, "Model", |ui| {
-            egui::ComboBox::from_id_salt("whisper-model").selected_text(label(model)).show_ui(ui, |ui| {
-                for m in Model::ALL {
-                    ui.selectable_value(&mut model, m, label(m));
-                }
-            });
+    let Engine::Whisper(mut model) = ed.caption_engine;
+    let label = |m: Model| {
+        if m.is_downloaded() { format!("{} (downloaded)", m.name()) } else { format!("{} ({} MB download)", m.name(), m.size_mb()) }
+    };
+    row(ui, "Model", |ui| {
+        egui::ComboBox::from_id_salt("whisper-model").selected_text(label(model)).show_ui(ui, |ui| {
+            for m in Model::ALL {
+                ui.selectable_value(&mut model, m, label(m));
+            }
         });
-        ed.caption_engine = Engine::Whisper(model);
-        caption(ui, "Runs on device with Whisper. Larger models are more accurate but slower.");
-    }
+    });
+    ed.caption_engine = Engine::Whisper(model);
+    caption(ui, "Runs on device with Whisper. Larger models are more accurate but slower.");
     if ui.button("Transcribe microphone").clicked() {
         ed.start_transcription();
     }

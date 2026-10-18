@@ -426,7 +426,7 @@ pub fn sweep_stale() {
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(rest) = name.strip_prefix("cam-preview-") else { continue };
-        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else { continue };
+        let Some(_pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else { continue };
         let alive = false;
         if !alive {
             let _ = std::fs::remove_file(e.path());

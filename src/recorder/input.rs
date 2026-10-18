@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -46,7 +46,6 @@ pub struct InputLogger {
     stop: Arc<AtomicBool>,
     poll: Option<JoinHandle<InputLog>>,
     keys: Arc<Mutex<Vec<RawKey>>>,
-    tap_thread: Option<JoinHandle<()>>,
     keys_enabled: Arc<AtomicBool>,
 }
 
@@ -140,7 +139,6 @@ impl InputLogger {
             stop,
             poll: Some(poll),
             keys,
-            tap_thread: None,
             keys_enabled,
         }
     }

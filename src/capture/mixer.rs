@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use crate::capture::writer::AudioKind;
 
 pub const RATE: f64 = 48000.0;
+#[allow(dead_code)]
 const MAX_WAIT: i64 = 24000;
 const SNAP: i64 = 96;
 
@@ -14,6 +15,7 @@ pub struct Mixer {
     base: i64,
     buf: VecDeque<[f32; 2]>,
     horizon: [Option<i64>; 2],
+    #[allow(dead_code)]
     active: [bool; 2],
     gain: [f32; 2],
     pub clipped: u64,

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use anyhow::Result;
-use crate::platform::media::{MediaBackend, VideoCodec, VideoFrameReader, VideoFileWriter, WriterSpec};
+use crate::platform::media::{MediaBackend, VideoFrameReader, VideoFileWriter, WriterSpec};
 use crate::render::VideoFrame;
 
 pub struct WindowsMediaBackend;

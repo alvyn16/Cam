@@ -14,6 +14,12 @@ pub struct MicMeter {
     stop: Arc<AtomicBool>,
 }
 
+impl Drop for MicMeter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 impl MicMeter {
     /// Meter the input device named `name`, or the default input.
     pub fn start(name: Option<&str>) -> Result<MicMeter> {

@@ -2,10 +2,9 @@
 //! Results go to `recording/transcript.json`.
 
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 use crate::capture::mixer;
-use crate::project::recording::Word;
 use crate::project::{Package, write_json};
 
 const RATE: f64 = 16_000.0;
