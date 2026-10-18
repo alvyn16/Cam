@@ -41,6 +41,8 @@ pub struct Settings {
     pub mic: bool,
     pub mic_id: Option<String>,
     pub camera: bool,
+    /// Show a floating monitor of the recording camera, excluded from capture.
+    pub show_camera_while_recording: bool,
     pub camera_id: Option<String>,
     /// The camera bubble's look and place, shown live in the preview and
     /// given to each new recording.
@@ -69,10 +71,10 @@ pub struct Hotkeys {
 
 impl Default for Hotkeys {
     fn default() -> Self {
-        use super::hotkey::{CMD, KEY_R, OPTION, SHIFT};
+        use super::hotkey::{CONTROL, KEY_R, SHIFT};
         Hotkeys {
-            record: Some(Combo::new(KEY_R, CMD | SHIFT | OPTION)),
-            pause: Some(Combo::new(35, CMD | SHIFT | OPTION)), // P
+            record: Some(Combo::new(KEY_R, CONTROL | SHIFT)),
+            pause: Some(Combo::new(0x50, CONTROL | SHIFT)), // P
             cancel: None,
         }
     }
@@ -96,8 +98,12 @@ impl Default for Settings {
             mic: false,
             mic_id: None,
             camera: false,
+            show_camera_while_recording: false,
             camera_id: None,
-            camera_style: crate::project::model::CameraStyle { mirror: true, ..Default::default() },
+            camera_style: crate::project::model::CameraStyle {
+                mirror: true,
+                ..Default::default()
+            },
             keys: true,
             countdown: true,
             fps: 60,
@@ -115,21 +121,40 @@ fn settings_path() -> PathBuf {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         return PathBuf::from(appdata).join("Cam").join("settings.json");
     }
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join("AppData/Roaming/Cam/settings.json")
 }
 
 impl Settings {
     pub fn load() -> Self {
-        project::read_json(&settings_path()).unwrap_or_default()
+        let Ok(value) = project::read_json::<serde_json::Value>(&settings_path()) else {
+            return Self::default();
+        };
+        let mut settings: Self = serde_json::from_value(value.clone()).unwrap_or_default();
+        if value.get("hotkey_format").and_then(|v| v.as_str()) != Some("win32") {
+            settings.hotkeys.record = settings.hotkeys.record.map(super::hotkey::migrate_legacy);
+            settings.hotkeys.pause = settings.hotkeys.pause.map(super::hotkey::migrate_legacy);
+            settings.hotkeys.cancel = settings.hotkeys.cancel.map(super::hotkey::migrate_legacy);
+        }
+        if settings.display != 0 && !super::os::display_ids().contains(&settings.display) {
+            settings.display = 0;
+        }
+        settings
     }
     pub fn save(&self) {
         let p = settings_path();
         let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let _ = project::write_json(&p, self);
+        if let Ok(mut value) = serde_json::to_value(self) {
+            value["hotkey_format"] = serde_json::json!("win32");
+            let _ = project::write_json(&p, &value);
+        }
     }
     pub fn dir(&self) -> PathBuf {
-        self.projects_dir.clone().unwrap_or_else(project::projects_dir)
+        self.projects_dir
+            .clone()
+            .unwrap_or_else(project::projects_dir)
     }
 
     /// Keep the chosen window when its id is gone: find it again by app and
@@ -150,10 +175,11 @@ impl Settings {
         }
         let found = self.window_label.as_deref().and_then(|label| {
             let app = label.split(" — ").next().unwrap_or(label);
-            dev.windows
-                .iter()
-                .find(|w| w.label == label)
-                .or_else(|| dev.windows.iter().find(|w| w.label.split(" — ").next() == Some(app)))
+            dev.windows.iter().find(|w| w.label == label).or_else(|| {
+                dev.windows
+                    .iter()
+                    .find(|w| w.label.split(" — ").next() == Some(app))
+            })
         });
         self.window = found.map(|w| w.id);
         self.window_label = found.map(|w| w.label.clone());
@@ -192,7 +218,17 @@ impl Devices {
         use crate::capture::{camera, screen};
         Devices {
             displays: screen::displays()
-                .map(|ds| ds.iter().enumerate().map(|(i, d)| (d.id, format!("Display {} — {}×{}", i + 1, d.points.0, d.points.1))).collect())
+                .map(|ds| {
+                    ds.iter()
+                        .enumerate()
+                        .map(|(i, d)| {
+                            (
+                                d.id,
+                                format!("Display {} — {}×{}", i + 1, d.points.0, d.points.1),
+                            )
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
             windows: screen::windows()
                 .map(|ws| {
@@ -201,21 +237,54 @@ impl Devices {
                     // SAFETY: SCWindow/SCRunningApplication accessors.
                     let ws: Vec<_> = ws
                         .into_iter()
-                        .filter(|w| !w.app.is_empty() && w.app != "Cam" && w.window.owningApplication().is_none_or(|a| a.processID() != me))
+                        .filter(|w| {
+                            !w.app.is_empty()
+                                && w.app != "Cam"
+                                && w.window
+                                    .owningApplication()
+                                    .is_none_or(|a| a.processID() != me)
+                        })
                         .collect();
                     let displays = crate::capture::winsize::display_sizes(&ws);
                     ws.into_iter()
                         .zip(displays)
                         .map(|(w, display)| {
-                            let label = if w.title.is_empty() { w.app.clone() } else { format!("{} — {}", w.app, w.title) };
-                            WindowEntry { id: w.id, label, size: w.size, display }
+                            let label = if w.title.is_empty() {
+                                w.app.clone()
+                            } else {
+                                format!("{} — {}", w.app, w.title)
+                            };
+                            WindowEntry {
+                                id: w.id,
+                                label,
+                                size: w.size,
+                                display,
+                            }
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
-            cameras: camera::cameras().into_iter().map(|d| Device { id: d.id, name: d.name }).collect(),
-            mics: camera::microphones().into_iter().map(|d| Device { id: d.id, name: d.name }).collect(),
-            ios: camera::ios_devices().into_iter().map(|d| Device { id: d.id, name: d.name }).collect(),
+            cameras: camera::cameras()
+                .into_iter()
+                .map(|d| Device {
+                    id: d.id,
+                    name: d.name,
+                })
+                .collect(),
+            mics: camera::microphones()
+                .into_iter()
+                .map(|d| Device {
+                    id: d.id,
+                    name: d.name,
+                })
+                .collect(),
+            ios: camera::ios_devices()
+                .into_iter()
+                .map(|d| Device {
+                    id: d.id,
+                    name: d.name,
+                })
+                .collect(),
         }
     }
 }
@@ -236,9 +305,21 @@ pub fn scan_projects(dir: &Path) -> Vec<ProjectEntry> {
                 continue;
             }
             let pkg = Package::new(&path);
-            let Ok(meta) = project::read_json::<crate::project::recording::RecordingMeta>(&pkg.rec("meta.json")) else { continue };
-            let modified = std::fs::metadata(pkg.project_file()).or_else(|_| e.metadata()).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-            out.push(ProjectEntry { name: pkg.name(), path, modified, duration_ms: meta.duration_ms });
+            let Ok(meta) = project::read_json::<crate::project::recording::RecordingMeta>(
+                &pkg.rec("meta.json"),
+            ) else {
+                continue;
+            };
+            let modified = std::fs::metadata(pkg.project_file())
+                .or_else(|_| e.metadata())
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            out.push(ProjectEntry {
+                name: pkg.name(),
+                path,
+                modified,
+                duration_ms: meta.duration_ms,
+            });
         }
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -257,15 +338,26 @@ pub struct Thumbs {
 
 impl Default for Thumbs {
     fn default() -> Self {
-        Thumbs { textures: HashMap::new(), pending: Arc::new(Mutex::new(vec![])), requested: Default::default(), queue: None }
+        Thumbs {
+            textures: HashMap::new(),
+            pending: Arc::new(Mutex::new(vec![])),
+            requested: Default::default(),
+            queue: None,
+        }
     }
 }
 
 impl Thumbs {
     pub fn get(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureId> {
         for (p, img) in self.pending.lock().unwrap().drain(..) {
-            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
-            self.textures.insert(p.clone(), ctx.load_texture(p.to_string_lossy(), ci, egui::TextureOptions::LINEAR));
+            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width as usize, img.height as usize],
+                &img.rgba,
+            );
+            self.textures.insert(
+                p.clone(),
+                ctx.load_texture(p.to_string_lossy(), ci, egui::TextureOptions::LINEAR),
+            );
         }
         if let Some(t) = self.textures.get(path) {
             return Some(t.id());
@@ -308,7 +400,11 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
         && let Ok(img) = image::open(&thumb)
     {
         let img = img.to_rgba8();
-        return Some(crate::render::Image { width: img.width(), height: img.height(), rgba: img.into_raw() });
+        return Some(crate::render::Image {
+            width: img.width(),
+            height: img.height(),
+            rgba: img.into_raw(),
+        });
     }
     let generate = || {
         let (p, rec) = pkg.load().ok()?;
@@ -316,7 +412,9 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
         let d = scene.duration();
         let t = [(d * 0.25).min(1500.0), d * 0.1, d * 0.5, d * 0.75, 0.0]
             .into_iter()
-            .find(|&t| crate::engine::zoom::active(&p.timeline.zooms, scene.map.to_source(t)).is_none())
+            .find(|&t| {
+                crate::engine::zoom::active(&p.timeline.zooms, scene.map.to_source(t)).is_none()
+            })
             .unwrap_or(0.0);
         let frame = scene.frame(t, 270.0);
         let gpu = crate::render::Gpu::headless().ok()?;
@@ -333,7 +431,13 @@ fn thumbnail(path: &Path) -> Option<crate::render::Image> {
             f.with_bgra(|v| r.set_camera(v));
         }
         let img = r.render_to_image(&frame, &p.style);
-        let _ = image::save_buffer(&thumb, &img.rgba, img.width, img.height, image::ExtendedColorType::Rgba8);
+        let _ = image::save_buffer(
+            &thumb,
+            &img.rgba,
+            img.width,
+            img.height,
+            image::ExtendedColorType::Rgba8,
+        );
         Some(img)
     };
     return generate();
@@ -350,7 +454,8 @@ pub fn canvas_px() -> [u32; 2] {
     [(v >> 32) as u32, v as u32]
 }
 
-pub static CAPTURING_SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static CAPTURING_SHORTCUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A shortcut button that records the next key combination when clicked.
 fn shortcut_row(ui: &mut Ui, label: &str, combo: &mut Option<Combo>) -> bool {
@@ -361,8 +466,16 @@ fn shortcut_row(ui: &mut Ui, label: &str, combo: &mut Option<Combo>) -> bool {
     }
     let mut changed = false;
     row(ui, label, |ui| {
-        let text = if capturing { "Press keys…".to_string() } else { combo.map_or("None".into(), |c| c.label()) };
-        let b = ui.add(egui::Button::new(text).selected(capturing).min_size(vec2(110.0, 0.0)));
+        let text = if capturing {
+            "Press keys…".to_string()
+        } else {
+            combo.map_or("None".into(), |c| c.label())
+        };
+        let b = ui.add(
+            egui::Button::new(text)
+                .selected(capturing)
+                .min_size(vec2(110.0, 0.0)),
+        );
         if b.clicked() {
             ui.data_mut(|d| {
                 d.insert_temp(id, !capturing);
@@ -371,7 +484,12 @@ fn shortcut_row(ui: &mut Ui, label: &str, combo: &mut Option<Combo>) -> bool {
         if capturing {
             let pressed = ui.input(|i| {
                 i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
                     _ => None,
                 })
             });
@@ -407,7 +525,11 @@ pub enum Action {
     RequestPermissions,
     /// Close the open recording (back to recording setup).
     Back,
-    ResizeWindow { id: u32, width: u32, height: u32 },
+    ResizeWindow {
+        id: u32,
+        width: u32,
+        height: u32,
+    },
     /// Pick a window on screen.
     SelectWindow,
     /// Remember the settings now (e.g. the camera bubble was restyled).
@@ -430,7 +552,9 @@ fn size_label((w, h): (u32, u32)) -> String {
 pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option<(u32, u32)> {
     use crate::capture::winsize::PRESETS;
     let current = (w.size.0.round() as u32, w.size.1.round() as u32);
-    let fits = |(a, b): (u32, u32)| a as f64 <= w.display.0 && b as f64 <= w.display.1 && (a, b) != current;
+    let fits = |(a, b): (u32, u32)| {
+        a as f64 <= w.display.0 && b as f64 <= w.display.1 && (a, b) != current
+    };
     let custom_id = ui.id().with("custom-window-size");
     let mut custom: Option<[u32; 2]> = ui.data(|d| d.get_temp(custom_id));
     let mut picked = None;
@@ -438,14 +562,20 @@ pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option
         caption(ui, &format!("{} pt", size_label(current)));
         ui.menu_button("Resize", |ui| {
             for &size in PRESETS[0].1 {
-                if ui.add_enabled(fits(size), egui::Button::new(size_label(size))).clicked() {
+                if ui
+                    .add_enabled(fits(size), egui::Button::new(size_label(size)))
+                    .clicked()
+                {
                     picked = Some(size);
                 }
             }
             for (name, sizes) in &PRESETS[1..] {
                 ui.menu_button(*name, |ui| {
                     for &size in *sizes {
-                        if ui.add_enabled(fits(size), egui::Button::new(size_label(size))).clicked() {
+                        if ui
+                            .add_enabled(fits(size), egui::Button::new(size_label(size)))
+                            .clicked()
+                        {
                             picked = Some(size);
                         }
                     }
@@ -456,12 +586,19 @@ pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option
                 ui.add_enabled(false, egui::Button::new("No saved sizes"));
             }
             for &size in &s.window_sizes {
-                if ui.add_enabled(fits(size), egui::Button::new(size_label(size))).clicked() {
+                if ui
+                    .add_enabled(fits(size), egui::Button::new(size_label(size)))
+                    .clicked()
+                {
                     picked = Some(size);
                 }
             }
-            let known = PRESETS.iter().any(|(_, l)| l.contains(&current)) || s.window_sizes.contains(&current);
-            if ui.add_enabled(!known, egui::Button::new("Save current size")).clicked() {
+            let known = PRESETS.iter().any(|(_, l)| l.contains(&current))
+                || s.window_sizes.contains(&current);
+            if ui
+                .add_enabled(!known, egui::Button::new("Save current size"))
+                .clicked()
+            {
                 s.window_sizes.push(current);
             }
             if !s.window_sizes.is_empty() {
@@ -486,16 +623,31 @@ pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option
     if let Some(c) = &mut custom {
         let mut done = false;
         ui.horizontal(|ui| {
-            let max = (w.display.0.min(10_000.0) as u32, w.display.1.min(10_000.0) as u32);
-            ui.add(egui::DragValue::new(&mut c[0]).range(200..=max.0).suffix(" w"));
+            let max = (
+                w.display.0.min(10_000.0) as u32,
+                w.display.1.min(10_000.0) as u32,
+            );
+            ui.add(
+                egui::DragValue::new(&mut c[0])
+                    .range(200..=max.0)
+                    .suffix(" w"),
+            );
             ui.label("×");
-            ui.add(egui::DragValue::new(&mut c[1]).range(200..=max.1).suffix(" h"));
+            ui.add(
+                egui::DragValue::new(&mut c[1])
+                    .range(200..=max.1)
+                    .suffix(" h"),
+            );
             // Consume Return/Esc so a surrounding picker doesn't act on them too.
-            if ui.button("Resize").clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+            if ui.button("Resize").clicked()
+                || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            {
                 picked = Some((c[0], c[1]));
                 done = true;
             }
-            if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if ui.button("Cancel").clicked()
+                || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
                 done = true;
             }
         });
@@ -511,7 +663,11 @@ pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option
             d.remove::<[u32; 2]>(custom_id);
         }
     });
-    if let Some(note) = RESIZE_NOTE.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+    if let Some(note) = RESIZE_NOTE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+    {
         caption(ui, note);
     }
     picked
@@ -521,22 +677,39 @@ pub fn window_size_row(ui: &mut Ui, s: &mut Settings, w: &WindowEntry) -> Option
 #[allow(dead_code)]
 fn heading(ui: &mut Ui, title: &str) {
     ui.add_space(12.0);
-    ui.label(RichText::new(title).font(theme::semibold(theme::SECONDARY)).color(pal(ui).secondary));
+    ui.label(
+        RichText::new(title)
+            .font(theme::semibold(theme::SECONDARY))
+            .color(pal(ui).secondary),
+    );
     ui.add_space(4.0);
 }
 
 /// Combo box filling the sidebar's width.
 #[allow(dead_code)]
-fn combo<T: Clone + PartialEq>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, String)], enabled: bool) {
-    let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
+fn combo<T: Clone + PartialEq>(
+    ui: &mut Ui,
+    id: &str,
+    value: &mut T,
+    options: &[(T, String)],
+    enabled: bool,
+) {
+    let current = options
+        .iter()
+        .find(|(v, _)| v == value)
+        .map(|(_, l)| l.clone())
+        .unwrap_or_default();
     ui.add_enabled_ui(enabled, |ui| {
-        egui::ComboBox::from_id_salt(id).width(ui.available_width()).selected_text(current).show_ui(ui, |ui| {
-            for (v, label) in options {
-                if ui.selectable_label(v == value, label).clicked() {
-                    *value = v.clone();
+        egui::ComboBox::from_id_salt(id)
+            .width(ui.available_width())
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                for (v, label) in options {
+                    if ui.selectable_label(v == value, label).clicked() {
+                        *value = v.clone();
+                    }
                 }
-            }
-        });
+            });
     });
 }
 
@@ -547,7 +720,11 @@ fn choice<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]
         ui.spacing_mut().item_spacing.x = 4.0;
         let w = (ui.available_width() - 4.0 * (options.len() - 1) as f32) / options.len() as f32;
         for (v, label) in options {
-            let b = egui::Button::selectable(*value == *v, RichText::new(*label).size(theme::SECONDARY + 1.0)).min_size(vec2(w, 26.0));
+            let b = egui::Button::selectable(
+                *value == *v,
+                RichText::new(*label).size(theme::SECONDARY + 1.0),
+            )
+            .min_size(vec2(w, 26.0));
             if ui.add(b).clicked() {
                 *value = *v;
             }
@@ -557,37 +734,78 @@ fn choice<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]
 
 /// Recording setup for the sidebar: scene, screen source, camera, audio and
 /// options.
-pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permission_note: Option<&str>) -> Action {
+pub fn record_settings(
+    ui: &mut Ui,
+    s: &mut Settings,
+    dev: &mut Devices,
+    permission_note: Option<&str>,
+) -> Action {
     let mut action = Action::None;
-    ui.label(RichText::new("Source").font(theme::semibold(13.0)).color(pal(ui).secondary));
+    ui.label(
+        RichText::new("Source")
+            .font(theme::semibold(13.0))
+            .color(pal(ui).secondary),
+    );
     ui.add_space(4.0);
-    segmented(ui, &mut s.source, &[(SourceKind::Display, "Display"), (SourceKind::Window, "Window"), (SourceKind::Area, "Area"), (SourceKind::Device, "iPhone")]);
+    segmented(
+        ui,
+        &mut s.source,
+        &[
+            (SourceKind::Display, "Display"),
+            (SourceKind::Window, "Window"),
+            (SourceKind::Area, "Area"),
+            (SourceKind::Device, "iPhone"),
+        ],
+    );
     ui.add_space(8.0);
     match s.source {
         SourceKind::Display => {
-            let label = dev.displays.iter().find(|d| d.0 == s.display).map_or("Main display".to_string(), |d| d.1.clone());
-            egui::ComboBox::from_id_salt("display").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                ui.selectable_value(&mut s.display, 0, "Main display");
-                for (id, name) in &dev.displays {
-                    ui.selectable_value(&mut s.display, *id, name);
-                }
-            });
+            let label = dev
+                .displays
+                .iter()
+                .find(|d| d.0 == s.display)
+                .map_or("Main display".to_string(), |d| d.1.clone());
+            egui::ComboBox::from_id_salt("display")
+                .width(290.0)
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.display, 0, "Main display");
+                    for (id, name) in &dev.displays {
+                        ui.selectable_value(&mut s.display, *id, name);
+                    }
+                });
         }
         SourceKind::Window => {
-            let chosen = s.window.and_then(|w| dev.windows.iter().find(|d| d.id == w)).cloned();
-            let label = chosen.as_ref().map_or("Choose a window".into(), |d| d.label.clone());
-            egui::ComboBox::from_id_salt("window").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                for d in &dev.windows {
-                    ui.selectable_value(&mut s.window, Some(d.id), &d.label);
-                }
-            });
+            let chosen = s
+                .window
+                .and_then(|w| dev.windows.iter().find(|d| d.id == w))
+                .cloned();
+            let label = chosen
+                .as_ref()
+                .map_or("Choose a window".into(), |d| d.label.clone());
+            egui::ComboBox::from_id_salt("window")
+                .width(290.0)
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for d in &dev.windows {
+                        ui.selectable_value(&mut s.window, Some(d.id), &d.label);
+                    }
+                });
             if let Some(w) = &chosen
                 && let Some((width, height)) = window_size_row(ui, s, w)
             {
-                action = Action::ResizeWindow { id: w.id, width, height };
+                action = Action::ResizeWindow {
+                    id: w.id,
+                    width,
+                    height,
+                };
             }
             ui.horizontal(|ui| {
-                if ui.small_button("Pick on screen…").on_hover_text("Highlight windows on the display and click one").clicked() {
+                if ui
+                    .small_button("Pick on screen…")
+                    .on_hover_text("Highlight windows on the display and click one")
+                    .clicked()
+                {
                     action = Action::SelectWindow;
                 }
                 if ui.small_button("Refresh windows").clicked() {
@@ -597,17 +815,31 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
         }
         SourceKind::Device => {
             if dev.ios.is_empty() {
-                caption(ui, "Connect an iPhone or iPad with a cable, unlock it and trust this computer.");
+                caption(
+                    ui,
+                    "Choose an iPhone/iPad exposed by a Windows camera or capture-device driver. A USB trust connection alone does not expose screen video on Windows.",
+                );
             } else {
-                if s.ios_device.as_ref().is_none_or(|id| !dev.ios.iter().any(|d| &d.id == id)) {
+                if s.ios_device
+                    .as_ref()
+                    .is_none_or(|id| !dev.ios.iter().any(|d| &d.id == id))
+                {
                     s.ios_device = dev.ios.first().map(|d| d.id.clone());
                 }
-                let label = s.ios_device.as_ref().and_then(|id| dev.ios.iter().find(|d| &d.id == id)).map_or("", |d| d.name.as_str()).to_string();
-                egui::ComboBox::from_id_salt("ios").width(290.0).selected_text(label).show_ui(ui, |ui| {
-                    for d in &dev.ios {
-                        ui.selectable_value(&mut s.ios_device, Some(d.id.clone()), &d.name);
-                    }
-                });
+                let label = s
+                    .ios_device
+                    .as_ref()
+                    .and_then(|id| dev.ios.iter().find(|d| &d.id == id))
+                    .map_or("", |d| d.name.as_str())
+                    .to_string();
+                egui::ComboBox::from_id_salt("ios")
+                    .width(290.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for d in &dev.ios {
+                            ui.selectable_value(&mut s.ios_device, Some(d.id.clone()), &d.name);
+                        }
+                    });
             }
             if ui.small_button("Refresh").clicked() {
                 *dev = Devices::load();
@@ -615,20 +847,38 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
         }
         SourceKind::Area => {
             ui.horizontal(|ui| {
-                if ui.button("Select area…").on_hover_text("Drag a region on the screen").clicked() {
+                if ui
+                    .button("Select area…")
+                    .on_hover_text("Drag a region on the screen")
+                    .clicked()
+                {
                     action = Action::SelectArea;
                 }
-                caption(ui, &format!("{:.0} × {:.0} at {:.0}, {:.0}", s.area[2], s.area[3], s.area[0], s.area[1]));
+                caption(
+                    ui,
+                    &format!(
+                        "{:.0} × {:.0} at {:.0}, {:.0}",
+                        s.area[2], s.area[3], s.area[0], s.area[1]
+                    ),
+                );
             });
             egui::CollapsingHeader::new("Exact size").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (i, l) in ["x", "y", "w", "h"].iter().enumerate() {
                         ui.label(*l);
-                        ui.add(egui::DragValue::new(&mut s.area[i]).speed(4.0).range(0.0..=8000.0));
+                        ui.add(
+                            egui::DragValue::new(&mut s.area[i])
+                                .speed(4.0)
+                                .range(0.0..=8000.0),
+                        );
                     }
                 });
                 ui.horizontal(|ui| {
-                    for (name, w, h) in [("1280×720", 1280.0, 720.0), ("1920×1080", 1920.0, 1080.0), ("1080×1080", 1080.0, 1080.0)] {
+                    for (name, w, h) in [
+                        ("1280×720", 1280.0, 720.0),
+                        ("1920×1080", 1920.0, 1080.0),
+                        ("1080×1080", 1080.0, 1080.0),
+                    ] {
                         if ui.small_button(name).clicked() {
                             s.area[2] = w;
                             s.area[3] = h;
@@ -643,25 +893,45 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
     toggle_row(ui, "System audio", &mut s.system_audio);
     toggle_row(ui, "Microphone", &mut s.mic);
     if s.mic {
-        let label = s.mic_id.as_ref().and_then(|id| dev.mics.iter().find(|m| &m.id == id)).map_or("Default".to_string(), |m| m.name.clone());
-        egui::ComboBox::from_id_salt("mic").width(290.0).selected_text(label).show_ui(ui, |ui| {
-            ui.selectable_value(&mut s.mic_id, None, "Default");
-            for m in &dev.mics {
-                ui.selectable_value(&mut s.mic_id, Some(m.id.clone()), &m.name);
-            }
-        });
-        
+        let label = s
+            .mic_id
+            .as_ref()
+            .and_then(|id| dev.mics.iter().find(|m| &m.id == id))
+            .map_or("Default".to_string(), |m| m.name.clone());
+        egui::ComboBox::from_id_salt("mic")
+            .width(290.0)
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.mic_id, None, "Default");
+                for m in &dev.mics {
+                    ui.selectable_value(&mut s.mic_id, Some(m.id.clone()), &m.name);
+                }
+            });
     }
     toggle_row(ui, "Camera", &mut s.camera);
     if s.camera {
-        let label = s.camera_id.as_ref().and_then(|id| dev.cameras.iter().find(|m| &m.id == id)).map_or("Default".to_string(), |m| m.name.clone());
-        egui::ComboBox::from_id_salt("cam").width(290.0).selected_text(label).show_ui(ui, |ui| {
-            ui.selectable_value(&mut s.camera_id, None, "Default");
-            for m in &dev.cameras {
-                ui.selectable_value(&mut s.camera_id, Some(m.id.clone()), &m.name);
-            }
-        });
+        let label = s
+            .camera_id
+            .as_ref()
+            .and_then(|id| dev.cameras.iter().find(|m| &m.id == id))
+            .map_or("Default".to_string(), |m| m.name.clone());
+        egui::ComboBox::from_id_salt("cam")
+            .width(290.0)
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.camera_id, None, "Default");
+                for m in &dev.cameras {
+                    ui.selectable_value(&mut s.camera_id, Some(m.id.clone()), &m.name);
+                }
+            });
     }
+    ui.add_enabled_ui(s.camera, |ui| {
+        toggle_row(
+            ui,
+            "Show while recording",
+            &mut s.show_camera_while_recording,
+        );
+    });
     toggle_row(ui, "Record key presses", &mut s.keys);
     toggle_row(ui, "3 s countdown", &mut s.countdown);
     if matches!(s.source, SourceKind::Display | SourceKind::Area) {
@@ -676,7 +946,10 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
         changed |= shortcut_row(ui, "Start / stop", &mut s.hotkeys.record);
         changed |= shortcut_row(ui, "Pause / resume", &mut s.hotkeys.pause);
         changed |= shortcut_row(ui, "Cancel recording", &mut s.hotkeys.cancel);
-        caption(ui, "Click a shortcut, then press the new keys (⌫ clears, ⎋ keeps it).");
+        caption(
+            ui,
+            "Click a shortcut, then press the new keys (⌫ clears, ⎋ keeps it).",
+        );
         if changed {
             action = Action::HotkeysChanged;
         }
@@ -700,13 +973,31 @@ pub fn record_settings(ui: &mut Ui, s: &mut Settings, dev: &mut Devices, permiss
 /// One line describing what Record will capture.
 pub fn source_summary(s: &Settings, dev: &Devices) -> String {
     let source = match s.source {
-        SourceKind::Display => dev.displays.iter().find(|d| d.0 == s.display).map_or("Main display".to_string(), |d| d.1.split(" — ").next().unwrap_or("Display").to_string()),
-        SourceKind::Window => s.window.and_then(|w| dev.windows.iter().find(|d| d.id == w)).map_or("A window (pick it next)".to_string(), |d| d.label.clone()),
+        SourceKind::Display => dev
+            .displays
+            .iter()
+            .find(|d| d.0 == s.display)
+            .map_or("Main display".to_string(), |d| {
+                d.1.split(" — ").next().unwrap_or("Display").to_string()
+            }),
+        SourceKind::Window => s
+            .window
+            .and_then(|w| dev.windows.iter().find(|d| d.id == w))
+            .map_or("A window (pick it next)".to_string(), |d| d.label.clone()),
         SourceKind::Area => format!("Area {:.0} × {:.0}", s.area[2], s.area[3]),
-        SourceKind::Device => s.ios_device.as_ref().and_then(|id| dev.ios.iter().find(|d| &d.id == id)).map_or("iPhone / iPad".to_string(), |d| d.name.clone()),
+        SourceKind::Device => s
+            .ios_device
+            .as_ref()
+            .and_then(|id| dev.ios.iter().find(|d| &d.id == id))
+            .map_or("iPhone / iPad".to_string(), |d| d.name.clone()),
     };
     let on = |b: bool| if b { "on" } else { "off" };
-    format!("{source}  ·  system audio {}  ·  mic {}  ·  camera {}", on(s.system_audio), on(s.mic), on(s.camera))
+    format!(
+        "{source}  ·  system audio {}  ·  mic {}  ·  camera {}",
+        on(s.system_audio),
+        on(s.mic),
+        on(s.camera)
+    )
 }
 
 fn source_name(k: SourceKind) -> &'static str {
@@ -720,10 +1011,20 @@ fn source_name(k: SourceKind) -> &'static str {
 
 /// Recent recordings, newest first, with small thumbnails; plus Open… and
 /// the projects folder. Used as the popover off the window title.
-pub fn recents(ui: &mut Ui, projects: &[ProjectEntry], thumbs: &mut Thumbs, current: Option<&Path>, dir: &Path) -> Action {
+pub fn recents(
+    ui: &mut Ui,
+    projects: &[ProjectEntry],
+    thumbs: &mut Thumbs,
+    current: Option<&Path>,
+    dir: &Path,
+) -> Action {
     const WIDTH: f32 = 340.0;
     ui.set_width(WIDTH);
-    ui.label(RichText::new("Recent recordings").font(theme::semibold(12.0)).color(pal(ui).secondary));
+    ui.label(
+        RichText::new("Recent recordings")
+            .font(theme::semibold(12.0))
+            .color(pal(ui).secondary),
+    );
     let action = recent_list(ui, projects, thumbs, current, WIDTH, 10);
     ui.separator();
     if ui.button("Open…").clicked()
@@ -738,7 +1039,14 @@ pub fn recents(ui: &mut Ui, projects: &[ProjectEntry], thumbs: &mut Thumbs, curr
 }
 
 /// Rows of recent recordings with thumbnails, newest first.
-fn recent_list(ui: &mut Ui, projects: &[ProjectEntry], thumbs: &mut Thumbs, current: Option<&Path>, width: f32, max: usize) -> Action {
+fn recent_list(
+    ui: &mut Ui,
+    projects: &[ProjectEntry],
+    thumbs: &mut Thumbs,
+    current: Option<&Path>,
+    width: f32,
+    max: usize,
+) -> Action {
     let mut action = Action::None;
     let p = pal(ui);
     if projects.is_empty() {
@@ -748,20 +1056,40 @@ fn recent_list(ui: &mut Ui, projects: &[ProjectEntry], thumbs: &mut Thumbs, curr
         let open = current == Some(e.path.as_path());
         let (rect, resp) = ui.allocate_exact_size(vec2(width, 46.0), Sense::click());
         if resp.hovered() || open {
-            ui.painter().rect_filled(rect, CornerRadius::same(6), if open { p.pressed } else { p.hover });
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(6),
+                if open { p.pressed } else { p.hover },
+            );
         }
         let thumb = egui::Rect::from_min_size(rect.min + vec2(4.0, 5.0), vec2(58.0, 36.0));
-        ui.painter().rect_filled(thumb, CornerRadius::same(4), p.control);
+        ui.painter()
+            .rect_filled(thumb, CornerRadius::same(4), p.control);
         if let Some(tex) = thumbs.get(ui.ctx(), &e.path) {
-            ui.painter().image(tex, thumb, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            ui.painter().image(
+                tex,
+                thumb,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
         }
         let x = thumb.right() + 10.0;
         let text = ui.painter().with_clip_rect(rect.shrink(2.0));
-        text.text(egui::pos2(x, rect.top() + 7.0), egui::Align2::LEFT_TOP, &e.name, theme::semibold(12.5), p.text);
+        text.text(
+            egui::pos2(x, rect.top() + 7.0),
+            egui::Align2::LEFT_TOP,
+            &e.name,
+            theme::semibold(12.5),
+            p.text,
+        );
         text.text(
             egui::pos2(x, rect.top() + 25.0),
             egui::Align2::LEFT_TOP,
-            format!("{}  ·  {}", widgets::fmt_time(e.duration_ms), ago(e.modified)),
+            format!(
+                "{}  ·  {}",
+                widgets::fmt_time(e.duration_ms),
+                ago(e.modified)
+            ),
             egui::FontId::proportional(11.0),
             p.secondary,
         );
@@ -805,15 +1133,23 @@ impl Chrome<'_> {
 
     /// Back, then the title, which opens recent recordings.
     pub fn title_left(&mut self, ui: &mut Ui, title: &str, open: Option<&Path>) {
-        if open.is_some() && ui.button("‹ Back").on_hover_text("Close this recording and set up a new one").clicked() {
+        if open.is_some()
+            && ui
+                .button("‹ Back")
+                .on_hover_text("Close this recording and set up a new one")
+                .clicked()
+        {
             self.set(Action::Back);
         }
         ui.add_space(8.0);
         let dir = self.settings.dir();
         let mut a = Action::None;
-        let r = ui.menu_button(RichText::new(format!("{title}      ")).font(theme::semibold(theme::BODY)), |ui| {
-            a = recents(ui, self.projects, self.thumbs, open, &dir);
-        });
+        let r = ui.menu_button(
+            RichText::new(format!("{title}      ")).font(theme::semibold(theme::BODY)),
+            |ui| {
+                a = recents(ui, self.projects, self.thumbs, open, &dir);
+            },
+        );
         chevron(ui, &r.response);
         r.response.on_hover_text("Recent recordings");
         self.set(a);
@@ -825,7 +1161,12 @@ impl Chrome<'_> {
         let s = &mut *self.settings;
         let mut a = Action::None;
         let r = ui.menu_button(format!("{}      ", source_name(s.source)), |ui| {
-            for k in [SourceKind::Display, SourceKind::Window, SourceKind::Area, SourceKind::Device] {
+            for k in [
+                SourceKind::Display,
+                SourceKind::Window,
+                SourceKind::Area,
+                SourceKind::Device,
+            ] {
                 if ui.selectable_label(s.source == k, source_name(k)).clicked() {
                     s.source = k;
                 }
@@ -835,14 +1176,30 @@ impl Chrome<'_> {
             ui.checkbox(&mut s.mic, "Microphone");
             ui.checkbox(&mut s.camera, "Camera");
             ui.separator();
-            if ui.button("More options…").on_hover_text("Close this recording and show every recording option").clicked() {
+            if ui
+                .button("More options…")
+                .on_hover_text("Close this recording and show every recording option")
+                .clicked()
+            {
                 a = Action::Back;
             }
         });
         chevron(ui, &r.response);
         r.response.on_hover_text("What to record");
-        let rec = egui::Button::new(RichText::new("●  Record").color(Color32::from_rgb(255, 69, 58)).font(theme::semibold(theme::BODY)));
-        if ui.add(rec).on_hover_text(format!("{}  ({})", source_summary(s, self.devices), s.hotkeys.record_label())).clicked() {
+        let rec = egui::Button::new(
+            RichText::new("●  Record")
+                .color(Color32::from_rgb(255, 69, 58))
+                .font(theme::semibold(theme::BODY)),
+        );
+        if ui
+            .add(rec)
+            .on_hover_text(format!(
+                "{}  ({})",
+                source_summary(s, self.devices),
+                s.hotkeys.record_label()
+            ))
+            .clicked()
+        {
             a = Action::Record;
         }
         self.set(a);
@@ -871,10 +1228,13 @@ const SIDEBAR_W: f32 = 300.0;
 /// Small rounded label (PREVIEW, …) in the toolbar.
 #[allow(dead_code)]
 fn pill(ui: &mut Ui, text: &str, fill: Color32, fg: Color32) {
-    let galley = ui.painter().layout_no_wrap(text.to_string(), theme::semibold(theme::SECONDARY), fg);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_string(), theme::semibold(theme::SECONDARY), fg);
     let (rect, _) = ui.allocate_exact_size(galley.size() + vec2(16.0, 6.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
-    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, fg);
 }
 
 /// Horizontal peak meter, -60..0 dBFS, green/yellow/red.
@@ -882,22 +1242,43 @@ fn pill(ui: &mut Ui, text: &str, fill: Color32, fg: Color32) {
 fn meter(ui: &mut Ui, label: &str, level: Option<f32>) {
     let p = pal(ui);
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(44.0, 14.0), egui::Label::new(RichText::new(label).size(theme::SECONDARY).color(p.secondary)));
+        ui.add_sized(
+            vec2(44.0, 14.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .size(theme::SECONDARY)
+                    .color(p.secondary),
+            ),
+        );
         let (rect, _) = ui.allocate_exact_size(vec2(180.0, 8.0), Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(rect, CornerRadius::same(3), p.control);
         let Some(level) = level else {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "off", egui::FontId::proportional(9.0), p.tertiary);
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "off",
+                egui::FontId::proportional(9.0),
+                p.tertiary,
+            );
             return;
         };
         let db = 20.0 * level.max(1e-6).log10();
         let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
         let x = |f: f32| rect.left() + rect.width() * f;
         let at = frac(db);
-        for (lo, hi, col) in [(0.0, frac(-18.0), Color32::from_rgb(0x34, 0xc7, 0x59)), (frac(-18.0), frac(-6.0), Color32::from_rgb(0xff, 0xcc, 0x00)), (frac(-6.0), 1.0, RED)] {
+        for (lo, hi, col) in [
+            (0.0, frac(-18.0), Color32::from_rgb(0x34, 0xc7, 0x59)),
+            (frac(-18.0), frac(-6.0), Color32::from_rgb(0xff, 0xcc, 0x00)),
+            (frac(-6.0), 1.0, RED),
+        ] {
             let hi = hi.min(at);
             if hi > lo {
-                painter.rect_filled(egui::Rect::from_x_y_ranges(x(lo)..=x(hi), rect.y_range()), CornerRadius::same(2), col);
+                painter.rect_filled(
+                    egui::Rect::from_x_y_ranges(x(lo)..=x(hi), rect.y_range()),
+                    CornerRadius::same(2),
+                    col,
+                );
             }
         }
     });
@@ -905,29 +1286,56 @@ fn meter(ui: &mut Ui, label: &str, level: Option<f32>) {
 
 /// The bubble's rect for `style` over a preview of the screen at `frame`,
 /// laid out as the editor lays it out over the output.
-fn bubble_rect(style: &crate::project::model::CameraStyle, frame: egui::Rect, cam: egui::Vec2) -> egui::Rect {
+fn bubble_rect(
+    style: &crate::project::model::CameraStyle,
+    frame: egui::Rect,
+    cam: egui::Vec2,
+) -> egui::Rect {
     use crate::engine::{camera, geom::v2};
     let out = v2(frame.width() as f64, frame.height() as f64);
     let aspect = camera::aspect(style, v2(cam.x as f64, cam.y as f64));
     let r = camera::bubble_rect(out, aspect, style.size, style.position);
-    egui::Rect::from_min_size(frame.min + vec2(r.x as f32, r.y as f32), vec2(r.w as f32, r.h as f32))
+    egui::Rect::from_min_size(
+        frame.min + vec2(r.x as f32, r.y as f32),
+        vec2(r.w as f32, r.h as f32),
+    )
 }
 
 /// Anti-aliased mesh filling the convex outline `pts` (centre `c`): a 1 px
 /// ramp to transparent along the edge, as egui feathers its own shapes.
-fn outline_mesh(pts: &[egui::Pos2], c: egui::Pos2, tex: egui::TextureId, color: Color32, uv: impl Fn(egui::Pos2) -> egui::Pos2) -> egui::Mesh {
+pub(crate) fn outline_mesh(
+    pts: &[egui::Pos2],
+    c: egui::Pos2,
+    tex: egui::TextureId,
+    color: Color32,
+    uv: impl Fn(egui::Pos2) -> egui::Pos2,
+) -> egui::Mesh {
     let mut m = egui::Mesh::with_texture(tex);
     let n = pts.len() as u32;
-    m.vertices.push(egui::epaint::Vertex { pos: c, uv: uv(c), color });
+    m.vertices.push(egui::epaint::Vertex {
+        pos: c,
+        uv: uv(c),
+        color,
+    });
     for (i, &p) in pts.iter().enumerate() {
-        let (prev, next) = (pts[(i + pts.len() - 1) % pts.len()], pts[(i + 1) % pts.len()]);
+        let (prev, next) = (
+            pts[(i + pts.len() - 1) % pts.len()],
+            pts[(i + 1) % pts.len()],
+        );
         let t = next - prev;
         let mut normal = vec2(t.y, -t.x).normalized();
         if normal.dot(p - c) < 0.0 {
             normal = -normal;
         }
-        for (q, col) in [(p - normal * 0.5, color), (p + normal * 0.5, Color32::TRANSPARENT)] {
-            m.vertices.push(egui::epaint::Vertex { pos: q, uv: uv(q), color: col });
+        for (q, col) in [
+            (p - normal * 0.5, color),
+            (p + normal * 0.5, Color32::TRANSPARENT),
+        ] {
+            m.vertices.push(egui::epaint::Vertex {
+                pos: q,
+                uv: uv(q),
+                color: col,
+            });
         }
     }
     for i in 0..n {
@@ -943,7 +1351,13 @@ fn outline_mesh(pts: &[egui::Pos2], c: egui::Pos2, tex: egui::TextureId, color: 
 /// The live camera over the preview `frame` in its bubble (shape, border,
 /// shadow, mirror), draggable: it moves while dragged and snaps to a corner
 /// when released near one.
-fn camera_bubble(ui: &mut Ui, style: &mut crate::project::model::CameraStyle, frame: egui::Rect, tex: egui::TextureId, cam: egui::Vec2) -> Action {
+fn camera_bubble(
+    ui: &mut Ui,
+    style: &mut crate::project::model::CameraStyle,
+    frame: egui::Rect,
+    tex: egui::TextureId,
+    cam: egui::Vec2,
+) -> Action {
     use crate::engine::{camera, geom::v2};
     const SNAP: f64 = 0.12;
     let mut action = Action::None;
@@ -954,10 +1368,23 @@ fn camera_bubble(ui: &mut Ui, style: &mut crate::project::model::CameraStyle, fr
         let m = frame.width().min(frame.height()) * camera::SAFE_MARGIN as f32;
         let room = (frame.size() - vec2(2.0 * m, 2.0 * m) - bubble.size()).max(vec2(1.0, 1.0));
         let min = bubble.min + resp.drag_delta() - frame.min - vec2(m, m);
-        style.position = v2((min.x / room.x).clamp(0.0, 1.0) as f64, (min.y / room.y).clamp(0.0, 1.0) as f64);
+        style.position = v2(
+            (min.x / room.x).clamp(0.0, 1.0) as f64,
+            (min.y / room.y).clamp(0.0, 1.0) as f64,
+        );
     }
-    let snap = |p: f64| if p < SNAP { Some(0.0) } else if p > 1.0 - SNAP { Some(1.0) } else { None };
-    let corner = snap(style.position.x).zip(snap(style.position.y)).map(|(x, y)| v2(x, y));
+    let snap = |p: f64| {
+        if p < SNAP {
+            Some(0.0)
+        } else if p > 1.0 - SNAP {
+            Some(1.0)
+        } else {
+            None
+        }
+    };
+    let corner = snap(style.position.x)
+        .zip(snap(style.position.y))
+        .map(|(x, y)| v2(x, y));
     if resp.drag_stopped() {
         if let Some(c) = corner {
             style.position = c;
@@ -970,35 +1397,77 @@ fn camera_bubble(ui: &mut Ui, style: &mut crate::project::model::CameraStyle, fr
     let n = style.squircle_exponent() as f32;
     let painter = ui.painter_at(frame);
     if style.shadow {
-        let r = if n > 0.0 { bubble.width().min(bubble.height()) * 0.3 } else { radius };
-        let shadow = egui::epaint::Shadow { offset: [0, (8.0 * k).round() as i8], blur: (32.0 * k).clamp(4.0, 60.0) as u8, spread: 0, color: Color32::from_black_alpha(115) };
+        let r = if n > 0.0 {
+            bubble.width().min(bubble.height()) * 0.3
+        } else {
+            radius
+        };
+        let shadow = egui::epaint::Shadow {
+            offset: [0, (8.0 * k).round() as i8],
+            blur: (32.0 * k).clamp(4.0, 60.0) as u8,
+            spread: 0,
+            color: Color32::from_black_alpha(115),
+        };
         painter.add(shadow.as_shape(bubble, CornerRadius::same(r.min(255.0) as u8)));
     }
-    let bw = (style.border.max(0.0) as f32 * k).round().min(bubble.width().min(bubble.height()) / 2.0);
+    let bw = (style.border.max(0.0) as f32 * k)
+        .round()
+        .min(bubble.width().min(bubble.height()) / 2.0);
     if bw > 0.0 {
         let [r, g, b, _] = style.border_color.0;
         let pts = widgets::bubble_outline(bubble, radius, n);
-        painter.add(outline_mesh(&pts, bubble.center(), egui::TextureId::default(), Color32::from_rgb(r, g, b), |_| egui::epaint::WHITE_UV));
+        painter.add(outline_mesh(
+            &pts,
+            bubble.center(),
+            egui::TextureId::default(),
+            Color32::from_rgb(r, g, b),
+            |_| egui::epaint::WHITE_UV,
+        ));
     }
     let inner = bubble.shrink(bw);
     // Centre crop of the camera to the bubble's aspect, mirrored if asked.
-    let crop = crate::engine::scene::centre_crop((cam.x / cam.y) as f64, (inner.width() / inner.height()) as f64);
+    let crop = crate::engine::scene::centre_crop(
+        (cam.x / cam.y) as f64,
+        (inner.width() / inner.height()) as f64,
+    );
     let uv = |p: egui::Pos2| {
-        let (fx, fy) = ((p.x - inner.min.x) / inner.width(), (p.y - inner.min.y) / inner.height());
+        let (fx, fy) = (
+            (p.x - inner.min.x) / inner.width(),
+            (p.y - inner.min.y) / inner.height(),
+        );
         let fx = if style.mirror { 1.0 - fx } else { fx };
-        egui::pos2(crop.x as f32 + fx * crop.w as f32, crop.y as f32 + fy * crop.h as f32)
+        egui::pos2(
+            crop.x as f32 + fx * crop.w as f32,
+            crop.y as f32 + fy * crop.h as f32,
+        )
     };
     let pts = widgets::bubble_outline(inner, (radius - bw).max(0.0), n);
     painter.add(outline_mesh(&pts, inner.center(), tex, Color32::WHITE, uv));
     if resp.hovered() || resp.dragged() {
-        ui.ctx().set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        ui.ctx().set_cursor_icon(if resp.dragged() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::Grab
+        });
     }
     if resp.dragged()
         && let Some(c) = corner
     {
         // Where it will snap.
-        let ghost = bubble_rect(&crate::project::model::CameraStyle { position: c, ..*style }, frame, cam);
-        painter.rect_stroke(ghost, CornerRadius::same(6), Stroke::new(1.5, theme::accent().gamma_multiply(0.8)), egui::StrokeKind::Outside);
+        let ghost = bubble_rect(
+            &crate::project::model::CameraStyle {
+                position: c,
+                ..*style
+            },
+            frame,
+            cam,
+        );
+        painter.rect_stroke(
+            ghost,
+            CornerRadius::same(6),
+            Stroke::new(1.5, theme::accent().gamma_multiply(0.8)),
+            egui::StrokeKind::Outside,
+        );
     }
     action
 }
@@ -1016,11 +1485,26 @@ pub fn start_view(
     permission_note: Option<&str>,
     live: &LiveView,
 ) -> Action {
-    let mut chrome = Chrome { settings: s, devices: dev, projects, thumbs, action: Action::None };
+    let mut chrome = Chrome {
+        settings: s,
+        devices: dev,
+        projects,
+        thumbs,
+        action: Action::None,
+    };
     let p = pal(ui);
     egui::Panel::top("editor-toolbar")
         .exact_size(theme::TOOLBAR_H)
-        .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::toolbar_left(), right: 12, top: 0, bottom: 0 }))
+        .frame(
+            egui::Frame::new()
+                .fill(p.window)
+                .inner_margin(egui::Margin {
+                    left: theme::toolbar_left(),
+                    right: 12,
+                    top: 0,
+                    bottom: 0,
+                }),
+        )
         .show(ui, |ui| {
             super::toolbar_drag(ui);
             ui.horizontal_centered(|ui| {
@@ -1041,46 +1525,72 @@ pub fn start_view(
     egui::Panel::right("inspector")
         .exact_size(320.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(p.inspector).inner_margin(egui::Margin::symmetric(14, 10)))
+        .frame(
+            egui::Frame::new()
+                .fill(p.inspector)
+                .inner_margin(egui::Margin::symmetric(14, 10)),
+        )
         .show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                // The editor's tabs, with Record active until there's a recording.
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                    let pill = |label: &str, sel: bool| {
-                        egui::Button::new(RichText::new(label).size(12.0).color(if sel { Color32::WHITE } else { p.text }))
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    // The editor's tabs, with Record active until there's a recording.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                        let pill = |label: &str, sel: bool| {
+                            egui::Button::new(RichText::new(label).size(12.0).color(if sel {
+                                Color32::WHITE
+                            } else {
+                                p.text
+                            }))
                             .fill(if sel { theme::accent() } else { p.control })
-                            .stroke(if sel { Stroke::NONE } else { Stroke::new(0.5, p.control_border) })
+                            .stroke(if sel {
+                                Stroke::NONE
+                            } else {
+                                Stroke::new(0.5, p.control_border)
+                            })
                             .corner_radius(CornerRadius::same(12))
-                    };
-                    ui.add(pill("Record", true));
-                    for (_, label) in super::editor::Tab::ALL {
-                        ui.add_enabled(false, pill(label, false)).on_disabled_hover_text("Record or open a recording to edit it");
-                    }
+                        };
+                        ui.add(pill("Record", true));
+                        for (_, label) in super::editor::Tab::ALL {
+                            ui.add_enabled(false, pill(label, false))
+                                .on_disabled_hover_text("Record or open a recording to edit it");
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    let a = record_settings(ui, chrome.settings, chrome.devices, permission_note);
+                    chrome.set(a);
                 });
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-                let a = record_settings(ui, chrome.settings, chrome.devices, permission_note);
-                chrome.set(a);
-            });
         });
 
     egui::Panel::bottom("timeline")
         .exact_size(236.0)
-        .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(12, 8)))
+        .frame(
+            egui::Frame::new()
+                .fill(p.sidebar)
+                .inner_margin(egui::Margin::symmetric(12, 8)),
+        )
         .show(ui, |ui| {
             super::timeline::empty(ui);
         });
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(if ui.visuals().dark_mode { Color32::from_rgb(0x1c, 0x1c, 0x1e) } else { Color32::from_rgb(0xe4, 0xe4, 0xe7) }))
+        .frame(egui::Frame::new().fill(if ui.visuals().dark_mode {
+            Color32::from_rgb(0x1c, 0x1c, 0x1e)
+        } else {
+            Color32::from_rgb(0xe4, 0xe4, 0xe7)
+        }))
         .show(ui, |ui| {
             let mut a = Action::None;
             let canvas = ui.available_rect_before_wrap();
             let ppp = ui.ctx().pixels_per_point();
             let px = |v: f32| (v * ppp).floor().max(0.0) as u64;
-            CANVAS_PX.store(px(canvas.width()) << 32 | px(canvas.height()), std::sync::atomic::Ordering::Relaxed);
+            CANVAS_PX.store(
+                px(canvas.width()) << 32 | px(canvas.height()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             let rect = if let Some((tex, size)) = live.screen {
                 // The source, live, as large as the canvas allows.
@@ -1088,14 +1598,38 @@ pub fn start_view(
                 let fit = (area.width() / size.x).min(area.height() / size.y).min(1.0);
                 let snap = |v: f32| (v * ppp).round() / ppp;
                 let min = area.center() - size * fit / 2.0;
-                let rect = egui::Rect::from_min_size(egui::pos2(snap(min.x), snap(min.y)), size * fit);
-                let shadow = egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(60) };
-                ui.painter().add(shadow.as_shape(rect, CornerRadius::same(6)));
-                egui::Image::new((tex, size)).corner_radius(6).paint_at(ui, rect);
-                let badge = egui::Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(104.0, 22.0));
-                ui.painter().rect_filled(badge, CornerRadius::same(11), Color32::from_black_alpha(150));
-                ui.painter().circle_filled(badge.left_center() + vec2(12.0, 0.0), 4.0, Color32::from_rgb(255, 69, 58));
-                ui.painter().text(badge.left_center() + vec2(22.0, 0.0), egui::Align2::LEFT_CENTER, "Live preview", egui::FontId::proportional(11.0), Color32::WHITE);
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(snap(min.x), snap(min.y)), size * fit);
+                let shadow = egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 24,
+                    spread: 0,
+                    color: Color32::from_black_alpha(60),
+                };
+                ui.painter()
+                    .add(shadow.as_shape(rect, CornerRadius::same(6)));
+                egui::Image::new((tex, size))
+                    .corner_radius(6)
+                    .paint_at(ui, rect);
+                let badge =
+                    egui::Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(104.0, 22.0));
+                ui.painter().rect_filled(
+                    badge,
+                    CornerRadius::same(11),
+                    Color32::from_black_alpha(150),
+                );
+                ui.painter().circle_filled(
+                    badge.left_center() + vec2(12.0, 0.0),
+                    4.0,
+                    Color32::from_rgb(255, 69, 58),
+                );
+                ui.painter().text(
+                    badge.left_center() + vec2(22.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Live preview",
+                    egui::FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
                 rect
             } else {
                 // When starting or without screen texture, draw the document preview canvas as shown in home.png
@@ -1106,10 +1640,20 @@ pub fn start_view(
                     size = vec2(area.height() * aspect, area.height());
                 }
                 let rect = egui::Rect::from_center_size(area.center(), size);
-                let shadow = egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(60) };
-                ui.painter().add(shadow.as_shape(rect, CornerRadius::same(6)));
-                ui.painter().rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(0xf5, 0xf6, 0xf8));
-                
+                let shadow = egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 24,
+                    spread: 0,
+                    color: Color32::from_black_alpha(60),
+                };
+                ui.painter()
+                    .add(shadow.as_shape(rect, CornerRadius::same(6)));
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::same(6),
+                    Color32::from_rgb(0xf5, 0xf6, 0xf8),
+                );
+
                 // Draw mock document lines/cards matching home.png
                 let painter = ui.painter();
                 let pad = 24.0;
@@ -1117,26 +1661,62 @@ pub fn start_view(
                 for col in 0..3 {
                     let col_x = rect.left() + pad + col as f32 * (col_w + pad);
                     if col == 0 {
-                        let header_r = egui::Rect::from_min_size(egui::pos2(col_x, rect.top() + pad + 20.0), vec2(col_w * 0.6, 26.0));
-                        painter.rect_filled(header_r, CornerRadius::same(3), Color32::from_rgb(0x00, 0x7a, 0xff));
+                        let header_r = egui::Rect::from_min_size(
+                            egui::pos2(col_x, rect.top() + pad + 20.0),
+                            vec2(col_w * 0.6, 26.0),
+                        );
+                        painter.rect_filled(
+                            header_r,
+                            CornerRadius::same(3),
+                            Color32::from_rgb(0x00, 0x7a, 0xff),
+                        );
                     }
                     for row in 0..3 {
                         let y = rect.top() + pad + 60.0 + row as f32 * 140.0;
                         if y + 100.0 < rect.bottom() - pad {
-                            let title_r = egui::Rect::from_min_size(egui::pos2(col_x, y), vec2(col_w * 0.85, 18.0));
-                            painter.rect_filled(title_r, CornerRadius::same(2), Color32::from_rgb(0x2d, 0x31, 0x39));
+                            let title_r = egui::Rect::from_min_size(
+                                egui::pos2(col_x, y),
+                                vec2(col_w * 0.85, 18.0),
+                            );
+                            painter.rect_filled(
+                                title_r,
+                                CornerRadius::same(2),
+                                Color32::from_rgb(0x2d, 0x31, 0x39),
+                            );
                             for line in 0..4 {
-                                let line_r = egui::Rect::from_min_size(egui::pos2(col_x, y + 26.0 + line as f32 * 14.0), vec2(col_w * (0.9 - line as f32 * 0.1), 8.0));
-                                painter.rect_filled(line_r, CornerRadius::same(2), Color32::from_rgb(0xaa, 0xad, 0xb5));
+                                let line_r = egui::Rect::from_min_size(
+                                    egui::pos2(col_x, y + 26.0 + line as f32 * 14.0),
+                                    vec2(col_w * (0.9 - line as f32 * 0.1), 8.0),
+                                );
+                                painter.rect_filled(
+                                    line_r,
+                                    CornerRadius::same(2),
+                                    Color32::from_rgb(0xaa, 0xad, 0xb5),
+                                );
                             }
                         }
                     }
                 }
-                
-                let badge = egui::Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(104.0, 22.0));
-                ui.painter().rect_filled(badge, CornerRadius::same(11), Color32::from_black_alpha(150));
-                ui.painter().circle_filled(badge.left_center() + vec2(12.0, 0.0), 4.0, Color32::from_rgb(255, 69, 58));
-                ui.painter().text(badge.left_center() + vec2(22.0, 0.0), egui::Align2::LEFT_CENTER, "Live preview", egui::FontId::proportional(11.0), Color32::WHITE);
+
+                let badge =
+                    egui::Rect::from_min_size(rect.min + vec2(10.0, 10.0), vec2(104.0, 22.0));
+                ui.painter().rect_filled(
+                    badge,
+                    CornerRadius::same(11),
+                    Color32::from_black_alpha(150),
+                );
+                ui.painter().circle_filled(
+                    badge.left_center() + vec2(12.0, 0.0),
+                    4.0,
+                    Color32::from_rgb(255, 69, 58),
+                );
+                ui.painter().text(
+                    badge.left_center() + vec2(22.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Live preview",
+                    egui::FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
                 rect
             };
 
@@ -1165,16 +1745,28 @@ pub fn start_view(
                     };
                     ui.vertical_centered(|ui| {
                         let hk = s.hotkeys.record_label();
-                        if widgets::record_button(ui, 88.0, false).on_hover_text(format!("Start recording {hk}")).clicked() {
+                        if widgets::record_button(ui, 88.0, false)
+                            .on_hover_text(format!("Start recording {hk}"))
+                            .clicked()
+                        {
                             a = Action::Record;
                         }
                         ui.add_space(12.0);
-                        ui.label(RichText::new(format!("Record {}", source_name(s.source).to_lowercase())).font(theme::semibold(20.0)).color(strong));
+                        ui.label(
+                            RichText::new(format!(
+                                "Record {}",
+                                source_name(s.source).to_lowercase()
+                            ))
+                            .font(theme::semibold(20.0))
+                            .color(strong),
+                        );
                         ui.add_space(4.0);
                         sub(ui, &source_summary(s, chrome.devices));
                         let next = match s.source {
                             SourceKind::Area => "You'll drag to select the area next.",
-                            SourceKind::Window if s.window.is_none() => "You'll pick the window on screen next.",
+                            SourceKind::Window if s.window.is_none() => {
+                                "You'll pick the window on screen next."
+                            }
                             _ if s.countdown => "Recording starts after a 3 s countdown.",
                             _ => "",
                         };
@@ -1185,7 +1777,8 @@ pub fn start_view(
                         ui.add_space(14.0);
                         let dir = s.dir();
                         if ui.button("Open a recording…").clicked()
-                            && let Some(f) = rfd::FileDialog::new().set_directory(&dir).pick_folder()
+                            && let Some(f) =
+                                rfd::FileDialog::new().set_directory(&dir).pick_folder()
                         {
                             a = Action::Open(f);
                         }
@@ -1198,7 +1791,10 @@ pub fn start_view(
 }
 
 fn ago(t: SystemTime) -> String {
-    let s = SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    let s = SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     match s {
         0..=59 => "just now".into(),
         60..=3599 => format!("{} min ago", s / 60),
@@ -1211,14 +1807,38 @@ fn ago(t: SystemTime) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn camera_monitor_preference_is_optional_and_persistent() {
+        let old: Settings = serde_json::from_str(r#"{"camera":true}"#).unwrap();
+        assert!(!old.show_camera_while_recording);
+        let mut settings = old;
+        settings.show_camera_while_recording = true;
+        settings.camera = false;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.show_camera_while_recording);
+        assert!(!restored.camera);
+    }
+
     fn win(id: u32, label: &str) -> WindowEntry {
-        WindowEntry { id, label: label.into(), size: (800.0, 600.0), display: (1440.0, 900.0) }
+        WindowEntry {
+            id,
+            label: label.into(),
+            size: (800.0, 600.0),
+            display: (1440.0, 900.0),
+        }
     }
 
     #[test]
     fn window_is_found_again_after_its_id_changes() {
-        let mut s = Settings { window: Some(10), ..Default::default() };
-        let mut dev = Devices { windows: vec![win(10, "Safari — Docs"), win(11, "Notes")], ..Default::default() };
+        let mut s = Settings {
+            window: Some(10),
+            ..Default::default()
+        };
+        let mut dev = Devices {
+            windows: vec![win(10, "Safari — Docs"), win(11, "Notes")],
+            ..Default::default()
+        };
         assert!(s.resolve_window(&dev));
         assert_eq!(s.window_label.as_deref(), Some("Safari — Docs"));
         assert!(!s.resolve_window(&dev));

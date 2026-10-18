@@ -1,4 +1,4 @@
-//! Preview audio: the edit's soundtrack, mixed in the background and played
+//! Preview audio: bounded soundtrack windows, mixed in the background and played
 //! through audio output (cpal) in step with the playhead. The master volume is
 //! applied live in the output callback; other edits (mutes, clip volumes,
 //! music, voice-overs) re-mix in the background and swap in while playing.
@@ -20,6 +20,8 @@ use crate::export::audio::{Stereo, sample, soft_clip};
 use crate::project::model::{AudioStyle, Project, Slice, VoiceOver};
 use crate::project::recording::Recording;
 use crate::util::SendBox;
+mod window;
+use window::{Prepared, Window};
 
 /// Re-seek when the audio is this far from the playhead.
 const MAX_DRIFT_MS: f64 = 60.0;
@@ -74,7 +76,11 @@ impl Meter {
 /// State shared with the output callback.
 struct Shared {
     /// The soundtrack before the master volume (None = nothing audible).
-    mix: Mutex<Option<Arc<Vec<Stereo>>>>,
+    mix: Mutex<Option<Arc<Window>>>,
+    prepared: Mutex<Option<Prepared>>,
+    applied: AtomicU64,
+    stopped: AtomicBool,
+    mix_error: Mutex<Option<Option<String>>>,
     /// Bumped when `mix` changes.
     mix_gen: AtomicU64,
     /// Newest requested mix; older background mixes are dropped.
@@ -109,7 +115,11 @@ impl MixKey {
     fn of(p: &Project) -> MixKey {
         let mut audio = p.style.audio.clone();
         audio.volume = 1.0;
-        MixKey { audio, slices: p.timeline.slices.clone(), voiceovers: p.timeline.voiceovers.clone() }
+        MixKey {
+            audio,
+            slices: p.timeline.slices.clone(),
+            voiceovers: p.timeline.voiceovers.clone(),
+        }
     }
 }
 
@@ -128,9 +138,11 @@ pub struct AudioPreview {
     request: Option<(Instant, Project, Recording, PathBuf)>,
     mixed: Option<MixKey>,
     /// Mixes running in the background.
-    mixing: Arc<AtomicU64>,
+    preparations: Vec<std::thread::JoinHandle<()>>,
+    producer: Option<std::thread::JoinHandle<()>>,
     /// Last output error, for the status line.
     pub error: Option<String>,
+    mix_failure: Option<String>,
     /// When the output was last restarted (at most once a second).
     restarted: Option<Instant>,
     /// Held while playing, so App Nap doesn't throttle the picture when
@@ -139,33 +151,44 @@ pub struct AudioPreview {
 }
 
 #[cfg(target_os = "macos")]
-type Activity = SendBox<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>;
+type Activity = SendBox<
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+>;
 #[cfg(not(target_os = "macos"))]
 type Activity = SendBox<()>;
 
 impl AudioPreview {
     pub fn new() -> Self {
+        let shared = Arc::new(Shared {
+            mix: Mutex::new(None),
+            prepared: Mutex::new(None),
+            applied: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+            mix_error: Mutex::new(None),
+            mix_gen: AtomicU64::new(0),
+            requested: AtomicU64::new(0),
+            pos: AtomicU64::new(0f64.to_bits()),
+            playing: AtomicBool::new(false),
+            volume: AtomicU32::new(1f32.to_bits()),
+            broken: AtomicBool::new(false),
+            heartbeat: AtomicU64::new(0),
+            meter_reset: AtomicBool::new(false),
+            meter_frames: AtomicU64::new(0),
+            meter_energy: AtomicU64::new(0f64.to_bits()),
+            meter_source: AtomicU64::new(0f64.to_bits()),
+            meter_peak: AtomicU32::new(0f32.to_bits()),
+        });
+        let producer_shared = shared.clone();
+        let producer = std::thread::spawn(move || window::produce(producer_shared));
         AudioPreview {
-            shared: Arc::new(Shared {
-                mix: Mutex::new(None),
-                mix_gen: AtomicU64::new(0),
-                requested: AtomicU64::new(0),
-                pos: AtomicU64::new(0f64.to_bits()),
-                playing: AtomicBool::new(false),
-                volume: AtomicU32::new(1f32.to_bits()),
-                broken: AtomicBool::new(false),
-                heartbeat: AtomicU64::new(0),
-                meter_reset: AtomicBool::new(false),
-                meter_frames: AtomicU64::new(0),
-                meter_energy: AtomicU64::new(0f64.to_bits()),
-                meter_source: AtomicU64::new(0f64.to_bits()),
-                meter_peak: AtomicU32::new(0f32.to_bits()),
-            }),
+            shared,
             output: None,
             request: None,
             mixed: None,
-            mixing: Arc::new(AtomicU64::new(0)),
+            preparations: Vec::new(),
+            producer: Some(producer),
             error: None,
+            mix_failure: None,
             restarted: None,
             activity: None,
         }
@@ -176,19 +199,31 @@ impl AudioPreview {
     pub fn rebuild(&mut self, project: &Project, rec: &Recording, package: &Path) {
         self.set_volume(project.style.audio.volume);
         if self.mixed.as_ref() != Some(&MixKey::of(project)) {
-            self.request = Some((Instant::now() + Duration::from_millis(120), project.clone(), rec.clone(), package.to_path_buf()));
+            self.request = Some((
+                Instant::now() + Duration::from_millis(120),
+                project.clone(),
+                rec.clone(),
+                package.to_path_buf(),
+            ));
         }
     }
 
     /// Mix right away (opening a project).
     pub fn rebuild_now(&mut self, project: &Project, rec: &Recording, package: &Path) {
         self.set_volume(project.style.audio.volume);
-        self.request = Some((Instant::now(), project.clone(), rec.clone(), package.to_path_buf()));
+        self.request = Some((
+            Instant::now(),
+            project.clone(),
+            rec.clone(),
+            package.to_path_buf(),
+        ));
         self.start_due();
     }
 
     fn set_volume(&self, v: f64) {
-        self.shared.volume.store((v as f32).to_bits(), Ordering::Relaxed);
+        self.shared
+            .volume
+            .store((v as f32).to_bits(), Ordering::Relaxed);
     }
 
     fn start_due(&mut self) {
@@ -199,31 +234,48 @@ impl AudioPreview {
         self.mixed = Some(MixKey::of(&p));
         let shared = self.shared.clone();
         let gen_ = shared.requested.fetch_add(1, Ordering::SeqCst) + 1;
-        let mixing = self.mixing.clone();
-        mixing.fetch_add(1, Ordering::SeqCst);
-        std::thread::spawn(move || {
-            let stale = || shared.requested.load(Ordering::SeqCst) != gen_;
+        self.preparations.push(std::thread::spawn(move || {
+            let stale = || {
+                shared.stopped.load(Ordering::Acquire)
+                    || shared.requested.load(Ordering::SeqCst) != gen_
+            };
+            let map = TimeMap::new(&p.timeline.slices, r.meta.duration_ms);
+            let result = crate::media::audio_cache::directory()
+                .and_then(|cache| {
+                    crate::export::block_mix::BlockMixer::new(
+                        &p,
+                        &r,
+                        Some(&dir),
+                        &cache,
+                        &map,
+                        &stale,
+                    )
+                })
+                .map_err(|error| format!("Couldn't prepare preview audio: {error:#}"));
+            let mut slot = shared.prepared.lock().unwrap_or_else(|e| e.into_inner());
             if !stale() {
-                let map = TimeMap::new(&p.timeline.slices, r.meta.duration_ms);
-                let mix = crate::export::audio::mix_unmastered(&p, &r, Some(&dir), &map);
-                let mut slot = shared.mix.lock().unwrap_or_else(|e| e.into_inner());
-                if !stale() {
-                    *slot = mix.map(Arc::new);
-                    shared.mix_gen.fetch_add(1, Ordering::Release);
-                }
+                *slot = Some(Prepared {
+                    generation: gen_,
+                    result,
+                });
             }
-            mixing.fetch_sub(1, Ordering::SeqCst);
-        });
+        }));
     }
 
     /// Is a re-mix waiting or running?
     pub fn mixing(&self) -> bool {
-        self.request.is_some() || self.mixing.load(Ordering::SeqCst) > 0
+        self.request.is_some()
+            || self.shared.requested.load(Ordering::Acquire)
+                != self.shared.applied.load(Ordering::Acquire)
     }
 
     /// Is there anything to hear (once mixed)?
     pub fn has_audio(&self) -> bool {
-        self.shared.mix.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.shared
+            .mix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     pub fn is_playing(&self) -> bool {
@@ -287,7 +339,9 @@ impl AudioPreview {
             }
             o.beat.1.elapsed() > Duration::from_millis(500)
         });
-        let recently = self.restarted.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+        let recently = self
+            .restarted
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
         if (stalled || self.shared.broken.load(Ordering::Relaxed)) && !recently {
             eprintln!("cam: restarting audio output");
             self.restarted = Some(Instant::now());
@@ -305,8 +359,19 @@ impl AudioPreview {
     pub fn meter(&self) -> Meter {
         let s = &self.shared;
         let frames = s.meter_frames.load(Ordering::Relaxed);
-        let rms = |bits: &AtomicU64| if frames > 0 { (f64::from_bits(bits.load(Ordering::Relaxed)) / frames as f64).sqrt() as f32 } else { 0.0 };
-        Meter { frames, rms: rms(&s.meter_energy), peak: f32::from_bits(s.meter_peak.load(Ordering::Relaxed)), source_rms: rms(&s.meter_source) }
+        let rms = |bits: &AtomicU64| {
+            if frames > 0 {
+                (f64::from_bits(bits.load(Ordering::Relaxed)) / frames as f64).sqrt() as f32
+            } else {
+                0.0
+            }
+        };
+        Meter {
+            frames,
+            rms: rms(&s.meter_energy),
+            peak: f32::from_bits(s.meter_peak.load(Ordering::Relaxed)),
+            source_rms: rms(&s.meter_source),
+        }
     }
 
     pub fn reset_meter(&self) {
@@ -323,13 +388,18 @@ impl AudioPreview {
         let host = cpal::default_host();
         let device = host.default_output_device().context("no output device")?;
         let id = device.id().ok();
-        let stale = self.shared.broken.swap(false, Ordering::Relaxed) || self.output.as_ref().is_some_and(|o| o.device != id);
+        let stale = self.shared.broken.swap(false, Ordering::Relaxed)
+            || self.output.as_ref().is_some_and(|o| o.device != id);
         if stale {
             self.output = None;
         }
         if self.output.is_none() {
             let stream = open_stream(&device, self.shared.clone())?;
-            self.output = Some(Output { stream: SendBox(stream), device: id, beat: (u64::MAX, Instant::now()) });
+            self.output = Some(Output {
+                stream: SendBox(stream),
+                device: id,
+                beat: (u64::MAX, Instant::now()),
+            });
         }
         Ok(())
     }
@@ -337,6 +407,33 @@ impl AudioPreview {
     /// Start a settled re-mix.
     pub fn tick(&mut self) {
         self.start_due();
+        self.preparations.retain(|job| !job.is_finished());
+        if let Some(error) = self
+            .shared
+            .mix_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            if error.is_some() || self.error == self.mix_failure {
+                self.error = error.clone();
+            }
+            self.mix_failure = error;
+        }
+    }
+
+    /// Join audio workers before the native application starts tearing down.
+    pub fn shutdown(&mut self) {
+        self.request = None;
+        self.pause();
+        self.shared.stopped.store(true, Ordering::Release);
+        for job in self.preparations.drain(..) {
+            let _ = job.join();
+        }
+        if let Some(job) = self.producer.take() {
+            let _ = job.join();
+        }
+        self.output = None;
     }
 }
 
@@ -354,11 +451,15 @@ fn open_stream(device: &cpal::Device, shared: Arc<Shared>) -> Result<cpal::Strea
     }
 }
 
-fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: cpal::StreamConfig, shared: Arc<Shared>) -> Result<cpal::Stream> {
+fn build<T: SizedSample + FromSample<f32>>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    shared: Arc<Shared>,
+) -> Result<cpal::Stream> {
     let channels = config.channels as usize;
     // Soundtrack frames per device frame.
     let step = RATE / config.sample_rate as f64;
-    let mut mix: Option<Arc<Vec<Stereo>>> = None;
+    let mut mix: Option<Arc<Window>> = None;
     let mut seen = u64::MAX;
     let (mut frames, mut energy, mut source, mut peak) = (0u64, 0f64, 0f64, 0f32);
     let cb = shared.clone();
@@ -381,7 +482,7 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: cpal::
         let mut pos = f64::from_bits(start);
         for frame in out.chunks_mut(channels.max(1)) {
             let v = match (&mix, playing) {
-                (Some(m), true) => sample(m, pos),
+                (Some(m), true) => m.sample(pos),
                 _ => [0.0, 0.0],
             };
             let [l, r] = [soft_clip(v[0] * volume), soft_clip(v[1] * volume)];
@@ -406,7 +507,9 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: cpal::
         }
         if playing {
             // A seek from the UI since `start` wins over our advance.
-            let _ = s.pos.compare_exchange(start, pos.to_bits(), Ordering::Relaxed, Ordering::Relaxed);
+            let _ =
+                s.pos
+                    .compare_exchange(start, pos.to_bits(), Ordering::Relaxed, Ordering::Relaxed);
             s.meter_frames.store(frames, Ordering::Relaxed);
             s.meter_energy.store(energy.to_bits(), Ordering::Relaxed);
             s.meter_source.store(source.to_bits(), Ordering::Relaxed);
@@ -422,11 +525,17 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: cpal::
 
 /// Remove preview WAVs left by Cam versions that played audio from files.
 pub fn sweep_stale() {
-    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix("cam-preview-") else { continue };
-        let Some(_pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else { continue };
+        let Some(rest) = name.strip_prefix("cam-preview-") else {
+            continue;
+        };
+        let Some(_pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else {
+            continue;
+        };
         let alive = false;
         if !alive {
             let _ = std::fs::remove_file(e.path());
@@ -436,9 +545,7 @@ pub fn sweep_stale() {
 
 impl Drop for AudioPreview {
     fn drop(&mut self) {
-        // Background mixes still running are discarded.
-        self.shared.requested.fetch_add(1, Ordering::SeqCst);
-        self.pause();
+        self.shutdown();
     }
 }
 

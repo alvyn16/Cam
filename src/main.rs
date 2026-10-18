@@ -13,7 +13,11 @@ use cam::project::{self, Package};
 use cam::render::{Gpu, Renderer, VideoFrame};
 
 #[derive(Parser)]
-#[command(name = "cam", version, about = "Fast native Windows screen recorder and video studio")]
+#[command(
+    name = "cam",
+    version,
+    about = "Fast native Windows screen recorder and video studio"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -141,7 +145,7 @@ enum Cmd {
         #[arg(long)]
         tab: Option<String>,
         /// Select the first zoom, mask or slice.
-        #[arg(long, value_parser = ["zoom", "mask", "slice"])]
+        #[arg(long, value_parser = ["zoom", "mask", "slice", "camera-preview"])]
         select: Option<String>,
         #[arg(long)]
         export_sheet: bool,
@@ -239,25 +243,93 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if cam::export::native_worker::entry()? {
+        return Ok(());
+    }
+    cam::platform::windows::ensure_dpi_awareness();
     let cli = Cli::parse();
-    
+
     match cli.cmd {
-        Some(Cmd::Frame { project, synthetic, time, height, style, output }) => {
-            frame(project, synthetic, time, height, style, output)
-        }
-        Some(Cmd::CheckBackground { project, synthetic, time, height }) => check_background(project, synthetic, time, height),
-        Some(Cmd::AudioCheck { path, freq, require, min_seconds }) => audio_check(path, freq, require, min_seconds),
-        Some(Cmd::Export { project, synthetic, output, format, height, fps, quality, codec, target_mb }) => {
-            export_cmd(project, synthetic, output, format, height, fps, quality, codec, target_mb)
-        }
-        Some(Cmd::Synth { output, duration, width, height, device, tone }) => synth(output, duration, width, height, device, tone),
-        Some(Cmd::Record { display, window, area, device, pattern, mic, no_system_audio, camera, duration, fps, dir, name, hide_icons, hide_dock }) => {
-            record(display, window, area, device, pattern, mic, !no_system_audio, camera, duration, fps, dir, name, (hide_icons, hide_dock))
-        }
+        Some(Cmd::Frame {
+            project,
+            synthetic,
+            time,
+            height,
+            style,
+            output,
+        }) => frame(project, synthetic, time, height, style, output),
+        Some(Cmd::CheckBackground {
+            project,
+            synthetic,
+            time,
+            height,
+        }) => check_background(project, synthetic, time, height),
+        Some(Cmd::AudioCheck {
+            path,
+            freq,
+            require,
+            min_seconds,
+        }) => audio_check(path, freq, require, min_seconds),
+        Some(Cmd::Export {
+            project,
+            synthetic,
+            output,
+            format,
+            height,
+            fps,
+            quality,
+            codec,
+            target_mb,
+        }) => export_cmd(
+            project, synthetic, output, format, height, fps, quality, codec, target_mb,
+        ),
+        Some(Cmd::Synth {
+            output,
+            duration,
+            width,
+            height,
+            device,
+            tone,
+        }) => synth(output, duration, width, height, device, tone),
+        Some(Cmd::Record {
+            display,
+            window,
+            area,
+            device,
+            pattern,
+            mic,
+            no_system_audio,
+            camera,
+            duration,
+            fps,
+            dir,
+            name,
+            hide_icons,
+            hide_dock,
+        }) => record(
+            display,
+            window,
+            area,
+            device,
+            pattern,
+            mic,
+            !no_system_audio,
+            camera,
+            duration,
+            fps,
+            dir,
+            name,
+            (hide_icons, hide_dock),
+        ),
         Some(Cmd::Devices) => devices(),
         Some(Cmd::Permissions { request }) => permissions(request),
         Some(Cmd::Gui { project }) => cam::app::run(project),
-        Some(Cmd::BenchPreview { project, width, height }) => {
+        Some(Cmd::BenchPreview {
+            project,
+            width,
+            height,
+        }) => {
             let fps = cam::app::snapshot::bench_preview(&project, (width, height), 240)?;
             println!("preview {width}x{height}: {fps:.0} frames/s");
             Ok(())
@@ -265,8 +337,13 @@ fn main() -> Result<()> {
         Some(Cmd::Denoise { input, output }) => {
             let audio = cam::media::read_audio(&input, 0)?;
             let t = Instant::now();
-            let out = cam::export::isolate::isolate_voice(&audio).ok_or_else(|| anyhow::anyhow!("voice isolation unavailable"))?;
-            eprintln!("{:.1} s of audio in {:.2} s", audio.len() as f64 / 48_000.0, t.elapsed().as_secs_f64());
+            let out = cam::export::isolate::isolate_voice(&audio)
+                .ok_or_else(|| anyhow::anyhow!("voice isolation unavailable"))?;
+            eprintln!(
+                "{:.1} s of audio in {:.2} s",
+                audio.len() as f64 / 48_000.0,
+                t.elapsed().as_secs_f64()
+            );
             cam::app::player::write_wav(&output, &out)?;
             println!("{}", output.display());
             Ok(())
@@ -278,17 +355,44 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Icon { output, png }) => {
             match png {
-                Some(size) => image::save_buffer(&output, &cam::render::icon::render(size), size, size, image::ExtendedColorType::Rgba8)?,
+                Some(size) => image::save_buffer(
+                    &output,
+                    &cam::render::icon::render(size),
+                    size,
+                    size,
+                    image::ExtendedColorType::Rgba8,
+                )?,
                 None => cam::render::icon::write_iconset(&output)?,
             }
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Snapshot { project, tab, select, export_sheet, fresh, light, at, window, recents, live, output }) => {
+        Some(Cmd::Snapshot {
+            project,
+            tab,
+            select,
+            export_sheet,
+            fresh,
+            light,
+            at,
+            window,
+            recents,
+            live,
+            output,
+        }) => {
             use cam::app::editor::Tab;
             let tab = tab.map(|t| {
-                Tab::ALL.iter().find(|(_, n)| n.eq_ignore_ascii_case(&t)).map(|(t, _)| *t).expect("unknown tab")
+                Tab::ALL
+                    .iter()
+                    .find(|(_, n)| n.eq_ignore_ascii_case(&t))
+                    .map(|(t, _)| *t)
+                    .expect("unknown tab")
             });
+            let size = if select.as_deref() == Some("camera-preview") {
+                (234.0, 294.0)
+            } else {
+                (1320.0, 840.0)
+            };
             let shot = cam::app::snapshot::Shot {
                 project: project.as_deref(),
                 tab,
@@ -297,7 +401,7 @@ fn main() -> Result<()> {
                 fresh,
                 dark: !light,
                 playhead_ms: at * 1000.0,
-                size: (1320.0, 840.0),
+                size,
                 window,
                 recents,
                 live,
@@ -306,16 +410,32 @@ fn main() -> Result<()> {
             println!("{}", output.display());
             Ok(())
         }
-        Some(Cmd::Preview { window, area, camera, secs, output }) => {
+        Some(Cmd::Preview {
+            window,
+            area,
+            camera,
+            secs,
+            output,
+        }) => {
             use cam::capture::preview::{LivePreview, Source};
             let source = if let Some(c) = camera {
-                Source::Camera { id: (c != "default").then_some(c) }
+                Source::Camera {
+                    id: (c != "default").then_some(c),
+                }
             } else if let Some(w) = window {
-                Source::Window { id: cam::capture::screen::find_window(&w)?.id }
+                Source::Window {
+                    id: cam::capture::screen::find_window(&w)?.id,
+                }
             } else if let Some(a) = area {
-                let v: Vec<f64> = a.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
+                let v: Vec<f64> = a
+                    .split(',')
+                    .map(|x| x.trim().parse().unwrap_or(0.0))
+                    .collect();
                 anyhow::ensure!(v.len() == 4, "--area expects x,y,w,h");
-                Source::Area { display: 0, rect: [v[0], v[1], v[2], v[3]] }
+                Source::Area {
+                    display: 0,
+                    rect: [v[0], v[1], v[2], v[3]],
+                }
             } else {
                 Source::Display { id: 0 }
             };
@@ -337,18 +457,34 @@ fn main() -> Result<()> {
             drop(p);
             let n = frames.load(std::sync::atomic::Ordering::Relaxed);
             let f = last.ok_or_else(|| anyhow::anyhow!("no preview frames"))?;
-            image::save_buffer(&output, &f.rgba, f.width, f.height, image::ExtendedColorType::Rgba8)?;
-            println!("{source:?}: started in {started:.2} s, {n} frames in {secs:.1} s, {}x{} → {}", f.width, f.height, output.display());
+            image::save_buffer(
+                &output,
+                &f.rgba,
+                f.width,
+                f.height,
+                image::ExtendedColorType::Rgba8,
+            )?;
+            println!(
+                "{source:?}: started in {started:.2} s, {n} frames in {secs:.1} s, {}x{} → {}",
+                f.width,
+                f.height,
+                output.display()
+            );
             Ok(())
         }
         Some(Cmd::ResizeWindow { window, size }) => {
-            let (w, h) = size.split_once(['x', '×']).ok_or_else(|| anyhow::anyhow!("size must look like 1920x1080"))?;
+            let (w, h) = size
+                .split_once(['x', '×'])
+                .ok_or_else(|| anyhow::anyhow!("size must look like 1920x1080"))?;
             let (w, h): (f64, f64) = (w.trim().parse()?, h.trim().parse()?);
             // A window id needs no ScreenCaptureKit lookup (which can stall).
-            let pid = window.strip_prefix("pid:").and_then(|p| p.parse::<i32>().ok());
+            let pid = window
+                .strip_prefix("pid:")
+                .and_then(|p| p.parse::<i32>().ok());
             let (id, label) = match (pid, window.parse::<u32>()) {
                 (Some(pid), _) => {
-                    let id = cam::capture::winsize::window_of_pid(pid).ok_or_else(|| anyhow::anyhow!("process {pid} has no window on screen"))?;
+                    let id = cam::capture::winsize::window_of_pid(pid)
+                        .ok_or_else(|| anyhow::anyhow!("process {pid} has no window on screen"))?;
                     (id, format!("window {id}"))
                 }
                 (None, Ok(id)) => (id, format!("window {id}")),
@@ -359,18 +495,39 @@ fn main() -> Result<()> {
             };
             let before = cam::capture::winsize::window_size(id)?;
             let got = cam::capture::winsize::resize(id, w, h)?;
-            println!("{label}: {:.0}×{:.0} → {:.0}×{:.0}", before.0, before.1, got.0, got.1);
+            println!(
+                "{label}: {:.0}×{:.0} → {:.0}×{:.0}",
+                before.0, before.1, got.0, got.1
+            );
             Ok(())
         }
         Some(Cmd::CheckMasks { project }) => {
             let pkg = Package::new(&project);
             let (p, rec) = pkg.load()?;
             let t0 = Instant::now();
-            let found = cam::exposure::scan(&pkg.rec(&rec.meta.screen.file), &p.timeline.masks, &mut Default::default(), &|| false)?;
-            let hiding = p.timeline.masks.iter().filter(|m| cam::exposure::hides(m.kind)).count();
-            println!("{hiding} hiding masks checked in {:.2} s", t0.elapsed().as_secs_f64());
+            let found = cam::exposure::scan(
+                &pkg.rec(&rec.meta.screen.file),
+                &p.timeline.masks,
+                &mut Default::default(),
+                &|| false,
+            )?;
+            let hiding = p
+                .timeline
+                .masks
+                .iter()
+                .filter(|m| cam::exposure::hides(m.kind))
+                .count();
+            println!(
+                "{hiding} hiding masks checked in {:.2} s",
+                t0.elapsed().as_secs_f64()
+            );
             for e in &found {
-                println!("mask {}: content moved {:.1}–{:.1} s", e.mask, e.start / 1000.0, e.end / 1000.0);
+                println!(
+                    "mask {}: content moved {:.1}–{:.1} s",
+                    e.mask,
+                    e.start / 1000.0,
+                    e.end / 1000.0
+                );
             }
             if found.is_empty() {
                 println!("no content moves under masks");
@@ -378,18 +535,30 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Transcribe { project, engine }) => {
-            let engine = cam::transcribe::Engine::parse(&engine).ok_or_else(|| anyhow::anyhow!("unknown engine {engine:?}"))?;
+            let engine = cam::transcribe::Engine::parse(&engine)
+                .ok_or_else(|| anyhow::anyhow!("unknown engine {engine:?}"))?;
             let t0 = Instant::now();
-            let n = cam::transcribe::transcribe_package(&Package::new(&project), engine, &Default::default())?;
+            let progress = std::sync::Arc::new(cam::whisper::Progress::default());
+            let _ = CAPTION_PROGRESS.set(std::sync::Arc::downgrade(&progress));
+            console_cancellation()?;
+            let n =
+                cam::transcribe::transcribe_package(&Package::new(&project), engine, &progress)?;
             eprintln!("{} in {:.1} s", engine.label(), t0.elapsed().as_secs_f64());
-            println!("{n} words → {}", cam::transcribe::transcript_path(&Package::new(&project)).display());
+            println!(
+                "{n} words → {}",
+                cam::transcribe::transcript_path(&Package::new(&project)).display()
+            );
             Ok(())
         }
         None => cam::app::run(None),
     }
 }
 
-type Loaded = (cam::project::model::Project, cam::project::recording::Recording, Option<PathBuf>);
+type Loaded = (
+    cam::project::model::Project,
+    cam::project::recording::Recording,
+    Option<PathBuf>,
+);
 
 /// A project to render frames of: a package, or the synthetic recording.
 fn load_for_frames(pkg: Option<PathBuf>, synthetic: bool) -> Result<Loaded> {
@@ -404,7 +573,12 @@ fn load_for_frames(pkg: Option<PathBuf>, synthetic: bool) -> Result<Loaded> {
 }
 
 /// Render the frame at `time` seconds, `height` pixels tall.
-fn render_frame(r: &mut Renderer, (proj, rec, dir): &Loaded, time: f64, height: u32) -> Result<(cam::render::Image, f64)> {
+fn render_frame(
+    r: &mut Renderer,
+    (proj, rec, dir): &Loaded,
+    time: f64,
+    height: u32,
+) -> Result<(cam::render::Image, f64)> {
     let mut scene = Scene::new(proj.clone(), rec, 60.0);
     let f = scene.frame(time * 1000.0, height as f64);
     r.prepare(&proj.style, rec, dir.as_deref());
@@ -412,7 +586,12 @@ fn render_frame(r: &mut Renderer, (proj, rec, dir): &Loaded, time: f64, height: 
         None => {
             let (w, h) = (rec.meta.screen.width, rec.meta.screen.height);
             let px = cam::synth::screen_bgra(w, h, f.source_ms);
-            r.set_screen(&VideoFrame { width: w, height: h, stride: (w * 4) as usize, bgra: &px });
+            r.set_screen(&VideoFrame {
+                width: w,
+                height: h,
+                stride: (w * 4) as usize,
+                bgra: &px,
+            });
         }
         Some(dir) => {
             let pkg = Package::new(dir);
@@ -431,7 +610,14 @@ fn render_frame(r: &mut Renderer, (proj, rec, dir): &Loaded, time: f64, height: 
     Ok((r.render_to_image(&f, &proj.style), f.source_ms))
 }
 
-fn frame(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32, style: Option<String>, output: PathBuf) -> Result<()> {
+fn frame(
+    pkg: Option<PathBuf>,
+    synthetic: bool,
+    time: f64,
+    height: u32,
+    style: Option<String>,
+    output: PathBuf,
+) -> Result<()> {
     let mut loaded = load_for_frames(pkg, synthetic)?;
     if let Some(s) = style {
         let mut v = serde_json::to_value(&loaded.0)?;
@@ -440,12 +626,33 @@ fn frame(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u32, style: O
     }
     let mut r = Renderer::new(Gpu::headless()?);
     let (img, source_ms) = render_frame(&mut r, &loaded, time, height)?;
-    image::save_buffer(&output, &img.rgba, img.width, img.height, image::ExtendedColorType::Rgba8)?;
-    println!("{} ({}x{}, source {:.0} ms)", output.display(), img.width, img.height, source_ms);
+    image::save_buffer(
+        &output,
+        &img.rgba,
+        img.width,
+        img.height,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    println!(
+        "{} ({}x{}, source {:.0} ms)",
+        output.display(),
+        img.width,
+        img.height,
+        source_ms
+    );
     Ok(())
 }
 
 fn audio_check(path: PathBuf, freq: f64, require: Vec<String>, min_seconds: f64) -> Result<()> {
+    console_cancellation()?;
+    anyhow::ensure!(
+        freq.is_finite() && freq > 0.0 && freq < 24000.0,
+        "tone frequency must be between 0 and 24000 Hz"
+    );
+    anyhow::ensure!(
+        min_seconds.is_finite() && min_seconds >= 0.0,
+        "minimum seconds must be finite and nonnegative"
+    );
     let mut tracks: Vec<(String, PathBuf, usize)> = vec![];
     if path.join("recording/meta.json").exists() {
         let pkg = Package::new(&path);
@@ -457,29 +664,38 @@ fn audio_check(path: PathBuf, freq: f64, require: Vec<String>, min_seconds: f64)
             }
         }
     } else {
-        for i in 0..8 {
-            if cam::media::read_audio(&path, i).is_err() {
-                if i == 0 {
-                    println!("audio0: no audio track");
-                }
-                break;
-            }
+        let count = cam::media::audio_track_count(&path)?;
+        if count == 0 {
+            println!("audio0: no audio track");
+        }
+        for i in 0..count {
             tracks.push((format!("audio{i}"), path.clone(), i));
         }
     }
     let mut found = std::collections::HashMap::new();
     for (label, file, track) in &tracks {
-        let samples = cam::media::read_audio(file, *track)?;
-        let l = cam::audiocheck::analyze(&samples, freq);
+        let l = cam::audiocheck::analyze_file(file, *track, freq, &|| {
+            STOP.load(std::sync::atomic::Ordering::Acquire)
+        })?;
         println!(
             "{label}: {:.1} s, {:.1} dBFS RMS; {freq:.0} Hz tone for {:.2} s at {:.1} dBFS",
             l.seconds, l.rms_db, l.tone_seconds, l.tone_db
         );
         found.insert(label.clone(), l.tone_seconds);
     }
-    let missing: Vec<_> = require.iter().filter(|r| found.get(*r).is_none_or(|s| *s < min_seconds)).collect();
+    let missing: Vec<_> = require
+        .iter()
+        .filter(|r| found.get(*r).is_none_or(|s| *s < min_seconds))
+        .collect();
     if !missing.is_empty() {
-        bail!("no {freq:.0} Hz tone (at least {min_seconds} s) in: {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        bail!(
+            "no {freq:.0} Hz tone (at least {min_seconds} s) in: {}",
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
 }
@@ -505,12 +721,23 @@ fn check_background(pkg: Option<PathBuf>, synthetic: bool, time: f64, height: u3
     for o in &outcomes {
         let mark = if o.ok() { "ok  " } else { "FAIL" };
         bad += usize::from(!o.ok());
-        println!("{mark} {:<22} {:>6.2}% changed (needs {:.2}%)", o.name, o.changed * 100.0, o.min * 100.0);
+        println!(
+            "{mark} {:<22} {:>6.2}% changed (needs {:.2}%)",
+            o.name,
+            o.changed * 100.0,
+            o.min * 100.0
+        );
     }
     if bad > 0 {
-        bail!("{bad} of {} background settings made no visible change", outcomes.len());
+        bail!(
+            "{bad} of {} background settings made no visible change",
+            outcomes.len()
+        );
     }
-    println!("all {} background settings change the frame", outcomes.len());
+    println!(
+        "all {} background settings change the frame",
+        outcomes.len()
+    );
     Ok(())
 }
 
@@ -540,7 +767,12 @@ fn export_cmd(
 ) -> Result<()> {
     let (proj, rec, source, base) = if synthetic {
         let rec = cam::synth::recording(1920, 1080, 12_000.0);
-        (project::new_project("synthetic", &rec), rec, Source::Synthetic, PathBuf::from("synthetic.cam"))
+        (
+            project::new_project("synthetic", &rec),
+            rec,
+            Source::Synthetic,
+            PathBuf::from("synthetic.cam"),
+        )
     } else {
         let path = pkg.expect("project path or --synthetic");
         let pkg = Package::new(&path);
@@ -552,7 +784,14 @@ fn export_cmd(
         settings.target_mb = target_mb;
     }
     if let Some(f) = format {
-        settings = if f == "gif" { ExportSettings::gif_default() } else { ExportSettings { format: ExportFormat::Mp4, ..settings } };
+        settings = if f == "gif" {
+            ExportSettings::gif_default()
+        } else {
+            ExportSettings {
+                format: ExportFormat::Mp4,
+                ..settings
+            }
+        };
     }
     if let Some(h) = height {
         settings.height = h;
@@ -576,15 +815,25 @@ fn export_cmd(
         };
     }
     let output = output.unwrap_or_else(|| export::default_output(&base, &settings));
-    let job = Job { project: proj, recording: rec, source, settings, output: output.clone() };
-    let cancel = AtomicBool::new(false);
+    let job = Job {
+        project: proj,
+        recording: rec,
+        source,
+        settings,
+        output: output.clone(),
+    };
+    console_cancellation()?;
     let mut last = Instant::now();
-    let stats = export::run(&job, &mut |p| {
-        if last.elapsed().as_millis() > 500 {
-            eprint!("\r{:5.1}%", p * 100.0);
-            last = Instant::now();
-        }
-    }, &cancel)?;
+    let stats = export::run(
+        &job,
+        &mut |p| {
+            if last.elapsed().as_millis() > 500 {
+                eprint!("\r{:5.1}%", p * 100.0);
+                last = Instant::now();
+            }
+        },
+        &STOP,
+    )?;
     eprintln!("\r100.0%");
     println!(
         "{}: {}x{} {} frames, {:.1} s video in {:.2} s ({:.1}x real time), {:.1} MB",
@@ -600,8 +849,19 @@ fn export_cmd(
     Ok(())
 }
 
-fn synth(output: PathBuf, duration: f64, width: u32, height: u32, device: bool, tone: Option<f64>) -> Result<()> {
-    let write = if device { cam::synth::write_device_package } else { cam::synth::write_package };
+fn synth(
+    output: PathBuf,
+    duration: f64,
+    width: u32,
+    height: u32,
+    device: bool,
+    tone: Option<f64>,
+) -> Result<()> {
+    let write = if device {
+        cam::synth::write_device_package
+    } else {
+        cam::synth::write_package
+    };
     let (frames, zooms) = write(&output, duration, width, height)?;
     if let Some(hz) = tone {
         cam::synth::add_tone(&output, hz)?;
@@ -610,9 +870,48 @@ fn synth(output: PathBuf, duration: f64, width: u32, height: u32, device: bool, 
     Ok(())
 }
 
-static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+unsafe extern "system" fn console_stop(event: u32) -> windows::Win32::Foundation::BOOL {
+    if event == 0 || event == 1 {
+        STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(progress) = CAPTION_PROGRESS.get().and_then(std::sync::Weak::upgrade) {
+            progress.cancel();
+        }
+        windows::Win32::Foundation::BOOL(1)
+    } else {
+        windows::Win32::Foundation::BOOL(0)
+    }
+}
 
+static STOP: AtomicBool = AtomicBool::new(false);
+static CAPTION_PROGRESS: std::sync::OnceLock<std::sync::Weak<cam::whisper::Progress>> =
+    std::sync::OnceLock::new();
+fn console_cancellation() -> Result<()> {
+    STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        windows::Win32::System::Console::SetConsoleCtrlHandler(Some(console_stop), true)?;
+    }
+    Ok(())
+}
 
+#[cfg(test)]
+mod console_tests {
+    use super::*;
+    #[test]
+    fn console_signal_cancels_export_token_and_transcription() {
+        let progress = std::sync::Arc::new(cam::whisper::Progress::default());
+        assert!(
+            CAPTION_PROGRESS
+                .set(std::sync::Arc::downgrade(&progress))
+                .is_ok()
+        );
+        STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!unsafe { console_stop(99) }.as_bool());
+        assert!(!progress.is_cancelled());
+        assert!(unsafe { console_stop(1) }.as_bool());
+        assert!(STOP.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(progress.is_cancelled());
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn record(
@@ -645,11 +944,19 @@ fn record(
     } else if let Some(id) = window {
         Target::Window { id }
     } else if let Some(a) = area {
-        let v: Vec<f64> = a.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
+        let v: Vec<f64> = a
+            .split(',')
+            .map(|x| x.trim().parse().unwrap_or(0.0))
+            .collect();
         anyhow::ensure!(v.len() == 4, "--area expects x,y,w,h");
-        Target::Area { display: display.unwrap_or(0), rect: cam::engine::geom::Rect::new(v[0], v[1], v[2], v[3]) }
+        Target::Area {
+            display: display.unwrap_or(0),
+            rect: cam::engine::geom::Rect::new(v[0], v[1], v[2], v[3]),
+        }
     } else {
-        Target::Display { id: display.unwrap_or(0) }
+        Target::Display {
+            id: display.unwrap_or(0),
+        }
     };
     let opts = Options {
         target,
@@ -666,9 +973,13 @@ fn record(
         exclude_own_audio: false,
         ..Default::default()
     };
-    
+
+    console_cancellation()?;
     let rec = Recorder::start(opts)?;
-    eprintln!("cam: recording to {} (Ctrl-C to stop)", rec.package.root.display());
+    eprintln!(
+        "cam: recording to {} (Ctrl-C to stop)",
+        rec.package.root.display()
+    );
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if STOP.load(std::sync::atomic::Ordering::SeqCst) || rec.error().is_some() {
@@ -677,7 +988,9 @@ fn record(
         if duration.is_some_and(|d| rec.has_frames() && rec.elapsed() >= d) {
             break;
         }
-        if duration.is_some_and(|d| !rec.has_frames() && rec.started.elapsed().as_secs_f64() > d + 5.0) {
+        if duration
+            .is_some_and(|d| !rec.has_frames() && rec.started.elapsed().as_secs_f64() > d + 5.0)
+        {
             break;
         }
     }
@@ -706,11 +1019,17 @@ fn devices() -> Result<()> {
     use cam::capture::{camera, screen};
     println!("Displays:");
     for d in screen::displays()? {
-        println!("  {:>10}  {}x{} pt  {}x{} px", d.id, d.points.0, d.points.1, d.pixels.0, d.pixels.1);
+        println!(
+            "  {:>10}  {}x{} pt  {}x{} px",
+            d.id, d.points.0, d.points.1, d.pixels.0, d.pixels.1
+        );
     }
     println!("Windows:");
     for w in screen::windows()? {
-        println!("  {:>10}  {} — {} ({:.0}x{:.0})", w.id, w.app, w.title, w.size.0, w.size.1);
+        println!(
+            "  {:>10}  {} — {} ({:.0}x{:.0})",
+            w.id, w.app, w.title, w.size.0, w.size.1
+        );
     }
     println!("Cameras:");
     for c in camera::cameras() {
@@ -738,7 +1057,14 @@ fn permissions(request: bool) -> Result<()> {
     println!("Screen Recording: {:?}", tcc::screen_status());
     println!("Microphone:       {:?}", tcc::mic_status());
     println!("Camera:           {:?}", tcc::camera_status());
-    println!("Accessibility:    {} (resizing windows)", if cam::capture::winsize::trusted(false) { "Authorized" } else { "NotDetermined/Denied" });
+    println!(
+        "Accessibility:    {} (resizing windows)",
+        if cam::capture::winsize::trusted(false) {
+            "Authorized"
+        } else {
+            "NotDetermined/Denied"
+        }
+    );
     if cam::capture::camera::builtin_mic_off(None) {
         println!("Note: the lid is closed, so the built-in microphone records silence.");
     }

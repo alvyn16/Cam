@@ -1,12 +1,12 @@
 //! Windows platform helpers: explorer integration, clipboard, display queries, and DWM styling.
 
-use std::path::Path;
 use anyhow::Result;
-use windows::core::HSTRING;
+use std::path::Path;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::HSTRING;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -42,9 +42,76 @@ pub fn open(path: &Path) {
 }
 
 /// Put a file on the Windows clipboard.
-pub fn copy_file(path: &Path) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(path.display().to_string());
+pub fn copy_file(path: &Path) -> Result<()> {
+    use windows::Win32::{
+        System::{DataExchange::*, Memory::*},
+        UI::Shell::DROPFILES,
+    };
+    unsafe {
+        let path = std::fs::canonicalize(path)?;
+        let path = path.to_string_lossy();
+        let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            path.trim_start_matches(r"\\?\").to_owned()
+        };
+        let text = path.encode_utf16().chain([0, 0]).collect::<Vec<_>>();
+        let header = std::mem::size_of::<DROPFILES>();
+        let memory = GlobalAlloc(GMEM_MOVEABLE, header + text.len() * 2)?;
+        let ptr = GlobalLock(memory);
+        if ptr.is_null() {
+            let _ = GlobalFree(memory);
+            anyhow::bail!("clipboard allocation failed");
+        }
+        std::ptr::write(
+            ptr as *mut DROPFILES,
+            DROPFILES {
+                pFiles: header as u32,
+                fWide: BOOL(1),
+                ..Default::default()
+            },
+        );
+        std::ptr::copy_nonoverlapping(
+            text.as_ptr(),
+            (ptr as *mut u8).add(header) as *mut u16,
+            text.len(),
+        );
+        let _ = GlobalUnlock(memory);
+        let owner = match CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            windows::core::w!("STATIC"),
+            windows::core::w!("Cam clipboard"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = GlobalFree(memory);
+                return Err(e.into());
+            }
+        };
+        let result = (|| -> Result<()> {
+            OpenClipboard(owner)?;
+            let result = (|| -> Result<()> {
+                EmptyClipboard()?;
+                SetClipboardData(15, HANDLE(memory.0))?;
+                Ok(())
+            })();
+            let _ = CloseClipboard();
+            result
+        })();
+        let _ = DestroyWindow(owner);
+        if result.is_err() {
+            let _ = GlobalFree(memory);
+        }
+        result
     }
 }
 
@@ -90,24 +157,32 @@ pub fn save_desktop_wallpaper(dest: &Path) -> Result<()> {
 
 /// IDs of the active displays (main display first).
 pub fn display_ids() -> Vec<u32> {
+    crate::platform::windows::ensure_dpi_awareness();
     let mut ids = Vec::new();
-    unsafe extern "system" fn callback(hmon: HMONITOR, _: HDC, _: *mut RECT, lparam: LPARAM) -> BOOL {
+    unsafe extern "system" fn callback(
+        hmon: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
         let list = unsafe { &mut *(lparam.0 as *mut Vec<u32>) };
         list.push(hmon.0 as u32);
         BOOL(1)
     }
     unsafe {
-        let _ = EnumDisplayMonitors(None, None, Some(callback), LPARAM(&mut ids as *mut _ as isize));
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(callback),
+            LPARAM(&mut ids as *mut _ as isize),
+        );
     }
-    if ids.is_empty() {
-        vec![0]
-    } else {
-        ids
-    }
+    if ids.is_empty() { vec![0] } else { ids }
 }
 
 /// The display under the mouse pointer.
 pub fn display_under_pointer() -> u32 {
+    crate::platform::windows::ensure_dpi_awareness();
     let mut pt = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut pt);
@@ -118,6 +193,7 @@ pub fn display_under_pointer() -> u32 {
 
 /// A display's frame in global points (top-left origin). (id, x, y, w, h)
 pub fn display_frame(id: u32) -> (u32, f64, f64, f64, f64) {
+    crate::platform::windows::ensure_dpi_awareness();
     let hmon = if id == 0 {
         unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) }
     } else {
@@ -162,7 +238,20 @@ pub fn fullscreen_display(_window: &Window) -> Option<u32> {
 pub fn inset_traffic_lights(_window: &Window, _x: f64, _bar_h: f64) {}
 
 /// Bring the app to the front.
-pub fn activate() {}
+pub fn activate() {
+    unsafe {
+        let mut hwnd = GetTopWindow(None).unwrap_or_default();
+        while !hwnd.is_invalid() {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == std::process::id() && IsWindowVisible(hwnd).as_bool() {
+                let _ = SetForegroundWindow(hwnd);
+                break;
+            }
+            hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
+        }
+    }
+}
 
 /// Open URLs handler (macOS specific, no-op on Windows).
 pub fn install_open_handler() {}

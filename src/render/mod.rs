@@ -23,6 +23,8 @@ pub use gpu::Gpu;
 
 /// Format of the final frame (matches CoreVideo BGRA buffers).
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+#[cfg(target_os = "windows")]
+pub mod dx12;
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DRAW_STRIDE: u64 = 512;
 const MAX_DRAWS: u64 = 256;

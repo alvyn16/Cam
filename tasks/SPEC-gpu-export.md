@@ -1,0 +1,21 @@
+# Spec: gpu-export
+
+Connect the verified native encoder prototype to production export only after these contracts are implemented and tested:
+
+- Cancellable native finalization using a callback/event wait; abort queued samples and release the sink before removing owned staging files. Preserve an existing destination on cancel/error throughout render, finalize, audio mux and file-size fitting.
+- A shared, cancellable video/audio mux boundary that borrows input files, writes an exclusively owned staging destination, encodes AAC and copies native H.264/HEVC video. Keep file-backed soundtrack ownership alive until mux completes.
+- Explicit backend selection with DX12/device capability probing, verified hardware identity and truthful diagnostics. Retain the CPU/FFmpeg fallback for unavailable hardware, unsupported quality/format/dimensions and ProRes. Honor quality presets through encoder parameters and use bitrate mode for file-size targets.
+- Render the compositor directly into NativeWriter surfaces. Do not route these surfaces through readback. The existing decoded-video upload is a distinct remaining gpu-decoder slice, so do not describe this integration as complete end-to-end GPU media.
+- Independently verify a real edited recording with audio through both H.264 and HEVC native paths, quality/bitrate and full-duration fit-to-size behavior. Compare motion/colors/timestamps against the fallback, test cancellation at each stage and ensure bounded native handles/memory over sustained exports. Repeat standard tests, current release GUI and hardware checks.
+
+Do not switch the default backend merely because the two-second encoder test passed. No deployment, commit/push, system settings changes or removal of the working fallback is authorized by this slice.
+
+## Implemented and verified so far
+
+The export hook is enabled automatically, with CAM_NATIVE_ENCODER=off/auto/require overrides and the software override retained. Production jobs now run through the process lifetime boundary in SPEC-native-worker.md. It renders into pooled shared GPU targets, converts into a bounded MF sample pool, asynchronously finalizes and muxes the disk soundtrack through the same transactional mux helper as the fallback. Cancellation passes during rendering, before finalization, during asynchronous finalization and during muxing. Edited cut/speed/audio and both codec file-size-target tests pass. A real screen/webcam/microphone/system recording exported through both native codecs and fully decoded; its recorded 0.85-second tone was retained.
+
+An initial allocation-per-frame prototype produced increasing GPU performance counters. Fixed shared-render-target and MF input pools plus native completion fencing replace that churn. The subsequent 36,000-frame/3600-second H.264 export fully decoded, with direct DXGI usage constant at 197230592 bytes after warmup, private-memory range 4.18 MiB and handle range 7. See %TEMP%/cam-native-resources-cadbd8db49d14316958d3e4fc322998c and scripts/test-native-export.ps1. Startup/teardown are excluded from handle-range measurements; a teardown drop is not a leak.
+
+Native quality is configured through SetInputMediaType encoding parameters. Independent grayscale-detail checks show quality 0.95 vs 0.55 MSE 4.498 vs 52.911 for H.264 and 4.215 vs 46.890 for HEVC, with larger files at higher quality. Eight production worker exports with alternating codecs independently decoded and left parent handles/GPU usage exactly constant. Cancellation and failed-input worker cleanup passed. Standard regression and current release/native GUI verification are running; GPU source decoding/capture remain separate work.
+
+Optimized native release acceptance passed: actual GUI mic/webcam/system recording and native export (all saved media fully decoded), both 4K codecs, software H.264/ProRes fallbacks, invalid size-target preservation, and 36,000-frame/3600-second native export. The optimized resource test measured constant direct DXGI usage, combined parent/worker private range 2.84 MiB and handle range 3. See IMPLEMENTATION_STATUS.md for artifact paths and candidate hash. Source GPU decoding/capture and USB capture remain separate capabilities.

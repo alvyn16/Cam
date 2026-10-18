@@ -21,9 +21,13 @@ fn load(dir: &Path, track: &Option<crate::project::recording::AudioTrack>) -> Op
 /// Peak level of a recorded track (0..1), or None if it wasn't recorded or
 /// can't be read.
 pub fn track_peak(dir: &Path, track: &Option<crate::project::recording::AudioTrack>) -> Option<f32> {
+    track_peak_cancellable(dir, track, &|| false)
+}
+pub(crate) fn track_peak_cancellable(dir: &Path, track: &Option<crate::project::recording::AudioTrack>, cancelled: &dyn Fn() -> bool) -> Option<f32> {
     let t = track.as_ref()?;
-    let buf = crate::media::read_audio(&dir.join(&t.file), t.track).ok()?;
-    Some(buf.iter().fold(0.0f32, |m, s| m.max(s[0].abs()).max(s[1].abs())))
+    let cache = crate::media::audio_cache::directory().ok()?;
+    crate::media::audio_file::AudioFile::decode_cached(&dir.join(&t.file), t.track, &cache, cancelled)
+        .ok()?.peak(cancelled).ok()
 }
 
 /// Below this peak a track is silence (AAC-coded digital silence is -91 dBFS).
@@ -97,10 +101,12 @@ pub fn enhance_voice(buf: &mut [Stereo]) {
 /// Level speech to about -18 dBFS RMS on voiced parts, never above 4x, then
 /// even out quieter and louder passages with `agc`.
 fn level_voice(buf: &mut [Stereo], floor: f32) {
-    let voiced: Vec<f32> = buf.iter().map(|s| (s[0] * s[0] + s[1] * s[1]) / 2.0).filter(|v| *v > floor * floor).collect();
-    if !voiced.is_empty() {
-        let rms = (voiced.iter().sum::<f32>() / voiced.len() as f32).sqrt();
-        let g = (0.125 / rms.max(1e-6)).min(4.0);
+    let (energy, count) = buf.iter().map(|s| (s[0] * s[0] + s[1] * s[1]) / 2.0)
+        .filter(|v| *v > floor * floor)
+        .fold((0.0f64, 0u64), |(sum, count), value| (sum + value as f64, count + 1));
+    if count > 0 {
+        let rms = (energy / count as f64).sqrt();
+        let g = (0.125 / rms.max(1e-6)).min(4.0) as f32;
         for s in buf.iter_mut() {
             s[0] *= g;
             s[1] *= g;
@@ -150,7 +156,7 @@ pub fn agc(buf: &mut [Stereo], floor: f32) {
 fn cleaned(dir: &Path, file: &str, track: usize, raw: Vec<Stereo>) -> Vec<Stereo> {
     let src = dir.join("recording").join(file);
     // Bump when clean_voice changes so old caches aren't reused.
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     let cache = dir.join("cache").join(format!("voice-v{VERSION}-{file}-{track}.f32"));
     let fresh = |c: &Path| {
         let (Ok(a), Ok(b)) = (std::fs::metadata(c), std::fs::metadata(&src)) else { return false };
@@ -185,8 +191,8 @@ fn cleaned(dir: &Path, file: &str, track: usize, raw: Vec<Stereo>) -> Vec<Stereo
     buf
 }
 
-/// "Enhance voice": Apple's on-device voice isolation (removes background
-/// noise and room tone) plus levelling; the simple DSP chain if isolation
+/// "Enhance voice": RNNoise voice isolation (removes background noise and
+/// room tone) plus levelling; the simple DSP chain if isolation
 /// isn't available.
 pub fn clean_voice(buf: &mut Vec<Stereo>) {
     match super::isolate::isolate_voice(buf) {
@@ -199,7 +205,7 @@ pub fn clean_voice(buf: &mut Vec<Stereo>) {
 }
 
 /// A short synthetic mouse click (two damped noise ticks).
-fn click_sound() -> Vec<Stereo> {
+pub(crate) fn click_sound() -> Vec<Stereo> {
     let n = (RATE * 0.045) as usize;
     let mut seed = 0x1234_5678u32;
     (0..n)
@@ -347,6 +353,15 @@ pub fn mix_unmastered(project: &Project, rec: &Recording, dir: Option<&Path>, ma
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voice_global_level_is_independent_of_track_length() {
+        let mut short = vec![[0.1; 2]; 48_000];
+        let mut long = vec![[0.1; 2]; 960_000];
+        level_voice(&mut short, 0.006);
+        level_voice(&mut long, 0.006);
+        assert!((short[0][0] - long[0][0]).abs() < 1e-7, "short={} long={}", short[0][0], long[0][0]);
+        assert!((long[0][0] - 0.125).abs() < 1e-6);
+    }
     use crate::project::model::Slice;
 
     #[test]

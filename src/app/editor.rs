@@ -1,8 +1,8 @@
 //! The editor: preview, inspector, timeline and export for one project.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,9 +15,9 @@ use super::theme::{self, pal};
 use super::widgets::{self, fmt_time};
 use super::{inspector, timeline};
 use crate::export::{self, Job, Source, Stats};
+use crate::project::Package;
 use crate::project::model::{Codec, ExportFormat, ExportSettings, Project, Quality, Slice, Zoom};
 use crate::project::recording::Recording;
-use crate::project::Package;
 use crate::render::Gpu;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +56,8 @@ impl Tab {
 /// quitting) finishes a voice-over in progress and saves.
 impl Drop for Editor {
     fn drop(&mut self) {
+        self.cancel_export();
+        self.cancel_transcription();
         if self.voice.is_some() {
             self.stop_voiceover();
         }
@@ -84,6 +86,47 @@ pub struct ExportRun {
 impl ExportRun {
     pub fn progress(&self) -> f64 {
         f64::from_bits(self.progress.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for ExportRun {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod export_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn leaving_an_export_cancels_and_joins_its_worker() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (worker_cancel, worker_finished) = (cancel.clone(), finished.clone());
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_finished.store(worker_cancel.load(Ordering::Acquire), Ordering::Release);
+            Ok(Stats::default())
+        });
+        drop(ExportRun {
+            progress: Arc::new(AtomicU64::new(0.0f64.to_bits())),
+            cancel: cancel.clone(),
+            handle: Some(handle),
+            output: PathBuf::new(),
+            started: Instant::now(),
+        });
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(
+            finished.load(Ordering::Acquire),
+            "export thread escaped its owner"
+        );
     }
 }
 
@@ -153,8 +196,12 @@ pub struct Editor {
 pub fn silence_note(rec: &Recording, p: TrackPeaks) -> &'static str {
     match (rec.meta.mic.is_some(), rec.meta.system_audio.is_some()) {
         (false, false) => "This recording has no audio: system audio and the microphone were off.",
-        (false, true) => "This recording is silent: the microphone was off and the Mac played nothing ScreenCaptureKit could capture.",
-        (true, _) if p.mic.is_some() => "This recording is silent: the microphone only picked up silence (lid closed or muted input?).",
+        (false, true) if p.system.is_some() => {
+            "This recording is silent: the microphone was off and no system audio was captured."
+        }
+        (true, _) if p.mic.is_some() => {
+            "This recording is silent: the microphone only picked up silence (lid closed or muted input?)."
+        }
         _ => "This recording's audio couldn't be read.",
     }
 }
@@ -163,6 +210,7 @@ impl Editor {
     pub fn open(path: &Path, gpu: Gpu) -> Result<Self> {
         let package = Package::new(path);
         let (project, rec) = package.load()?;
+        crate::media::VideoReader::open(&package.rec(&rec.meta.screen.file))?;
         if !package.project_file().exists() {
             package.save_project(&project)?;
         }
@@ -172,10 +220,24 @@ impl Editor {
         audio.rebuild_now(&project, &rec, path);
         let peaks = Arc::new(Mutex::new(None));
         {
-            let (peaks, meta, rd) = (peaks.clone(), rec.meta.clone(), package.recording_dir());
+            let (peaks, meta, rd) = (
+                Arc::downgrade(&peaks),
+                rec.meta.clone(),
+                package.recording_dir(),
+            );
             std::thread::spawn(move || {
-                let p = TrackPeaks { system: crate::export::audio::track_peak(&rd, &meta.system_audio), mic: crate::export::audio::track_peak(&rd, &meta.mic) };
-                *peaks.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+                let cancelled = || peaks.strong_count() == 0;
+                let p = TrackPeaks {
+                    system: crate::export::audio::track_peak_cancellable(
+                        &rd,
+                        &meta.system_audio,
+                        &cancelled,
+                    ),
+                    mic: crate::export::audio::track_peak_cancellable(&rd, &meta.mic, &cancelled),
+                };
+                if let Some(peaks) = peaks.upgrade() {
+                    *peaks.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+                }
             });
         }
         Ok(Editor {
@@ -198,7 +260,9 @@ impl Editor {
             thumbs: None,
             close_requested: false,
             transcribing: None,
-            caption_engine: crate::transcribe::Engine::Whisper(crate::whisper::best_downloaded().unwrap_or(crate::whisper::Model::Base)),
+            caption_engine: crate::transcribe::Engine::Whisper(
+                crate::whisper::best_downloaded().unwrap_or(crate::whisper::Model::Base),
+            ),
             transcribe_progress: Default::default(),
             preset_name: String::new(),
             looping: false,
@@ -218,7 +282,9 @@ impl Editor {
 
     /// The playhead right now (it moves between frames while playing).
     pub fn playhead_now(&self) -> f64 {
-        self.playing.map_or(self.playhead, |(t0, from)| (from + t0.elapsed().as_secs_f64() * 1000.0).min(self.duration()))
+        self.playing.map_or(self.playhead, |(t0, from)| {
+            (from + t0.elapsed().as_secs_f64() * 1000.0).min(self.duration())
+        })
     }
 
     pub fn is_playing(&self) -> bool {
@@ -231,7 +297,9 @@ impl Editor {
             return;
         }
         // Coalesce rapid edits (slider drags) into one undo step.
-        let coalesce = self.last_commit.is_some_and(|t| t.elapsed() < Duration::from_millis(600));
+        let coalesce = self
+            .last_commit
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(600));
         if !coalesce {
             self.undo.push(self.project.clone());
             if self.undo.len() > 200 {
@@ -251,7 +319,8 @@ impl Editor {
         self.project = p;
         self.preview.set_project(&self.project, &self.rec);
         if audio_changed {
-            self.audio.rebuild(&self.project, &self.rec, &self.package.root);
+            self.audio
+                .rebuild(&self.project, &self.rec, &self.package.root);
         }
         self.playhead = self.playhead.min(self.duration());
         self.dirty_at = Some(Instant::now());
@@ -295,8 +364,12 @@ impl Editor {
     pub fn save(&mut self) {
         if let Err(e) = self.package.save_project(&self.project) {
             self.status = Some(format!("Couldn't save: {e}"));
+            if self.dirty_at.is_some() {
+                self.dirty_at = Some(Instant::now());
+            }
+        } else {
+            self.dirty_at = None;
         }
-        self.dirty_at = None;
     }
 
     pub fn toggle_play(&mut self) {
@@ -341,7 +414,12 @@ impl Editor {
         self.edit(|p| {
             if p.timeline.slices.is_empty() {
                 let id = p.timeline.new_id();
-                p.timeline.slices.push(Slice { id, start: 0.0, end: map.source_end(), ..Default::default() });
+                p.timeline.slices.push(Slice {
+                    id,
+                    start: 0.0,
+                    end: map.source_end(),
+                    ..Default::default()
+                });
             }
             crate::engine::typing::split_at(&mut p.timeline, src);
         });
@@ -352,9 +430,14 @@ impl Editor {
         let duration = self.preview.scene.map.source_end();
         let pad = crate::exposure::CUT_PAD_MS;
         let mut cut = false;
-        self.edit(|p| cut = crate::engine::typing::cut(&mut p.timeline, duration, e.start - pad, e.end + pad));
+        self.edit(|p| {
+            cut = crate::engine::typing::cut(&mut p.timeline, duration, e.start - pad, e.end + pad)
+        });
         self.status = Some(if cut {
-            format!("Cut {:.1} s where masked content was visible", (e.end - e.start + 2.0 * pad) / 1000.0)
+            format!(
+                "Cut {:.1} s where masked content was visible",
+                (e.end - e.start + 2.0 * pad) / 1000.0
+            )
         } else {
             "Couldn't cut that part (it's the whole clip)".into()
         });
@@ -372,8 +455,16 @@ impl Editor {
         let progress = std::sync::Arc::new(crate::whisper::Progress::default());
         self.transcribe_progress = progress.clone();
         self.transcribing = Some(std::thread::spawn(move || {
-            crate::transcribe::transcribe_package(&pkg, engine, &progress).map_err(|e| format!("{e:#}"))
+            crate::transcribe::transcribe_package(&pkg, engine, &progress)
+                .map_err(|e| format!("{e:#}"))
         }));
+    }
+
+    pub fn cancel_transcription(&mut self) {
+        self.transcribe_progress.cancel();
+        if let Some(handle) = self.transcribing.take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn delete_selection(&mut self) {
@@ -402,7 +493,13 @@ impl Editor {
             new_id = id;
             let start = src.max(0.0);
             let end = (start + 2500.0).min(end_limit);
-            p.timeline.zooms.push(Zoom { id, start, end, scale: p.style.default_zoom, ..Default::default() });
+            p.timeline.zooms.push(Zoom {
+                id,
+                start,
+                end,
+                scale: p.style.default_zoom,
+                ..Default::default()
+            });
         });
         self.selection = Selection::Zoom(new_id);
     }
@@ -418,9 +515,15 @@ impl Editor {
         if self.playhead >= self.duration() - 100.0 {
             self.playhead = 0.0;
         }
-        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        let file = format!("voiceover-{ms}.m4a");
-        match super::voiceover::VoiceRecorder::start(&self.package.root, &file, self.source_at_playhead()) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let file = format!("voiceover-{ms}.wav");
+        match super::voiceover::VoiceRecorder::start(
+            &self.package.root,
+            &file,
+            self.source_at_playhead(),
+        ) {
             Ok(v) => {
                 self.voice = Some(v);
                 self.looping = false;
@@ -434,7 +537,15 @@ impl Editor {
     pub fn stop_voiceover(&mut self) {
         let Some(v) = self.voice.take() else { return };
         let (file, start) = (v.file.clone(), v.start_source);
-        let ms = v.stop();
+        let ms = match v.stop() {
+            Ok(ms) => ms,
+            Err(e) => {
+                self.playing = None;
+                self.audio.pause();
+                self.status = Some(format!("Voice-over could not be saved: {e:#}"));
+                return;
+            }
+        };
         self.playing = None;
         self.audio.pause();
         if ms < 300.0 {
@@ -444,7 +555,15 @@ impl Editor {
         }
         self.edit(|p| {
             let id = p.timeline.new_id();
-            p.timeline.voiceovers.push(crate::project::model::VoiceOver { id, file, start, duration: ms, volume: 1.0 });
+            p.timeline
+                .voiceovers
+                .push(crate::project::model::VoiceOver {
+                    id,
+                    file,
+                    start,
+                    duration: ms,
+                    volume: 1.0,
+                });
         });
         self.status = Some(format!("Added a {:.1} s voice-over", ms / 1000.0));
     }
@@ -459,14 +578,23 @@ impl Editor {
             new_id = id;
             let start = src.max(0.0);
             let end = (start + 3000.0).min(end_limit);
-            p.timeline.masks.push(crate::project::model::Mask { id, start, end, ..Default::default() });
+            p.timeline.masks.push(crate::project::model::Mask {
+                id,
+                start,
+                end,
+                ..Default::default()
+            });
         });
         self.selection = Selection::Mask(new_id);
     }
 
     /// Preview point (egui) → normalised recording coordinates, using the
     /// last rendered frame's window placement.
-    fn preview_to_recording(&self, preview: egui::Rect, pos: egui::Pos2) -> Option<crate::engine::geom::Vec2> {
+    fn preview_to_recording(
+        &self,
+        preview: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<crate::engine::geom::Vec2> {
         let f = self.preview.last_frame.as_ref()?;
         let out = crate::engine::geom::v2(
             ((pos.x - preview.min.x) / preview.width()) as f64 * f.size.x,
@@ -474,31 +602,77 @@ impl Editor {
         );
         let p = self.preview.scene.output_to_screen(out, f.window.rect);
         let rec = self.preview.scene.sizes.recording;
-        Some(crate::engine::geom::v2((p.x / rec.x).clamp(0.0, 1.0), (p.y / rec.y).clamp(0.0, 1.0)))
+        Some(crate::engine::geom::v2(
+            (p.x / rec.x).clamp(0.0, 1.0),
+            (p.y / rec.y).clamp(0.0, 1.0),
+        ))
     }
 
     /// Normalised recording rect → preview rect (egui points).
-    fn recording_to_preview(&self, preview: egui::Rect, r: crate::engine::geom::Rect) -> Option<egui::Rect> {
+    fn recording_to_preview(
+        &self,
+        preview: egui::Rect,
+        r: crate::engine::geom::Rect,
+    ) -> Option<egui::Rect> {
         let f = self.preview.last_frame.as_ref()?;
         let rec = self.preview.scene.sizes.recording;
         let map = |x: f64, y: f64| {
-            let o = self.preview.scene.screen_to_output(crate::engine::geom::v2(x * rec.x, y * rec.y), f.window.rect);
-            egui::pos2(preview.min.x + (o.x / f.size.x) as f32 * preview.width(), preview.min.y + (o.y / f.size.y) as f32 * preview.height())
+            let o = self
+                .preview
+                .scene
+                .screen_to_output(crate::engine::geom::v2(x * rec.x, y * rec.y), f.window.rect);
+            egui::pos2(
+                preview.min.x + (o.x / f.size.x) as f32 * preview.width(),
+                preview.min.y + (o.y / f.size.y) as f32 * preview.height(),
+            )
         };
-        Some(egui::Rect::from_two_pos(map(r.x, r.y), map(r.x + r.w, r.y + r.h)))
+        Some(egui::Rect::from_two_pos(
+            map(r.x, r.y),
+            map(r.x + r.w, r.y + r.h),
+        ))
     }
 
     /// Draw or move the selected mask by dragging on the preview.
-    fn mask_on_preview(&mut self, ui: &mut Ui, preview: egui::Rect, resp: &egui::Response, id: u64) {
+    fn mask_on_preview(
+        &mut self,
+        ui: &mut Ui,
+        preview: egui::Rect,
+        resp: &egui::Response,
+        id: u64,
+    ) {
         use crate::engine::geom::{Rect as R, v2};
-        let Some(mask) = self.project.timeline.masks.iter().find(|m| m.id == id).copied() else { return };
+        let Some(mask) = self
+            .project
+            .timeline
+            .masks
+            .iter()
+            .find(|m| m.id == id)
+            .copied()
+        else {
+            return;
+        };
         if let Some(r) = self.recording_to_preview(preview, mask.rect) {
             let r = r.intersect(preview);
-            ui.painter().rect_stroke(r, CornerRadius::same(3), Stroke::new(1.5, theme::accent()), egui::StrokeKind::Outside);
-            for c in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] {
-                ui.painter().circle(c, 3.5, Color32::WHITE, Stroke::new(1.0, theme::accent()));
+            ui.painter().rect_stroke(
+                r,
+                CornerRadius::same(3),
+                Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Outside,
+            );
+            for c in [
+                r.left_top(),
+                r.right_top(),
+                r.left_bottom(),
+                r.right_bottom(),
+            ] {
+                ui.painter()
+                    .circle(c, 3.5, Color32::WHITE, Stroke::new(1.0, theme::accent()));
             }
-            if resp.hovered() && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p)) {
+            if resp.hovered()
+                && ui
+                    .input(|i| i.pointer.hover_pos())
+                    .is_some_and(|p| r.contains(p))
+            {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             } else if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -510,11 +684,19 @@ impl Editor {
             Draw(crate::engine::geom::Vec2),
             Move(crate::engine::geom::Vec2, R),
         }
-        let Some(pos) = resp.interact_pointer_pos() else { return };
-        let Some(at) = self.preview_to_recording(preview, pos) else { return };
+        let Some(pos) = resp.interact_pointer_pos() else {
+            return;
+        };
+        let Some(at) = self.preview_to_recording(preview, pos) else {
+            return;
+        };
         if resp.drag_started() {
             let inside = mask.rect.contains(at);
-            let d = if inside { MaskDrag::Move(at, mask.rect) } else { MaskDrag::Draw(at) };
+            let d = if inside {
+                MaskDrag::Move(at, mask.rect)
+            } else {
+                MaskDrag::Draw(at)
+            };
             ui.data_mut(|m| m.insert_temp(drag_id, d));
         }
         if resp.dragged()
@@ -543,6 +725,7 @@ impl Editor {
     }
 
     pub fn start_export(&mut self) {
+        self.cancel_export();
         let settings = self.project.export;
         let output = export::default_output(&self.package.root, &settings);
         let job = Job {
@@ -559,7 +742,18 @@ impl Editor {
             export::run(&job, &mut |f| p2.store(f.to_bits(), Ordering::Relaxed), &c2)
         });
         self.export.result = None;
-        self.export.running = Some(ExportRun { progress, cancel, handle: Some(handle), output, started: Instant::now() });
+        self.export.running = Some(ExportRun {
+            progress,
+            cancel,
+            handle: Some(handle),
+            output,
+            started: Instant::now(),
+        });
+    }
+
+    /// Finish cancellation before leaving the editor or Windows teardown.
+    pub fn cancel_export(&mut self) {
+        drop(self.export.running.take());
     }
 
     /// Per-frame housekeeping. Returns true while something animates.
@@ -592,13 +786,17 @@ impl Editor {
             && let Some(p) = *self.peaks.lock().unwrap_or_else(|e| e.into_inner())
         {
             self.silence_noted = true;
-            let added = !self.project.timeline.voiceovers.is_empty() || self.project.style.audio.music.is_some();
+            let added = !self.project.timeline.voiceovers.is_empty()
+                || self.project.style.audio.music.is_some();
             if TrackPeaks::silent(p.system) && TrackPeaks::silent(p.mic) && !added {
                 self.status = Some(silence_note(&self.rec, p).into());
             }
         }
         let exposures_changed = self.mask_watch.update(&self.project.timeline.masks);
-        if self.dirty_at.is_some_and(|t| t.elapsed() > Duration::from_millis(800)) {
+        if self
+            .dirty_at
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(800))
+        {
             self.save();
         }
         if let Some(run) = &mut self.export.running
@@ -615,8 +813,13 @@ impl Editor {
             if self.copy_when_exported {
                 self.copy_when_exported = false;
                 if let Some(Ok((path, _))) = &self.export.result {
-                    super::os::copy_file(path);
-                    self.status = Some(format!("Exported and copied {} — paste it anywhere", path.file_name().unwrap_or_default().to_string_lossy()));
+                    self.status = Some(match super::os::copy_file(path) {
+                        Ok(()) => format!(
+                            "Exported and copied {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        Err(e) => format!("Exported; clipboard failed: {e:#}"),
+                    });
                 }
             }
         }
@@ -627,13 +830,21 @@ impl Editor {
                         self.rec = r;
                         self.preview.set_project(&self.project, &self.rec);
                     }
-                    self.status = Some(if n == 0 { "No speech found in the microphone track".into() } else { format!("Transcribed {n} words") });
+                    self.status = Some(if n == 0 {
+                        "No speech found in the microphone track".into()
+                    } else {
+                        format!("Transcribed {n} words")
+                    });
                 }
                 Ok(Err(e)) => self.status = Some(format!("Transcription failed: {e}")),
                 Err(_) => self.status = Some("Transcription crashed".into()),
             }
         }
-        self.playing.is_some() || self.export.running.is_some() || self.transcribing.is_some() || self.voice.is_some() || exposures_changed
+        self.playing.is_some()
+            || self.export.running.is_some()
+            || self.transcribing.is_some()
+            || self.voice.is_some()
+            || exposures_changed
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -693,7 +904,11 @@ impl Editor {
                 ui.label(RichText::new("No presets yet").color(pal(ui).secondary));
             }
             for p in &list {
-                let label = if default.as_deref() == Some(p.name.as_str()) { format!("{}  (default)", p.name) } else { p.name.clone() };
+                let label = if default.as_deref() == Some(p.name.as_str()) {
+                    format!("{}  (default)", p.name)
+                } else {
+                    p.name.clone()
+                };
                 if ui.button(label).on_hover_text("Apply this style").clicked() {
                     match presets::load(p) {
                         Ok(style) => {
@@ -708,12 +923,26 @@ impl Editor {
             ui.separator();
             ui.label(RichText::new("Save current style as").color(pal(ui).secondary));
             ui.horizontal(|ui| {
-                let field = ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Preset name").desired_width(140.0));
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.preset_name)
+                        .hint_text("Preset name")
+                        .desired_width(140.0),
+                );
                 let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() || enter)
+                if (ui
+                    .add_enabled(
+                        !self.preset_name.trim().is_empty(),
+                        egui::Button::new("Save"),
+                    )
+                    .clicked()
+                    || enter)
                     && !self.preset_name.trim().is_empty()
                 {
-                    match presets::save(&self.preset_name, &self.project.style, Some(&self.package.root)) {
+                    match presets::save(
+                        &self.preset_name,
+                        &self.project.style,
+                        Some(&self.package.root),
+                    ) {
                         Ok(p) => self.status = Some(format!("Saved preset “{}”", p.name)),
                         Err(e) => self.status = Some(format!("Couldn't save preset: {e:#}")),
                     }
@@ -728,7 +957,10 @@ impl Editor {
                         ui.close();
                     }
                     for p in &list {
-                        if ui.selectable_label(default.as_deref() == Some(p.name.as_str()), &p.name).clicked() {
+                        if ui
+                            .selectable_label(default.as_deref() == Some(p.name.as_str()), &p.name)
+                            .clicked()
+                        {
                             let _ = presets::set_default(Some(&p.name));
                             ui.close();
                         }
@@ -752,7 +984,12 @@ impl Editor {
     /// The editor window. `chrome` draws the app-level title-bar controls
     /// (Back, the title with recent recordings, Record) and collects their
     /// action.
-    pub fn ui(&mut self, ui: &mut Ui, egui_renderer: &mut egui_wgpu::Renderer, chrome: &mut super::home::Chrome) {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        egui_renderer: &mut egui_wgpu::Renderer,
+        chrome: &mut super::home::Chrome,
+    ) {
         let ctx = ui.ctx().clone();
         self.handle_keys(&ctx);
         let p = pal(ui);
@@ -760,7 +997,16 @@ impl Editor {
         // Toolbar.
         egui::Panel::top("editor-toolbar")
             .exact_size(theme::TOOLBAR_H)
-            .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: theme::toolbar_left(), right: 12, top: 0, bottom: 0 }))
+            .frame(
+                egui::Frame::new()
+                    .fill(p.window)
+                    .inner_margin(egui::Margin {
+                        left: theme::toolbar_left(),
+                        right: 12,
+                        top: 0,
+                        bottom: 0,
+                    }),
+            )
             .show(ui, |ui| {
                 super::toolbar_drag(ui);
                 ui.horizontal_centered(|ui| {
@@ -772,10 +1018,16 @@ impl Editor {
                         ui.add_space(6.0);
                         self.presets_menu(ui);
                         ui.add_space(4.0);
-                        if widgets::icon_button(ui, widgets::Icon::Redo, !self.redo.is_empty()).on_hover_text("Redo ⇧⌘Z").clicked() {
+                        if widgets::icon_button(ui, widgets::Icon::Redo, !self.redo.is_empty())
+                            .on_hover_text("Redo ⇧⌘Z")
+                            .clicked()
+                        {
                             self.redo();
                         }
-                        if widgets::icon_button(ui, widgets::Icon::Undo, !self.undo.is_empty()).on_hover_text("Undo ⌘Z").clicked() {
+                        if widgets::icon_button(ui, widgets::Icon::Undo, !self.undo.is_empty())
+                            .on_hover_text("Undo ⌘Z")
+                            .clicked()
+                        {
                             self.undo();
                         }
                         ui.add_space(10.0);
@@ -788,15 +1040,29 @@ impl Editor {
         egui::Panel::right("inspector")
             .exact_size(320.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(p.inspector).inner_margin(egui::Margin::symmetric(14, 10)))
+            .frame(
+                egui::Frame::new()
+                    .fill(p.inspector)
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
             .show(ui, |ui| {
                 inspector::ui(ui, self);
             });
 
         // Timeline.
         egui::Panel::bottom("timeline")
-            .exact_size(if self.rec.meta.camera.is_some() { 284.0 } else { 236.0 } + timeline::extra_height(self))
-            .frame(egui::Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(12, 8)))
+            .exact_size(
+                if self.rec.meta.camera.is_some() {
+                    284.0
+                } else {
+                    236.0
+                } + timeline::extra_height(self),
+            )
+            .frame(
+                egui::Frame::new()
+                    .fill(p.sidebar)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
             .show(ui, |ui| {
                 self.transport(ui);
                 ui.add_space(4.0);
@@ -881,7 +1147,9 @@ impl Editor {
         let y = ((px.y as f64 - sizes.pad - body.y) / body.h).clamp(0.0, 1.0);
         self.edit(|p| {
             if let Some(z) = p.timeline.zooms.iter_mut().find(|z| z.id == id) {
-                z.mode = crate::project::model::ZoomMode::Manual { target: crate::engine::geom::v2(x, y) };
+                z.mode = crate::project::model::ZoomMode::Manual {
+                    target: crate::engine::geom::v2(x, y),
+                };
             }
         });
     }
@@ -889,21 +1157,48 @@ impl Editor {
     fn transport(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             let label = if self.is_playing() { "⏸" } else { "▶" };
-            if ui.add(egui::Button::new(RichText::new(label).size(14.0)).min_size(vec2(32.0, 24.0))).on_hover_text("Play/Pause (Space)").clicked() {
+            if ui
+                .add(egui::Button::new(RichText::new(label).size(14.0)).min_size(vec2(32.0, 24.0)))
+                .on_hover_text("Play/Pause (Space)")
+                .clicked()
+            {
                 self.toggle_play();
             }
-            ui.label(RichText::new(format!("{} / {}", fmt_time(self.playhead), fmt_time(self.duration()))).monospace());
-            if ui.selectable_label(self.looping, "Loop").on_hover_text("Loop playback (L)").clicked() {
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    fmt_time(self.playhead),
+                    fmt_time(self.duration())
+                ))
+                .monospace(),
+            );
+            if ui
+                .selectable_label(self.looping, "Loop")
+                .on_hover_text("Loop playback (L)")
+                .clicked()
+            {
                 self.looping = !self.looping;
             }
             ui.separator();
-            if ui.button("✂ Split").on_hover_text("Split at playhead (S)").clicked() {
+            if ui
+                .button("✂ Split")
+                .on_hover_text("Split at playhead (S)")
+                .clicked()
+            {
                 self.split();
             }
-            if ui.button("+ Zoom").on_hover_text("Add zoom at playhead (Z)").clicked() {
+            if ui
+                .button("+ Zoom")
+                .on_hover_text("Add zoom at playhead (Z)")
+                .clicked()
+            {
                 self.add_zoom();
             }
-            if ui.button("+ Mask").on_hover_text("Blur, pixelate or highlight a region (M)").clicked() {
+            if ui
+                .button("+ Mask")
+                .on_hover_text("Blur, pixelate or highlight a region (M)")
+                .clicked()
+            {
                 self.add_mask();
             }
             if self.rec.meta.camera.is_some() && ui.button("+ Layout").clicked() {
@@ -920,11 +1215,21 @@ impl Editor {
                     });
                 });
             }
-            if ui.add_enabled(self.selection != Selection::None, egui::Button::new("Delete")).clicked() {
+            if ui
+                .add_enabled(
+                    self.selection != Selection::None,
+                    egui::Button::new("Delete"),
+                )
+                .clicked()
+            {
                 self.delete_selection();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add(egui::Slider::new(&mut self.px_per_sec, 20.0..=400.0).logarithmic(true).show_value(false));
+                ui.add(
+                    egui::Slider::new(&mut self.px_per_sec, 20.0..=400.0)
+                        .logarithmic(true)
+                        .show_value(false),
+                );
                 widgets::caption(ui, "Zoom");
             });
         });
@@ -944,40 +1249,70 @@ impl Editor {
                 ui.add_enabled_ui(!running, |ui| {
                     widgets::row(ui, "Format", |ui| {
                         let before = s.format;
-                        widgets::segmented(ui, &mut s.format, &[(ExportFormat::Gif, "GIF"), (ExportFormat::Mp4, "MP4")]);
+                        widgets::segmented(
+                            ui,
+                            &mut s.format,
+                            &[(ExportFormat::Gif, "GIF"), (ExportFormat::Mp4, "MP4")],
+                        );
                         if s.format != before {
-                            s = if s.format == ExportFormat::Gif { ExportSettings::gif_default() } else { ExportSettings::default() };
+                            s = if s.format == ExportFormat::Gif {
+                                ExportSettings::gif_default()
+                            } else {
+                                ExportSettings::default()
+                            };
                         }
                     });
                     let (heights, fpss): (&[u32], &[u32]) = match s.format {
-                        ExportFormat::Mp4 => (&ExportSettings::MP4_HEIGHTS, &ExportSettings::MP4_FPS),
-                        ExportFormat::Gif => (&ExportSettings::GIF_HEIGHTS, &ExportSettings::GIF_FPS),
+                        ExportFormat::Mp4 => {
+                            (&ExportSettings::MP4_HEIGHTS, &ExportSettings::MP4_FPS)
+                        }
+                        ExportFormat::Gif => {
+                            (&ExportSettings::GIF_HEIGHTS, &ExportSettings::GIF_FPS)
+                        }
                     };
                     widgets::row(ui, "Resolution", |ui| {
-                        egui::ComboBox::from_id_salt("res").selected_text(res_label(s.height)).show_ui(ui, |ui| {
-                            for h in heights {
-                                ui.selectable_value(&mut s.height, *h, res_label(*h));
-                            }
-                        });
+                        egui::ComboBox::from_id_salt("res")
+                            .selected_text(res_label(s.height))
+                            .show_ui(ui, |ui| {
+                                for h in heights {
+                                    ui.selectable_value(&mut s.height, *h, res_label(*h));
+                                }
+                            });
                     });
                     widgets::row(ui, "Frame rate", |ui| {
-                        egui::ComboBox::from_id_salt("fps").selected_text(format!("{} fps", s.fps)).show_ui(ui, |ui| {
-                            for f in fpss {
-                                ui.selectable_value(&mut s.fps, *f, format!("{f} fps"));
-                            }
-                        });
+                        egui::ComboBox::from_id_salt("fps")
+                            .selected_text(format!("{} fps", s.fps))
+                            .show_ui(ui, |ui| {
+                                for f in fpss {
+                                    ui.selectable_value(&mut s.fps, *f, format!("{f} fps"));
+                                }
+                            });
                     });
                     widgets::row(ui, "Quality", |ui| {
-                        egui::ComboBox::from_id_salt("q").selected_text(s.quality.label()).show_ui(ui, |ui| {
-                            let qs: &[Quality] = if s.format == ExportFormat::Gif { &[Quality::Studio, Quality::Social] } else { &Quality::ALL };
-                            for q in qs {
-                                ui.selectable_value(&mut s.quality, *q, q.label());
-                            }
-                        });
+                        egui::ComboBox::from_id_salt("q")
+                            .selected_text(s.quality.label())
+                            .show_ui(ui, |ui| {
+                                let qs: &[Quality] = if s.format == ExportFormat::Gif {
+                                    &[Quality::Studio, Quality::Social]
+                                } else {
+                                    &Quality::ALL
+                                };
+                                for q in qs {
+                                    ui.selectable_value(&mut s.quality, *q, q.label());
+                                }
+                            });
                     });
                     if s.format == ExportFormat::Mp4 {
                         widgets::row(ui, "Codec", |ui| {
-                            widgets::segmented(ui, &mut s.codec, &[(Codec::H264, "H.264"), (Codec::Hevc, "HEVC"), (Codec::Prores, "ProRes")]);
+                            widgets::segmented(
+                                ui,
+                                &mut s.codec,
+                                &[
+                                    (Codec::H264, "H.264"),
+                                    (Codec::Hevc, "HEVC"),
+                                    (Codec::Prores, "ProRes"),
+                                ],
+                            );
                         });
                         let fits = s.fits_size();
                         let mut fit = s.target_mb.is_some();
@@ -995,7 +1330,10 @@ impl Editor {
                     let (w, h) = self.preview.scene.sizes.render_size(s.height);
                     let secs = self.duration() / 1000.0;
                     let mb = s.estimate_mb(w, h, secs);
-                    widgets::caption(ui, &format!("{w}×{h} • {:.1} s • about {:.0} MB", secs, mb.max(0.1)));
+                    widgets::caption(
+                        ui,
+                        &format!("{w}×{h} • {:.1} s • about {:.0} MB", secs, mb.max(0.1)),
+                    );
                     if s.format == ExportFormat::Mp4 && s.codec_for(w, h) != s.codec {
                         widgets::caption(ui, "HEVC at this size (H.264 stops at 4096×2304)");
                     }
@@ -1019,20 +1357,33 @@ impl Editor {
                 } else {
                     match &self.export.result {
                         Some(Ok((path, stats))) => {
-                            ui.label(RichText::new("✓ Exported").color(Color32::from_rgb(52, 199, 89)));
-                            widgets::caption(ui, &format!(
-                                "{} • {:.1} MB • {:.1}× real time",
-                                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                                stats.bytes as f64 / 1e6,
-                                stats.speed()
-                            ));
+                            ui.label(
+                                RichText::new("✓ Exported").color(Color32::from_rgb(52, 199, 89)),
+                            );
+                            widgets::caption(
+                                ui,
+                                &format!(
+                                    "{} • {:.1} MB • {:.1}× real time",
+                                    path.file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default(),
+                                    stats.bytes as f64 / 1e6,
+                                    stats.speed()
+                                ),
+                            );
                             let path = path.clone();
                             ui.horizontal(|ui| {
                                 if ui.button("Show in Explorer").clicked() {
                                     super::os::reveal(&path);
                                 }
-                                if ui.button("Copy").on_hover_text("Copy the file to the clipboard").clicked() {
-                                    super::os::copy_file(&path);
+                                if ui
+                                    .button("Copy")
+                                    .on_hover_text("Copy the file to the clipboard")
+                                    .clicked()
+                                {
+                                    if let Err(e) = super::os::copy_file(&path) {
+                                        self.status = Some(format!("Clipboard failed: {e:#}"));
+                                    }
                                 }
                                 if ui.button("Open").clicked() {
                                     super::os::open(&path);

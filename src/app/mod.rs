@@ -4,21 +4,22 @@
 //! Inter, sharing one GPU device with the editor's renderer.
 
 pub mod editor;
-pub mod maskwatch;
 pub mod home;
 pub mod hotkey;
 pub mod inspector;
+pub mod maskwatch;
 pub mod os;
 pub use os as windows;
 pub use os as macos;
+mod camera_preview;
 pub mod menubar;
 pub mod player;
 pub mod preview;
+pub mod recbar;
 pub mod snapshot;
 pub mod theme;
 pub mod timeline;
 pub mod voiceover;
-pub mod recbar;
 pub mod widgets;
 pub mod winpick;
 
@@ -104,6 +105,7 @@ struct Win {
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Main,
+    CameraPreview,
     /// The picker overlay on this display.
     Overlay(u32),
 }
@@ -122,7 +124,13 @@ struct Slot<K, V> {
 
 impl<K, V> Default for Slot<K, V> {
     fn default() -> Self {
-        Slot { want: None, want_since: None, running: None, starting: None, failed: None }
+        Slot {
+            want: None,
+            want_since: None,
+            running: None,
+            starting: None,
+            failed: None,
+        }
     }
 }
 
@@ -136,7 +144,11 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
             self.want_since = Some(Instant::now());
             self.failed = None;
         }
-        if self.running.as_ref().is_some_and(|(k, _)| Some(k) != want.as_ref()) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|(k, _)| Some(k) != want.as_ref())
+        {
             let (_, v) = self.running.take().unwrap();
             std::thread::spawn(move || drop(v));
             stopped = true;
@@ -147,7 +159,9 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
             let k = k.clone();
             self.starting = None;
             match result {
-                Ok(v) if Some(&k) == want.as_ref() && self.running.is_none() => self.running = Some((k, v)),
+                Ok(v) if Some(&k) == want.as_ref() && self.running.is_none() => {
+                    self.running = Some((k, v))
+                }
                 Ok(v) => drop(std::thread::spawn(move || drop(v))),
                 Err(e) => {
                     eprintln!("cam: {name}: {e}");
@@ -156,7 +170,9 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
             }
         }
         // Wait for edits (an area being typed in) to settle before starting.
-        let settled = self.want_since.is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
+        let settled = self
+            .want_since
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(300));
         if let Some(k) = want
             && settled
             && self.running.is_none()
@@ -178,13 +194,34 @@ impl<K: Clone + PartialEq + Send + 'static, V: Send + 'static> Slot<K, V> {
         stopped
     }
 
+    /// Release device ownership before a recording opens its own streams.
+    fn stop(&mut self) -> Result<(), String> {
+        self.want = None;
+        self.want_since = None;
+        self.failed = None;
+        drop(self.running.take());
+        if let Some((_, receiver)) = self.starting.take() {
+            match receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(result) => drop(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("A preview device is still stopping; try recording again.".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn active(&self) -> bool {
         self.running.is_some() || self.starting.is_some()
     }
 
     /// Why the wanted key isn't running, if it failed.
     fn error(&self) -> Option<&str> {
-        self.failed.as_ref().filter(|(k, _)| self.want.as_ref() == Some(k)).map(|(_, e)| e.as_str())
+        self.failed
+            .as_ref()
+            .filter(|(k, _)| self.want.as_ref() == Some(k))
+            .map(|(_, e)| e.as_str())
     }
 }
 
@@ -207,6 +244,7 @@ struct Live {
     /// The registered native texture, reused across sources.
     tex_id: Option<egui::TextureId>,
     cam_tex: Option<egui::TextureHandle>,
+    screen_cpu_tex: Option<egui::TextureHandle>,
     /// Displayed levels (peak hold with decay).
     levels: [f32; 2],
 }
@@ -215,6 +253,7 @@ struct Live {
 #[derive(Default)]
 struct AreaPick {
     rect: Option<egui::Rect>,
+    pixels_per_point: f64,
     drag: Option<AreaDrag>,
     record_after: bool,
     display: u32,
@@ -262,6 +301,7 @@ struct SelfTest {
     at: Instant,
     paused_at: Option<Instant>,
     resumed: bool,
+    preview_frames_at_pause: usize,
     /// The recording made by the test.
     package: Option<PathBuf>,
 }
@@ -300,6 +340,8 @@ struct App {
     bar: Option<recbar::RecordBar>,
     /// Where the user last left the bar.
     bar_origin: Option<recbar::Point>,
+    camera_window: Option<Win>,
+    camera_monitor: camera_preview::Preview,
     /// Picker overlays, one per display.
     overlays: Vec<Win>,
     area: AreaPick,
@@ -327,32 +369,55 @@ struct App {
 fn permission_note() -> Option<String> {
     use crate::capture::tcc::{self, Status};
     if tcc::screen_status() != Status::Granted {
-        return Some("Cam needs screen capture permissions. Request it, then enable Glide in System Settings › Privacy & Security › Screen & System Audio Recording, and reopen Cam.".into());
+        return Some("Screen capture is unavailable. Check Windows graphics drivers and that this is an unlocked interactive desktop.".into());
     }
     None
 }
 
 impl App {
     fn new(open: Option<PathBuf>) -> App {
-        let selftest = std::env::var_os("CAM_GUI_SELFTEST").map(|_| SelfTest { phase: 0, at: Instant::now(), paused_at: None, resumed: false, package: None });
+        let selftest = std::env::var_os("CAM_GUI_SELFTEST").map(|_| SelfTest {
+            phase: 0,
+            at: Instant::now(),
+            paused_at: None,
+            resumed: false,
+            preview_frames_at_pause: 0,
+            package: None,
+        });
         let playtest = std::env::var_os("CAM_GUI_PLAYTEST").map(|p| PlayTest {
             path: PathBuf::from(p),
             phase: 0,
             at: Instant::now(),
             started: Instant::now(),
-            secs: std::env::var("CAM_PLAYTEST_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0),
-            delay: std::env::var("CAM_PLAYTEST_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5),
+            secs: std::env::var("CAM_PLAYTEST_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3.0),
+            delay: std::env::var("CAM_PLAYTEST_DELAY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.5),
             max_drift: 0.0,
             loud_db: 0.0,
             volume: 1.0,
         });
         let scripted = selftest.is_some() || playtest.is_some();
-        let mut settings = if scripted { Settings::default() } else { Settings::load() };
+        let mut settings = if scripted {
+            Settings::default()
+        } else {
+            Settings::load()
+        };
         if let Some(dir) = std::env::var_os("CAM_OUTPUT_DIR") {
             settings.projects_dir = Some(PathBuf::from(dir));
         }
         if selftest.is_some() {
             settings.countdown = false;
+            if std::env::var_os("CAM_SELFTEST_CAMERA").is_some() {
+                settings.camera = true;
+                settings.mic = true;
+            }
+            settings.show_camera_while_recording =
+                std::env::var_os("CAM_SELFTEST_CAMERA_PREVIEW").is_some();
         }
         let projects = home::scan_projects(&settings.dir());
         App {
@@ -360,6 +425,8 @@ impl App {
             main: None,
             bar: None,
             bar_origin: None,
+            camera_window: None,
+            camera_monitor: camera_preview::Preview::default(),
             overlays: vec![],
             area: AreaPick::default(),
             view: View::Start,
@@ -382,7 +449,26 @@ impl App {
         }
     }
 
-    fn open_window(&mut self, el: &ActiveEventLoop, title: &str, size: (f64, f64), min: (f64, f64)) -> Win {
+    fn app_icon() -> Option<winit::window::Icon> {
+        static ICON_DATA: OnceLock<Option<(Vec<u8>, u32, u32)>> = OnceLock::new();
+        let (rgba, w, h) = ICON_DATA
+            .get_or_init(|| {
+                let bytes = include_bytes!("../../docs/screenshots/icon.png");
+                let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+                let (w, h) = img.dimensions();
+                Some((img.into_raw(), w, h))
+            })
+            .as_ref()?;
+        winit::window::Icon::from_rgba(rgba.clone(), *w, *h).ok()
+    }
+
+    fn open_window(
+        &mut self,
+        el: &ActiveEventLoop,
+        title: &str,
+        size: (f64, f64),
+        min: (f64, f64),
+    ) -> Win {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
@@ -397,10 +483,13 @@ impl App {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let attrs = Window::default_attributes()
+            let mut attrs = Window::default_attributes()
                 .with_title(title)
                 .with_inner_size(winit::dpi::LogicalSize::new(size.0, size.1))
                 .with_min_inner_size(winit::dpi::LogicalSize::new(min.0, min.1));
+            if let Some(icon) = Self::app_icon() {
+                attrs = attrs.with_window_icon(Some(icon));
+            }
             self.make_window(el, attrs, false)
         }
     }
@@ -408,14 +497,20 @@ impl App {
     /// Borderless transparent window covering a display (area picker).
     fn open_overlay(&mut self, el: &ActiveEventLoop, display: u32) -> Win {
         let (id, x, y, w, h) = macos::display_frame(display);
-        let attrs = Window::default_attributes()
+        use winit::platform::windows::MonitorHandleExtWindows;
+        let monitor = el.available_monitors().find(|m| m.hmonitor() as u32 == id);
+        let mut attrs = Window::default_attributes()
             .with_title("Select Area")
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(false)
-            .with_position(winit::dpi::LogicalPosition::new(x, y))
-            .with_inner_size(winit::dpi::LogicalSize::new(w, h))
+            .with_position(winit::dpi::PhysicalPosition::new(x as i32, y as i32))
+            .with_inner_size(winit::dpi::PhysicalSize::new(w as u32, h as u32))
             .with_window_level(WindowLevel::AlwaysOnTop);
+        if let Some(monitor) = monitor {
+            attrs =
+                attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+        }
         let mut win = self.make_window(el, attrs, true);
         win.display = id;
         win
@@ -439,32 +534,56 @@ impl App {
         macos::activate();
     }
 
-    fn make_window(&mut self, el: &ActiveEventLoop, attrs: winit::window::WindowAttributes, overlay: bool) -> Win {
+    fn make_window(
+        &mut self,
+        el: &ActiveEventLoop,
+        attrs: winit::window::WindowAttributes,
+        overlay: bool,
+    ) -> Win {
         let window = Arc::new(el.create_window(attrs).expect("create window"));
+        if !overlay {
+            if let Some(icon) = Self::app_icon() {
+                window.set_window_icon(Some(icon));
+            }
+        }
         let surface = match &self.gpu {
             Some(g) => g.instance.create_surface(window.clone()).expect("surface"),
             None => {
-                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+                let instance = wgpu::Instance::new(
+                    wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+                );
                 let s = instance.create_surface(window.clone()).expect("surface");
-                let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    compatible_surface: Some(&s),
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    ..Default::default()
-                }))
-                .expect("no compatible GPU adapter");
-                let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: Some("cam"),
-                    required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
-                    ..Default::default()
-                }))
-                .expect("create device");
-                self.gpu = Some(Gpu { instance, adapter, device, queue });
+                let adapter =
+                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                        compatible_surface: Some(&s),
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        ..Default::default()
+                    }))
+                    .expect("no compatible GPU adapter");
+                let (device, queue) =
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("cam"),
+                        required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+                        ..Default::default()
+                    }))
+                    .expect("create device");
+                self.gpu = Some(Gpu {
+                    instance,
+                    adapter,
+                    device,
+                    queue,
+                });
                 s
             }
         };
         let g = self.gpu.as_ref().unwrap();
         let caps = surface.get_capabilities(&g.adapter);
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let px = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -474,10 +593,13 @@ impl App {
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: if overlay {
-                [wgpu::CompositeAlphaMode::PreMultiplied, wgpu::CompositeAlphaMode::PostMultiplied]
-                    .into_iter()
-                    .find(|m| caps.alpha_modes.contains(m))
-                    .unwrap_or(caps.alpha_modes[0])
+                [
+                    wgpu::CompositeAlphaMode::PreMultiplied,
+                    wgpu::CompositeAlphaMode::PostMultiplied,
+                ]
+                .into_iter()
+                .find(|m| caps.alpha_modes.contains(m))
+                .unwrap_or(caps.alpha_modes[0])
             } else {
                 caps.alpha_modes[0]
             },
@@ -485,7 +607,8 @@ impl App {
             color_space: Default::default(),
         };
         surface.configure(&g.device, &config);
-        let renderer = egui_wgpu::Renderer::new(&g.device, format, egui_wgpu::RendererOptions::default());
+        let renderer =
+            egui_wgpu::Renderer::new(&g.device, format, egui_wgpu::RendererOptions::default());
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let egui = egui_winit::State::new(
@@ -500,7 +623,17 @@ impl App {
             crate::platform::windows::WindowsOsBackend::style_window(&window);
         }
         window.request_redraw();
-        Win { window, surface, config, egui, ctx, renderer, repaint_at: None, overlay, display: 0 }
+        Win {
+            window,
+            surface,
+            config,
+            egui,
+            ctx,
+            renderer,
+            repaint_at: None,
+            overlay,
+            display: 0,
+        }
     }
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
@@ -536,7 +669,11 @@ impl App {
     fn bind_hotkeys(&mut self) {
         let hk = self.settings.hotkeys.clone();
         let mut failed = vec![];
-        for (slot, combo, cmd) in [(1, hk.record, Cmd::ToggleRecording), (2, hk.pause, Cmd::TogglePause), (3, hk.cancel, Cmd::Cancel)] {
+        for (slot, combo, cmd) in [
+            (1, hk.record, Cmd::ToggleRecording),
+            (2, hk.pause, Cmd::TogglePause),
+            (3, hk.cancel, Cmd::Cancel),
+        ] {
             match combo {
                 Some(c) => {
                     if let Err(code) = hotkey::bind(slot, c, move || push(cmd.clone())) {
@@ -548,10 +685,16 @@ impl App {
             }
         }
         if let Some(m) = &self.menubar {
-            m.set_hotkey(&hk.record_label(), !failed.iter().any(|l| *l == hk.record_label()));
+            m.set_hotkey(
+                &hk.record_label(),
+                !failed.iter().any(|l| *l == hk.record_label()),
+            );
         }
         if !failed.is_empty() {
-            self.error = Some(format!("Another app already uses {} — pick a different shortcut.", failed.join(", ")));
+            self.error = Some(format!(
+                "Another app already uses {} — pick a different shortcut.",
+                failed.join(", ")
+            ));
         }
     }
 
@@ -560,10 +703,30 @@ impl App {
         // CAM_SELFTEST_REAL records the main display (to check what ends up
         // in a real recording, e.g. that the control bar doesn't).
         if self.selftest.is_some() && std::env::var_os("CAM_SELFTEST_REAL").is_some() {
-            return recorder::Options { target: Target::Display { id: 0 }, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()), ..Default::default() };
+            return recorder::Options {
+                target: Target::Display { id: 0 },
+                system_audio: std::env::var_os("CAM_SELFTEST_SYSTEM").is_some(),
+                mic: s.mic.then_some(None),
+                camera: s.camera.then_some(None),
+                fps: 60,
+                keys: false,
+                dir: s.dir(),
+                name: Some("Selftest".into()),
+                ..Default::default()
+            };
         }
         if self.selftest.is_some() {
-            return recorder::Options { target: Target::Pattern, system_audio: false, mic: None, camera: None, fps: 60, keys: false, dir: s.dir(), name: Some("Selftest".into()), ..Default::default() };
+            return recorder::Options {
+                target: Target::Pattern,
+                system_audio: false,
+                mic: None,
+                camera: None,
+                fps: 60,
+                keys: false,
+                dir: s.dir(),
+                name: Some("Selftest".into()),
+                ..Default::default()
+            };
         }
         let target = match s.source {
             SourceKind::Display => Target::Display { id: s.display },
@@ -601,14 +764,38 @@ impl App {
             return;
         }
         self.error = None;
+        self.close_camera_monitor();
+        if let Err(error) = self
+            .live
+            .screen
+            .stop()
+            .and_then(|_| self.live.camera.stop())
+            .and_then(|_| self.live.mic.stop())
+        {
+            self.error = Some(error);
+            return;
+        }
+        self.live.tex = None;
+        self.live.screen_cpu_tex = None;
+        self.live.cam_tex = None;
         if !self.scripted() {
             self.settings.save();
         }
         if let View::Editor(ed) = &mut self.view {
+            if ed.is_playing() {
+                ed.toggle_play();
+            }
+            ed.stop_voiceover();
             ed.save();
         }
-        let countdown = self.settings.countdown.then(|| Instant::now() + Duration::from_secs(3));
-        self.recording = Some(Recording { rec: None, countdown_until: countdown });
+        let countdown = self
+            .settings
+            .countdown
+            .then(|| Instant::now() + Duration::from_secs(3));
+        self.recording = Some(Recording {
+            rec: None,
+            countdown_until: countdown,
+        });
         if let Some(w) = &self.main {
             w.window.set_visible(false);
         }
@@ -617,16 +804,37 @@ impl App {
             && let Some(mtm) = objc2::MainThreadMarker::new()
         {
             let hk = &self.settings.hotkeys;
-            let display = if matches!(self.settings.source, SourceKind::Display | SourceKind::Area) { self.settings.display } else { 0 };
+            let display = if matches!(self.settings.source, SourceKind::Display | SourceKind::Area)
+            {
+                self.settings.display
+            } else {
+                0
+            };
             let pause = hk.pause.map(|c| c.label()).unwrap_or_default();
-            self.bar = Some(recbar::RecordBar::new(mtm, display, self.bar_origin, &hk.record_label(), &pause));
+            self.bar = Some(recbar::RecordBar::new(
+                mtm,
+                display,
+                self.bar_origin,
+                &hk.record_label(),
+                &pause,
+            ));
         }
         #[cfg(not(target_os = "macos"))]
         if self.bar.is_none() {
             let hk = &self.settings.hotkeys;
-            let display = if matches!(self.settings.source, SourceKind::Display | SourceKind::Area) { self.settings.display } else { 0 };
+            let display = if matches!(self.settings.source, SourceKind::Display | SourceKind::Area)
+            {
+                self.settings.display
+            } else {
+                0
+            };
             let pause = hk.pause.map(|c| c.label()).unwrap_or_default();
-            self.bar = Some(recbar::RecordBar::new(display, self.bar_origin, &hk.record_label(), &pause));
+            self.bar = Some(recbar::RecordBar::new(
+                display,
+                self.bar_origin,
+                &hk.record_label(),
+                &pause,
+            ));
         }
         if countdown.is_none() {
             self.begin_capture();
@@ -653,7 +861,9 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
-        let Some(rec) = self.recording.take() else { return };
+        let Some(rec) = self.recording.take() else {
+            return;
+        };
         self.close_bar();
         let Some(r) = rec.rec else {
             push(Cmd::ShowWindow);
@@ -663,7 +873,9 @@ impl App {
         let done = self.finished.clone();
         std::thread::spawn(move || {
             #[cfg(target_os = "macos")]
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| objc2::rc::autoreleasepool(|_| r.stop())));
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                objc2::rc::autoreleasepool(|_| r.stop())
+            }));
             #[cfg(not(target_os = "macos"))]
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.stop()));
             let res = res
@@ -677,7 +889,10 @@ impl App {
     /// Discard the current recording (if any). `restarting` keeps the main
     /// window hidden and finishes the cancel before a new one starts.
     fn cancel_recording(&mut self, restarting: bool) {
-        let Some(rec) = self.recording.take() else { return };
+        let Some(rec) = self.recording.take() else {
+            return;
+        };
+        self.close_camera_monitor();
         if let Some(r) = rec.rec {
             #[cfg(target_os = "macos")]
             if restarting {
@@ -701,9 +916,65 @@ impl App {
 
     /// Remove the recording bar, remembering where it was.
     fn close_bar(&mut self) {
+        self.close_camera_monitor();
         if let Some(b) = self.bar.take() {
             self.bar_origin = Some(b.origin());
         }
+    }
+
+    fn close_camera_monitor(&mut self) {
+        self.camera_window = None;
+        self.camera_monitor = camera_preview::Preview::default();
+    }
+
+    fn update_camera_monitor(&mut self, el: &ActiveEventLoop) {
+        let active = self.recording.as_ref().is_some_and(|r| r.rec.is_some())
+            && self.settings.camera
+            && self.settings.show_camera_while_recording;
+        if !active {
+            self.close_camera_monitor();
+            return;
+        }
+        if self.camera_monitor.hidden || self.camera_window.is_some() {
+            return;
+        }
+        use winit::platform::windows::WindowAttributesExtWindows;
+        let (id, x, y, w, h) = macos::display_frame(self.settings.display);
+        use winit::platform::windows::MonitorHandleExtWindows;
+        let scale = el
+            .available_monitors()
+            .find(|m| m.hmonitor() as u32 == id)
+            .map_or(1.0, |m| m.scale_factor());
+        let attrs = Window::default_attributes()
+            .with_title("Cam camera preview")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_active(false)
+            .with_visible(false)
+            .with_skip_taskbar(true)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size(winit::dpi::LogicalSize::new(234.0, 294.0))
+            .with_position(winit::dpi::PhysicalPosition::new(
+                (x + w - 258.0 * scale).max(x) as i32,
+                (y + h - 410.0 * scale).max(y) as i32,
+            ));
+        let window = self.make_window(el, attrs, true);
+        if let Err(error) = camera_preview::configure(&window.window) {
+            self.error = Some(format!("Couldn't show camera preview: {error:#}"));
+            eprintln!("Cam camera preview: {error:#}");
+            self.camera_monitor.hidden = true;
+            return;
+        }
+        window.window.set_visible(true);
+        // Winit reapplies its extended styles when showing a hidden window.
+        // Restore the monitor's non-activation flags after that transition too.
+        if let Err(error) = camera_preview::configure(&window.window) {
+            self.error = Some(format!("Couldn't show camera preview: {error:#}"));
+            self.camera_monitor.hidden = true;
+            return;
+        }
+        self.camera_window = Some(window);
     }
 
     fn handle(&mut self, el: &ActiveEventLoop, c: Cmd) {
@@ -754,12 +1025,37 @@ impl App {
                 // Start from the saved area when it was on this display,
                 // trimmed to it.
                 let same_display = macos::display_frame(s.display).0 == id;
-                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(dw as f32, dh as f32));
-                let rect = (same_display && s.source == SourceKind::Area && s.area[2] > 8.0 && s.area[3] > 8.0)
-                    .then(|| egui::Rect::from_min_size(egui::pos2(s.area[0] as f32, s.area[1] as f32), vec2(s.area[2] as f32, s.area[3] as f32)).intersect(screen))
+                let screen =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(dw as f32, dh as f32));
+                let rect = (same_display
+                    && s.source == SourceKind::Area
+                    && s.area[2] > 8.0
+                    && s.area[3] > 8.0)
+                    .then(|| {
+                        egui::Rect::from_min_size(
+                            egui::pos2(s.area[0] as f32, s.area[1] as f32),
+                            vec2(s.area[2] as f32, s.area[3] as f32),
+                        )
+                        .intersect(screen)
+                    })
                     .filter(|r| r.width() > 8.0 && r.height() > 8.0);
-                self.area = AreaPick { rect, drag: None, record_after, display: id, closed: false, windows: None };
+                self.area = AreaPick {
+                    rect,
+                    pixels_per_point: 1.0,
+                    drag: None,
+                    record_after,
+                    display: id,
+                    closed: false,
+                    windows: None,
+                };
                 self.open_overlays(el, id);
+                if let Some(w) = self.overlays.iter().find(|w| w.display == id) {
+                    let scale = w.window.scale_factor();
+                    self.area.pixels_per_point = scale;
+                    self.area.rect = self.area.rect.map(|r| {
+                        egui::Rect::from_min_max(r.min / scale as f32, r.max / scale as f32)
+                    });
+                }
             }
             Cmd::SelectWindow(record_after) => {
                 if self.recording.is_some() {
@@ -768,8 +1064,19 @@ impl App {
                 // Pick on the display under the pointer.
                 let display = macos::display_under_pointer();
                 let (id, ..) = macos::display_frame(display);
-                let windows = Some(WindowMode { list: winpick::list_all(), ..Default::default() });
-                self.area = AreaPick { rect: None, drag: None, record_after, display: id, closed: false, windows };
+                let windows = Some(WindowMode {
+                    list: winpick::list_all(),
+                    ..Default::default()
+                });
+                self.area = AreaPick {
+                    rect: None,
+                    pixels_per_point: 1.0,
+                    drag: None,
+                    record_after,
+                    display: id,
+                    closed: false,
+                    windows,
+                };
                 self.open_overlays(el, id);
             }
             Cmd::Quit => {
@@ -780,7 +1087,10 @@ impl App {
                     self.stop_recording();
                 }
                 let deadline = Instant::now() + Duration::from_secs(60);
-                while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
+                while self.finishing
+                    && self.finished.lock().unwrap().is_none()
+                    && Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 el.exit();
@@ -806,6 +1116,7 @@ impl App {
             self.error = Some(format!("Recording stopped: {e}"));
             self.stop_recording();
         }
+        self.update_camera_monitor(el);
         let done = self.finished.lock().unwrap().take();
         if let Some(res) = done {
             self.finishing = false;
@@ -827,18 +1138,38 @@ impl App {
         self.playtest_step();
         let clock = match &self.recording {
             Some(Recording { rec: Some(r), .. }) => crate::capture::record::clock(r.elapsed()),
-            Some(Recording { countdown_until: Some(t), .. }) => format!("{}", t.saturating_duration_since(Instant::now()).as_secs() + 1),
+            Some(Recording {
+                countdown_until: Some(t),
+                ..
+            }) => format!(
+                "{}",
+                t.saturating_duration_since(Instant::now()).as_secs() + 1
+            ),
             _ => String::new(),
         };
-        let paused = matches!(&self.recording, Some(Recording { rec: Some(r), .. }) if r.is_paused());
+        let paused =
+            matches!(&self.recording, Some(Recording { rec: Some(r), .. }) if r.is_paused());
         if let Some(b) = &mut self.bar {
             b.update(match &self.recording {
-                Some(Recording { rec: None, countdown_until: Some(t) }) => recbar::State::Countdown(t.saturating_duration_since(Instant::now()).as_secs() + 1),
-                _ => recbar::State::Recording { clock: clock.clone(), paused },
+                Some(Recording {
+                    rec: None,
+                    countdown_until: Some(t),
+                }) => recbar::State::Countdown(
+                    t.saturating_duration_since(Instant::now()).as_secs() + 1,
+                ),
+                _ => recbar::State::Recording {
+                    clock: clock.clone(),
+                    paused,
+                },
             });
         }
         if let Some(m) = &mut self.menubar {
-            m.update(&menubar::View { recording: self.recording.is_some(), paused, finishing: self.finishing, clock: &clock });
+            m.update(&menubar::View {
+                recording: self.recording.is_some(),
+                paused,
+                finishing: self.finishing,
+                clock: &clock,
+            });
         }
     }
 
@@ -853,6 +1184,7 @@ impl App {
         let since = pt.at.elapsed();
         let fail = |msg: String| {
             plog(&format!("FAIL {msg}"));
+            hotkey::shutdown();
             std::process::exit(1);
         };
         if pt.started.elapsed() > Duration::from_secs(90) {
@@ -868,7 +1200,11 @@ impl App {
         }
         let View::Editor(ed) = &mut self.view else {
             if since > Duration::from_secs(10) {
-                fail(format!("couldn't open {}: {:?}", pt.path.display(), self.error));
+                fail(format!(
+                    "couldn't open {}: {:?}",
+                    pt.path.display(),
+                    self.error
+                ));
             }
             return;
         };
@@ -892,26 +1228,44 @@ impl App {
                 ed.playhead = 0.0;
                 ed.toggle_play();
                 ed.audio.reset_meter();
-                plog(&format!("playing {} ({:.1} s)", pt.path.display(), ed.duration() / 1000.0));
+                plog(&format!(
+                    "playing {} ({:.1} s)",
+                    pt.path.display(),
+                    ed.duration() / 1000.0
+                ));
                 pt.phase = 2;
                 pt.at = Instant::now();
             }
             2 => {
                 if since > Duration::from_millis(500) {
-                    pt.max_drift = pt.max_drift.max((ed.audio.position_ms() - ed.playhead_now()).abs());
+                    pt.max_drift = pt
+                        .max_drift
+                        .max((ed.audio.position_ms() - ed.playhead_now()).abs());
                 }
                 if since.as_secs_f64() >= pt.secs {
                     let m = ed.audio.meter();
                     pt.loud_db = m.rms_db();
-                    plog(&format!("output frames={} rms={:.1} dBFS peak={:.3} max_drift={:.0} ms", m.frames, m.rms_db(), m.peak, pt.max_drift));
+                    plog(&format!(
+                        "output frames={} rms={:.1} dBFS peak={:.3} max_drift={:.0} ms",
+                        m.frames,
+                        m.rms_db(),
+                        m.peak,
+                        pt.max_drift
+                    ));
                     if (m.frames as f64) < pt.secs * 0.7 * 44_100.0 {
-                        fail(format!("the output only rendered {} frames in {:.1} s", m.frames, pt.secs));
+                        fail(format!(
+                            "the output only rendered {} frames in {:.1} s",
+                            m.frames, pt.secs
+                        ));
                     }
                     if pt.loud_db < -45.0 {
                         fail(format!("playback is silent ({:.1} dBFS)", pt.loud_db));
                     }
                     if pt.max_drift > 80.0 {
-                        fail(format!("audio drifted {:.0} ms from the playhead", pt.max_drift));
+                        fail(format!(
+                            "audio drifted {:.0} ms from the playhead",
+                            pt.max_drift
+                        ));
                     }
                     let v = pt.volume;
                     edit(ed, &|a| a.volume = v * 0.25);
@@ -930,7 +1284,10 @@ impl App {
                     return;
                 };
                 let want = 20.0 * (0.25 * pt.volume).log10() as f32;
-                plog(&format!("volume x0.25 rms={:.1} dBFS, {gain:.1} dB relative to the soundtrack (want {want:.1})", m.rms_db()));
+                plog(&format!(
+                    "volume x0.25 rms={:.1} dBFS, {gain:.1} dB relative to the soundtrack (want {want:.1})",
+                    m.rms_db()
+                ));
                 if (gain - want).abs() > 2.0 {
                     fail("the volume didn't change what's heard".into());
                 }
@@ -950,7 +1307,11 @@ impl App {
             }
             5 if since > Duration::from_millis(600) => {
                 let m = ed.audio.meter();
-                plog(&format!("muted rms={:.1} dBFS frames={}", m.rms_db(), m.frames));
+                plog(&format!(
+                    "muted rms={:.1} dBFS frames={}",
+                    m.rms_db(),
+                    m.frames
+                ));
                 if m.rms_db() > -70.0 || m.frames == 0 {
                     fail("mute didn't silence playback".into());
                 }
@@ -974,21 +1335,40 @@ impl App {
                     }
                     return;
                 };
-                plog(&format!("unmuted rms={:.1} dBFS, {gain:.1} dB relative to the soundtrack", m.rms_db()));
+                plog(&format!(
+                    "unmuted rms={:.1} dBFS, {gain:.1} dB relative to the soundtrack",
+                    m.rms_db()
+                ));
                 if m.rms_db() < -70.0 {
                     fail("unmuting didn't bring the sound back".into());
                 }
-                let to = ed.duration() * 0.5;
+                let fraction = std::env::var("CAM_PLAYTEST_SEEK_FRACTION")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && (0.0..1.0).contains(v))
+                    .unwrap_or(0.5);
+                let to = ed.duration() * fraction;
                 ed.seek(to);
+                ed.audio.reset_meter();
                 pt.phase = 8;
                 pt.at = Instant::now();
             }
             8 if since > Duration::from_millis(400) => {
                 let now = ed.playhead_now();
                 let drift = ed.audio.position_ms() - now;
-                plog(&format!("after seek audio={:.0} ms playhead={now:.0} ms", ed.audio.position_ms()));
+                plog(&format!(
+                    "after seek audio={:.0} ms playhead={now:.0} ms",
+                    ed.audio.position_ms()
+                ));
                 if drift.abs() > 80.0 {
-                    fail(format!("audio is {drift:.0} ms off the playhead after a seek"));
+                    fail(format!(
+                        "audio is {drift:.0} ms off the playhead after a seek"
+                    ));
+                }
+                if std::env::var_os("CAM_PLAYTEST_REQUIRE_SEEK_AUDIO").is_some()
+                    && ed.audio.meter().source_rms < 1e-5
+                {
+                    fail("the soundtrack is silent after seeking".into());
                 }
                 ed.toggle_play();
                 ed.looping = false;
@@ -1005,6 +1385,7 @@ impl App {
         let since = st.at.elapsed();
         let fail = |msg: String| {
             log(&format!("FAIL {msg}"));
+            hotkey::shutdown();
             std::process::exit(1);
         };
         if since > Duration::from_secs(120) {
@@ -1016,12 +1397,17 @@ impl App {
                 // The display's live preview fills the canvas (when Screen
                 // Recording is allowed); give it a few seconds to arrive.
                 self.settings.source = SourceKind::Display;
-                let screen = crate::capture::tcc::screen_status() == crate::capture::tcc::Status::Granted;
+                let screen =
+                    crate::capture::tcc::screen_status() == crate::capture::tcc::Status::Granted;
                 if screen && self.live.tex.is_none() && since < Duration::from_secs(6) {
                     return;
                 }
                 let live = self.live.tex.map(|t| t.1);
-                log(&format!("launched main_window={} menubar={} start_view={start} live_preview={live:?}", self.main.is_some(), self.menubar.is_some()));
+                log(&format!(
+                    "launched main_window={} menubar={} start_view={start} live_preview={live:?}",
+                    self.main.is_some(),
+                    self.menubar.is_some()
+                ));
                 if !start {
                     fail("didn't open on recording setup".into());
                 }
@@ -1033,25 +1419,69 @@ impl App {
                 push(Cmd::SelectArea(false));
             }
             10 if since > Duration::from_millis(600) => {
-                let Some(w) = self.overlays.iter().find(|w| w.display == self.area.display) else {
+                let Some(w) = self
+                    .overlays
+                    .iter()
+                    .find(|w| w.display == self.area.display)
+                else {
                     fail("area picker did not open".into());
                     return;
                 };
+                for overlay in &self.overlays {
+                    let (_, _, _, width, height) = macos::display_frame(overlay.display);
+                    let actual = overlay.window.inner_size();
+                    log(&format!(
+                        "picker display={} dpi_scale={} size={}x{} expected={}x{}",
+                        overlay.display,
+                        overlay.window.scale_factor(),
+                        actual.width,
+                        actual.height,
+                        width,
+                        height
+                    ));
+                    if (actual.width, actual.height) != (width as u32, height as u32) {
+                        fail("picker does not cover the full display".into());
+                    }
+                }
                 let size = w.window.inner_size();
-                log(&format!("area picker open {}x{} px, {} displays covered", size.width, size.height, self.overlays.len()));
-                if let (Some(dir), Some(num)) = (std::env::var_os("CAM_SELFTEST_SHOTS"), macos::window_number(&w.window)) {
+                log(&format!(
+                    "area picker open {}x{} px, {} displays covered",
+                    size.width,
+                    size.height,
+                    self.overlays.len()
+                ));
+                if let (Some(dir), Some(num)) = (
+                    std::env::var_os("CAM_SELFTEST_SHOTS"),
+                    macos::window_number(&w.window),
+                ) {
                     let out = PathBuf::from(dir).join("area-picker.png");
-                    let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
+                    let ok = std::process::Command::new("screencapture")
+                        .args(["-x", "-o", "-l", &num.to_string()])
+                        .arg(&out)
+                        .status()
+                        .is_ok_and(|s| s.success());
                     log(&format!("area picker screenshot {} ok={ok}", out.display()));
                 }
                 st.phase = 11;
                 st.at = Instant::now();
-                self.finish_area(Some(egui::Rect::from_min_size(egui::pos2(200.0, 150.0), vec2(640.0, 400.0))));
+                let ppp = self.area.pixels_per_point.max(1.0) as f32;
+                self.finish_area(Some(egui::Rect::from_min_size(
+                    egui::pos2(200.0 / ppp, 150.0 / ppp),
+                    vec2(640.0 / ppp, 400.0 / ppp),
+                )));
             }
             11 if since > Duration::from_millis(300) => {
                 let a = self.settings.area;
-                log(&format!("area saved source={:?} area={:?} overlay_closed={}", self.settings.source, a, self.overlays.is_empty()));
-                if self.settings.source != SourceKind::Area || a != [200.0, 150.0, 640.0, 400.0] || !self.overlays.is_empty() {
+                log(&format!(
+                    "area saved source={:?} area={:?} overlay_closed={}",
+                    self.settings.source,
+                    a,
+                    self.overlays.is_empty()
+                ));
+                if self.settings.source != SourceKind::Area
+                    || a != [200.0, 150.0, 640.0, 400.0]
+                    || !self.overlays.is_empty()
+                {
                     fail("area picker result".into());
                 }
                 st.phase = 12;
@@ -1066,20 +1496,40 @@ impl App {
                 // Highlight the frontmost window first (as a click would), then
                 // check again after it has been drawn.
                 if wm.selected.is_none() && !wm.list.is_empty() {
-                    wm.selected = wm.list.iter().find(|x| x.display == w.display).or(wm.list.first()).map(|x| x.entry.id);
+                    wm.selected = wm
+                        .list
+                        .iter()
+                        .find(|x| x.display == w.display)
+                        .or(wm.list.first())
+                        .map(|x| x.entry.id);
                     for o in &self.overlays {
                         o.window.request_redraw();
                     }
                     st.at = Instant::now();
                     return;
                 }
-                log(&format!("window picker open on {} displays with {} windows, selected {:?}", self.overlays.len(), wm.list.len(), wm.selected));
+                log(&format!(
+                    "window picker open on {} displays with {} windows, selected {:?}",
+                    self.overlays.len(),
+                    wm.list.len(),
+                    wm.selected
+                ));
                 if let Some(dir) = std::env::var_os("CAM_SELFTEST_SHOTS") {
                     for o in &self.overlays {
-                        let Some(num) = macos::window_number(&o.window) else { continue };
-                        let out = PathBuf::from(&dir).join(format!("window-picker-{}.png", o.display));
-                        let ok = std::process::Command::new("screencapture").args(["-x", "-o", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
-                        log(&format!("window picker screenshot {} ok={ok}", out.display()));
+                        let Some(num) = macos::window_number(&o.window) else {
+                            continue;
+                        };
+                        let out =
+                            PathBuf::from(&dir).join(format!("window-picker-{}.png", o.display));
+                        let ok = std::process::Command::new("screencapture")
+                            .args(["-x", "-o", "-l", &num.to_string()])
+                            .arg(&out)
+                            .status()
+                            .is_ok_and(|s| s.success());
+                        log(&format!(
+                            "window picker screenshot {} ok={ok}",
+                            out.display()
+                        ));
                     }
                 }
                 st.phase = 13;
@@ -1087,7 +1537,11 @@ impl App {
                 self.finish_window(None);
             }
             13 if since > Duration::from_millis(300) => {
-                log(&format!("window picker cancelled overlay_closed={} source={:?}", self.overlays.is_empty(), self.settings.source));
+                log(&format!(
+                    "window picker cancelled overlay_closed={} source={:?}",
+                    self.overlays.is_empty(),
+                    self.settings.source
+                ));
                 if !self.overlays.is_empty() || self.settings.source != SourceKind::Area {
                     fail("window picker cancel".into());
                 }
@@ -1104,6 +1558,7 @@ impl App {
                 if let Some(Recording { rec: Some(r), .. }) = &self.recording {
                     match st.paused_at {
                         None if r.elapsed() >= 1.0 => {
+                            st.preview_frames_at_pause = self.camera_monitor.frames;
                             st.paused_at = Some(Instant::now());
                             push(Cmd::TogglePause);
                         }
@@ -1112,26 +1567,69 @@ impl App {
                             if !r.is_paused() {
                                 fail("pause had no effect".into());
                             }
+                            if self.settings.show_camera_while_recording
+                                && !self.camera_monitor.hidden
+                                && self.camera_monitor.frames <= st.preview_frames_at_pause
+                            {
+                                fail("camera preview stopped updating while paused".into());
+                            }
                             st.resumed = true;
                             push(Cmd::TogglePause);
                         }
                         _ => {}
                     }
                     if st.resumed && r.elapsed() >= 3.0 {
-                        let live = self.live.screen.active() || self.live.camera.active() || self.live.mic.active();
-                        let bar = self.bar.as_ref().map(|b| (b.window_number(), b.draggable()));
-                        let at = self.bar.as_ref().map(|b| (b.origin().x.round(), b.origin().y.round()));
-                        log(&format!("recording bar={bar:?} origin={at:?} elapsed={:.1}s live_preview_running={live}", r.elapsed()));
-                        if let (Some(dir), Some((num, _))) = (std::env::var_os("CAM_SELFTEST_SHOTS"), bar) {
+                        let live = self.live.screen.active()
+                            || self.live.camera.active()
+                            || self.live.mic.active();
+                        let bar = self
+                            .bar
+                            .as_ref()
+                            .map(|b| (b.window_number(), b.draggable()));
+                        let at = self
+                            .bar
+                            .as_ref()
+                            .map(|b| (b.origin().x.round(), b.origin().y.round()));
+                        log(&format!(
+                            "recording bar={bar:?} origin={at:?} elapsed={:.1}s live_preview_running={live}",
+                            r.elapsed()
+                        ));
+                        if let (Some(dir), Some((num, _))) =
+                            (std::env::var_os("CAM_SELFTEST_SHOTS"), bar)
+                        {
                             let out = PathBuf::from(dir).join("record-bar.png");
-                            let ok = std::process::Command::new("screencapture").args(["-x", "-l", &num.to_string()]).arg(&out).status().is_ok_and(|s| s.success());
-                            log(&format!("recording bar screenshot {} ok={ok}", out.display()));
+                            let ok = std::process::Command::new("screencapture")
+                                .args(["-x", "-l", &num.to_string()])
+                                .arg(&out)
+                                .status()
+                                .is_ok_and(|s| s.success());
+                            log(&format!(
+                                "recording bar screenshot {} ok={ok}",
+                                out.display()
+                            ));
                         }
                         if bar.is_none_or(|(_, draggable)| !draggable) {
                             fail("recording bar missing or not draggable".into());
                         }
                         if live {
                             fail("live preview kept running while recording".into());
+                        }
+                        if self.settings.show_camera_while_recording {
+                            log(&format!(
+                                "camera monitor visible={} frames={}",
+                                self.camera_window.is_some(),
+                                self.camera_monitor.frames
+                            ));
+                            let expected_hidden =
+                                std::env::var_os("CAM_SELFTEST_HIDE_CAMERA_PREVIEW").is_some();
+                            if (self.camera_window.is_none() != expected_hidden)
+                                || (self.camera_monitor.hidden != expected_hidden)
+                                || self.camera_monitor.frames < 5
+                            {
+                                fail("floating camera preview did not deliver frames".into());
+                            }
+                        } else if self.camera_window.is_some() {
+                            fail("camera monitor shown with option disabled".into());
                         }
                         st.phase = 2;
                         push(Cmd::ToggleRecording);
@@ -1142,6 +1640,9 @@ impl App {
                 }
             }
             2 => {
+                if self.camera_window.is_some() {
+                    fail("camera preview survived stop".into());
+                }
                 if let Some(e) = &self.error {
                     fail(e.clone());
                 }
@@ -1165,7 +1666,10 @@ impl App {
                     match res {
                         Ok((path, stats)) => {
                             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                            log(&format!("exported {} bytes={size} {stats:?}", path.display()));
+                            log(&format!(
+                                "exported {} bytes={size} {stats:?}",
+                                path.display()
+                            ));
                             if size == 0 {
                                 fail("empty export".into());
                             }
@@ -1181,7 +1685,11 @@ impl App {
             // popover; reopen it from there.
             4 if since > Duration::from_millis(300) => {
                 let first = self.projects.first().map(|p| p.path.clone());
-                log(&format!("back start_view={} recent={:?}", matches!(self.view, View::Start), first.as_ref().map(|p| p.display().to_string())));
+                log(&format!(
+                    "back start_view={} recent={:?}",
+                    matches!(self.view, View::Start),
+                    first.as_ref().map(|p| p.display().to_string())
+                ));
                 if !matches!(self.view, View::Start) || first.is_none() || first != st.package {
                     fail("back to recording setup / recents".into());
                 }
@@ -1228,7 +1736,15 @@ impl App {
         let action = match &mut self.view {
             View::Start => {
                 let live = self.live_view(ui.ctx(), renderer);
-                home::start_view(ui, &mut self.settings, &mut self.devices, &self.projects, &mut self.thumbs, note.as_deref(), &live)
+                home::start_view(
+                    ui,
+                    &mut self.settings,
+                    &mut self.devices,
+                    &self.projects,
+                    &mut self.thumbs,
+                    note.as_deref(),
+                    &live,
+                )
             }
             View::Editor(ed) => {
                 let mut chrome = home::Chrome {
@@ -1257,8 +1773,12 @@ impl App {
     fn handle_action(&mut self, action: home::Action) {
         match action {
             // Area recordings confirm the region first.
-            home::Action::Record if self.settings.source == SourceKind::Area => push(Cmd::SelectArea(true)),
-            home::Action::Record if self.settings.source == SourceKind::Window && self.settings.window.is_none() => {
+            home::Action::Record if self.settings.source == SourceKind::Area => {
+                push(Cmd::SelectArea(true))
+            }
+            home::Action::Record
+                if self.settings.source == SourceKind::Window && self.settings.window.is_none() =>
+            {
                 push(Cmd::SelectWindow(true))
             }
             home::Action::SelectWindow => push(Cmd::SelectWindow(false)),
@@ -1275,7 +1795,9 @@ impl App {
             }
             home::Action::Open(p) => push(Cmd::Open(p)),
             home::Action::RequestPermissions => {
-                std::thread::spawn(|| crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60)));
+                std::thread::spawn(|| {
+                    crate::capture::tcc::request_all(true, false, false, Duration::from_secs(60))
+                });
             }
             home::Action::ResizeWindow { id, width, height } => {
                 let note = match crate::capture::winsize::resize(id, width as f64, height as f64) {
@@ -1296,7 +1818,11 @@ impl App {
     /// Whether recording setup is on screen with nothing being recorded
     /// (when its previews and meters run).
     fn setup_visible(&self) -> bool {
-        let visible = self.main.as_ref().is_some_and(|w| w.window.is_visible() != Some(false)) && !self.main_occluded;
+        let visible = self
+            .main
+            .as_ref()
+            .is_some_and(|w| w.window.is_visible() != Some(false))
+            && !self.main_occluded;
         matches!(self.view, View::Start) && visible && self.recording.is_none() && !self.finishing
     }
 
@@ -1308,14 +1834,22 @@ impl App {
         }
         let s = &self.settings;
         if s.source == SourceKind::Device {
-            return s.ios_device.clone().map(|id| livecap::Source::Device { id });
+            return s
+                .ios_device
+                .clone()
+                .map(|id| livecap::Source::Device { id });
         }
         if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted {
             return None;
         }
         match s.source {
             SourceKind::Display => Some(livecap::Source::Display { id: s.display }),
-            SourceKind::Area if s.area[2] >= 8.0 && s.area[3] >= 8.0 => Some(livecap::Source::Area { display: s.display, rect: s.area }),
+            SourceKind::Area if s.area[2] >= 8.0 && s.area[3] >= 8.0 => {
+                Some(livecap::Source::Area {
+                    display: s.display,
+                    rect: s.area,
+                })
+            }
             SourceKind::Window => s.window.map(|id| livecap::Source::Window { id }),
             _ => None,
         }
@@ -1333,22 +1867,40 @@ impl App {
             let audio = s.system_audio && !matches!(src, livecap::Source::Device { .. });
             (src, audio)
         });
-        let camera = (visible && s.camera).then(|| livecap::Source::Camera { id: s.camera_id.clone() });
-        let mic = (visible && s.mic && self.selftest.is_none()).then(|| s.mic_id.as_ref().and_then(|id| self.devices.mics.iter().find(|m| &m.id == id)).map(|m| m.name.clone()));
+        let camera = (visible && s.camera).then(|| livecap::Source::Camera {
+            id: s.camera_id.clone(),
+        });
+        let mic = (visible && s.mic && self.selftest.is_none()).then(|| {
+            s.mic_id
+                .as_ref()
+                .and_then(|id| self.devices.mics.iter().find(|m| &m.id == id))
+                .map(|m| m.name.clone())
+        });
         let live = &mut self.live;
         // Screens at native resolution, scaled to the canvas (30 fps, as Rec).
-        if live.screen.update(screen, "live preview", |(src, audio)| livecap::LivePreview::start(src, 0, 30, *audio, wake).map_err(|e| format!("{e:#}"))) {
+        if live.screen.update(screen, "live preview", |(src, audio)| {
+            livecap::LivePreview::start(src, 0, 30, *audio, wake).map_err(|e| format!("{e:#}"))
+        }) {
             live.tex = None;
+            live.screen_cpu_tex = None;
         }
-        if live.camera.update(camera, "camera preview", |src| livecap::LivePreview::start(src, 720, 30, false, wake).map_err(|e| format!("{e:#}"))) {
+        if live.camera.update(camera, "camera preview", |src| {
+            livecap::LivePreview::start(src, 720, 30, false, wake).map_err(|e| format!("{e:#}"))
+        }) {
             live.cam_tex = None;
         }
-        live.mic.update(mic, "mic meter", |name| crate::capture::meter::MicMeter::start(name.as_deref()).map_err(|e| format!("{e:#}")));
+        live.mic.update(mic, "mic meter", |name| {
+            crate::capture::meter::MicMeter::start(name.as_deref()).map_err(|e| format!("{e:#}"))
+        });
     }
 
     /// Newest preview frames into their textures, levels into the meters,
     /// and what the start view should show.
-    fn live_view(&mut self, ctx: &egui::Context, renderer: &mut egui_wgpu::Renderer) -> home::LiveView {
+    fn live_view(
+        &mut self,
+        ctx: &egui::Context,
+        renderer: &mut egui_wgpu::Renderer,
+    ) -> home::LiveView {
         let live = &mut self.live;
         if let (Some((_, p)), Some(gpu)) = (&live.screen.running, &self.gpu) {
             // Scaled to the canvas the start view last laid out, in pixels.
@@ -1365,7 +1917,12 @@ impl App {
                 let filter = wgpu::FilterMode::Nearest;
                 let id = match live.tex_id {
                     Some(id) => {
-                        renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &f.view, filter, id);
+                        renderer.update_egui_texture_from_wgpu_texture(
+                            &gpu.device,
+                            &f.view,
+                            filter,
+                            id,
+                        );
                         id
                     }
                     None => renderer.register_native_texture(&gpu.device, &f.view, filter),
@@ -1379,15 +1936,27 @@ impl App {
                 cache.flush();
             }
         }
-        let upload = |slot: &mut Option<egui::TextureHandle>, p: &livecap::LivePreview, name: &str| {
+        let upload = |slot: &mut Option<egui::TextureHandle>,
+                      p: &livecap::LivePreview,
+                      name: &str| {
             if let Some(f) = p.take_frame() {
-                let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [f.width as usize, f.height as usize],
+                    &f.rgba,
+                );
                 match slot {
                     Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                     None => *slot = Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR)),
                 }
             }
         };
+        if let Some((_, p)) = &live.screen.running {
+            upload(&mut live.screen_cpu_tex, p, "screen-preview");
+            if let Some(t) = &live.screen_cpu_tex {
+                let size = t.size();
+                live.tex = Some((t.id(), [size[0] as u32, size[1] as u32]));
+            }
+        }
         if let Some((_, p)) = &live.camera.running {
             upload(&mut live.cam_tex, p, "camera-preview");
         }
@@ -1402,17 +1971,26 @@ impl App {
         }
         let s = &self.settings;
         let ppp = ctx.pixels_per_point();
-        let screen = live.tex.filter(|_| live.screen.running.is_some()).map(|(id, [w, h])| (id, egui::vec2(w as f32, h as f32) / ppp));
+        let screen = live
+            .tex
+            .filter(|_| live.screen.running.is_some())
+            .map(|(id, [w, h])| (id, egui::vec2(w as f32, h as f32) / ppp));
         let note = if screen.is_some() {
             None
         } else if let Some(e) = live.screen.error() {
             Some(format!("Preview unavailable: {e}"))
         } else {
             match s.source {
-                SourceKind::Window if s.window.is_none() => Some("Choose a window to see it here.".into()),
-                SourceKind::Device if s.ios_device.is_none() => Some("Connect an iPhone or iPad to see it here.".into()),
+                SourceKind::Window if s.window.is_none() => {
+                    Some("Choose a window to see it here.".into())
+                }
+                SourceKind::Device if s.ios_device.is_none() => {
+                    Some("Connect an iPhone or iPad to see it here.".into())
+                }
                 SourceKind::Device => None,
-                _ if crate::capture::tcc::screen_status() != crate::capture::tcc::Status::Granted => {
+                _ if crate::capture::tcc::screen_status()
+                    != crate::capture::tcc::Status::Granted =>
+                {
                     Some("Allow screen capture for Cam to see a live preview.".into())
                 }
                 _ => None,
@@ -1420,7 +1998,11 @@ impl App {
         };
         home::LiveView {
             screen,
-            camera: live.cam_tex.as_ref().filter(|_| live.camera.running.is_some()).map(|t| (t.id(), t.size_vec2())),
+            camera: live
+                .cam_tex
+                .as_ref()
+                .filter(|_| live.camera.running.is_some())
+                .map(|t| (t.id(), t.size_vec2())),
             // Inputs that are on show a (possibly empty) meter.
             system_level: Some(live.levels[0]),
             mic_level: Some(live.levels[1]),
@@ -1447,6 +2029,9 @@ impl App {
     /// Picker overlay on `display`: the area picker, or the window picker.
     fn draw_overlay(&mut self, ui: &mut egui::Ui, display: u32) {
         use egui::{Align2, FontId, Pos2, Rect, Stroke, pos2};
+        if self.area.display == display {
+            self.area.pixels_per_point = ui.ctx().pixels_per_point() as f64;
+        }
         if self.area.windows.is_some() {
             self.draw_window_picker(ui, display);
             return;
@@ -1463,27 +2048,50 @@ impl App {
             }
         }
         if self.area.display != display {
-            ui.painter().rect_filled(full, 0.0, Color32::from_black_alpha(120));
+            ui.painter()
+                .rect_filled(full, 0.0, Color32::from_black_alpha(120));
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             let hint = "Drag to select an area  ·  Esc to cancel";
-            let galley = ui.painter().layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
-            let bg = Rect::from_center_size(pos2(full.center().x, full.top() + 60.0), galley.size() + vec2(28.0, 14.0));
-            ui.painter().rect_filled(bg, egui::CornerRadius::same(10), Color32::from_black_alpha(170));
-            ui.painter().galley(bg.center() - galley.size() / 2.0, galley, Color32::WHITE);
+            let galley = ui.painter().layout_no_wrap(
+                hint.into(),
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            let bg = Rect::from_center_size(
+                pos2(full.center().x, full.top() + 60.0),
+                galley.size() + vec2(28.0, 14.0),
+            );
+            ui.painter().rect_filled(
+                bg,
+                egui::CornerRadius::same(10),
+                Color32::from_black_alpha(170),
+            );
+            ui.painter()
+                .galley(bg.center() - galley.size() / 2.0, galley, Color32::WHITE);
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.finish_area(None);
             }
             return;
         }
         let a = &mut self.area;
-        let corners = |r: Rect| [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()];
+        let corners = |r: Rect| {
+            [
+                r.left_top(),
+                r.right_top(),
+                r.left_bottom(),
+                r.right_bottom(),
+            ]
+        };
         if resp.drag_started()
             && let Some(p) = pointer
         {
             a.drag = Some(match a.rect {
                 Some(r) => match corners(r).into_iter().find(|c| c.distance(p) < 12.0) {
                     // Resize from the opposite (anchored) corner.
-                    Some(c) => AreaDrag::Corner(pos2(r.left() + r.right() - c.x, r.top() + r.bottom() - c.y)),
+                    Some(c) => AreaDrag::Corner(pos2(
+                        r.left() + r.right() - c.x,
+                        r.top() + r.bottom() - c.y,
+                    )),
                     None if r.contains(p) => AreaDrag::Move(p - r.min),
                     None => AreaDrag::New(p),
                 },
@@ -1507,7 +2115,9 @@ impl App {
         }
         if resp.drag_stopped() {
             a.drag = None;
-            if a.rect.is_some_and(|r| r.width() < 16.0 || r.height() < 16.0) {
+            if a.rect
+                .is_some_and(|r| r.width() < 16.0 || r.height() < 16.0)
+            {
                 a.rect = None;
             }
         }
@@ -1517,18 +2127,54 @@ impl App {
         let dim = Color32::from_black_alpha(120);
         match a.rect {
             Some(r) => {
-                painter.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, r.top())), 0.0, dim);
-                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.bottom()), full.max), 0.0, dim);
-                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.top()), pos2(r.left(), r.bottom())), 0.0, dim);
-                painter.rect_filled(Rect::from_min_max(pos2(r.right(), r.top()), pos2(full.max.x, r.bottom())), 0.0, dim);
-                painter.rect_stroke(r, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
+                painter.rect_filled(
+                    Rect::from_min_max(full.min, pos2(full.max.x, r.top())),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(full.min.x, r.bottom()), full.max),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(full.min.x, r.top()), pos2(r.left(), r.bottom())),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(r.right(), r.top()), pos2(full.max.x, r.bottom())),
+                    0.0,
+                    dim,
+                );
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    Stroke::new(1.5, Color32::WHITE),
+                    egui::StrokeKind::Outside,
+                );
                 for c in corners(r) {
                     painter.circle(c, 5.0, Color32::WHITE, Stroke::new(1.0, theme::accent()));
                 }
                 let label = format!("{:.0} × {:.0}", r.width(), r.height());
-                let at = if r.top() > 30.0 { r.center_top() - vec2(0.0, 10.0) } else { r.center_top() + vec2(0.0, 18.0) };
-                painter.text(at, Align2::CENTER_BOTTOM, label, FontId::proportional(13.0), Color32::WHITE);
-                let hover = pointer.map(|p| (corners(r).iter().any(|c| c.distance(p) < 12.0), r.contains(p)));
+                let at = if r.top() > 30.0 {
+                    r.center_top() - vec2(0.0, 10.0)
+                } else {
+                    r.center_top() + vec2(0.0, 18.0)
+                };
+                painter.text(
+                    at,
+                    Align2::CENTER_BOTTOM,
+                    label,
+                    FontId::proportional(13.0),
+                    Color32::WHITE,
+                );
+                let hover = pointer.map(|p| {
+                    (
+                        corners(r).iter().any(|c| c.distance(p) < 12.0),
+                        r.contains(p),
+                    )
+                });
                 ui.ctx().set_cursor_icon(match hover {
                     Some((true, _)) => egui::CursorIcon::ResizeNwSe,
                     Some((false, true)) => egui::CursorIcon::Move,
@@ -1542,9 +2188,14 @@ impl App {
         }
         let hint = "Drag to select an area  ·  Return to confirm  ·  Esc to cancel";
         let hint_pos = pos2(full.center().x, full.top() + 60.0);
-        let galley = painter.layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
+        let galley =
+            painter.layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
         let bg = Rect::from_center_size(hint_pos, galley.size() + vec2(28.0, 14.0));
-        painter.rect_filled(bg, egui::CornerRadius::same(10), Color32::from_black_alpha(170));
+        painter.rect_filled(
+            bg,
+            egui::CornerRadius::same(10),
+            Color32::from_black_alpha(170),
+        );
         painter.galley(bg.center() - galley.size() / 2.0, galley, Color32::WHITE);
 
         // Buttons under the selection.
@@ -1553,19 +2204,32 @@ impl App {
         if let Some(r) = a.rect
             && a.drag.is_none()
         {
-            let y = if r.bottom() + 52.0 < full.bottom() { r.bottom() + 12.0 } else { r.bottom() - 44.0 };
+            let y = if r.bottom() + 52.0 < full.bottom() {
+                r.bottom() + 12.0
+            } else {
+                r.bottom() - 44.0
+            };
             let bar = Rect::from_min_size(Pos2::new(r.right() - 220.0, y), vec2(220.0, 32.0));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
-                let primary = if a.record_after { "Record" } else { "Use area" };
-                if widgets::primary(ui, primary).clicked() {
-                    confirm = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(bar)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                |ui| {
+                    let primary = if a.record_after { "Record" } else { "Use area" };
+                    if widgets::primary(ui, primary).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                },
+            );
         }
-        let outcome = if confirm { a.rect.map(|r| r.translate(-full.min.to_vec2())) } else { None };
+        let outcome = if confirm {
+            a.rect.map(|r| r.translate(-full.min.to_vec2()))
+        } else {
+            None
+        };
         if confirm || cancel {
             self.finish_area(outcome);
         }
@@ -1580,10 +2244,24 @@ impl App {
         let resp = ui.interact(full, ui.id().with("windows"), Sense::click());
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let record_after = self.area.record_after;
-        let Some(wm) = self.area.windows.as_mut() else { return };
+        let Some(wm) = self.area.windows.as_mut() else {
+            return;
+        };
         // This overlay shows the windows on its own display.
-        let mine: Vec<winpick::PickWindow> = wm.list.iter().filter(|w| w.display == display).cloned().collect();
-        let hovered = pointer.and_then(|p| winpick::under(&mine, p)).map(|w| w.entry.id);
+        let mine: Vec<winpick::PickWindow> = wm
+            .list
+            .iter()
+            .filter(|w| w.display == display)
+            .cloned()
+            .map(|mut w| {
+                let scale = ui.ctx().pixels_per_point();
+                w.rect = Rect::from_min_max(w.rect.min / scale, w.rect.max / scale);
+                w
+            })
+            .collect();
+        let hovered = pointer
+            .and_then(|p| winpick::under(&mine, p))
+            .map(|w| w.entry.id);
         if resp.secondary_clicked() {
             wm.menu_for = hovered;
         }
@@ -1594,25 +2272,54 @@ impl App {
                 w.window.request_redraw();
             }
         }
-        let focus = wm.selected.or(hovered).and_then(|id| mine.iter().find(|w| w.entry.id == id)).cloned();
-        let visible: Vec<Rect> = mine.iter().filter(|w| !winpick::is_ignored(w.entry.id)).map(|w| w.rect).collect();
+        let focus = wm
+            .selected
+            .or(hovered)
+            .and_then(|id| mine.iter().find(|w| w.entry.id == id))
+            .cloned();
+        let visible: Vec<Rect> = mine
+            .iter()
+            .filter(|w| !winpick::is_ignored(w.entry.id))
+            .map(|w| w.rect)
+            .collect();
 
         let painter = ui.painter().clone();
         let dim = Color32::from_black_alpha(110);
         match &focus {
             Some(f) => {
                 let r = f.rect.intersect(full);
-                painter.rect_filled(Rect::from_min_max(full.min, pos2(full.max.x, r.top())), 0.0, dim);
-                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.bottom()), full.max), 0.0, dim);
-                painter.rect_filled(Rect::from_min_max(pos2(full.min.x, r.top()), pos2(r.left(), r.bottom())), 0.0, dim);
-                painter.rect_filled(Rect::from_min_max(pos2(r.right(), r.top()), pos2(full.max.x, r.bottom())), 0.0, dim);
+                painter.rect_filled(
+                    Rect::from_min_max(full.min, pos2(full.max.x, r.top())),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(full.min.x, r.bottom()), full.max),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(full.min.x, r.top()), pos2(r.left(), r.bottom())),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(r.right(), r.top()), pos2(full.max.x, r.bottom())),
+                    0.0,
+                    dim,
+                );
             }
             None => {
                 painter.rect_filled(full, 0.0, dim);
             }
         }
         for r in visible.iter().rev() {
-            painter.rect_stroke(*r, 8.0, Stroke::new(1.0, Color32::from_white_alpha(60)), egui::StrokeKind::Inside);
+            painter.rect_stroke(
+                *r,
+                8.0,
+                Stroke::new(1.0, Color32::from_white_alpha(60)),
+                egui::StrokeKind::Inside,
+            );
         }
         let mut choose = None;
         let mut adjust = None;
@@ -1620,42 +2327,82 @@ impl App {
         let mut whole_display = false;
         if let Some(f) = &focus {
             painter.rect_filled(f.rect, 8.0, theme::accent().gamma_multiply(0.12));
-            painter.rect_stroke(f.rect, 8.0, Stroke::new(3.0, theme::accent()), egui::StrokeKind::Inside);
+            painter.rect_stroke(
+                f.rect,
+                8.0,
+                Stroke::new(3.0, theme::accent()),
+                egui::StrokeKind::Inside,
+            );
             let size = vec2(340.0, 150.0);
             let mut card = Rect::from_center_size(f.rect.intersect(full).center(), size);
             card = card.translate(vec2(
-                (full.left() + 12.0 - card.left()).max(0.0) + (full.right() - 12.0 - card.right()).min(0.0),
-                (full.top() + 40.0 - card.top()).max(0.0) + (full.bottom() - 12.0 - card.bottom()).min(0.0),
+                (full.left() + 12.0 - card.left()).max(0.0)
+                    + (full.right() - 12.0 - card.right()).min(0.0),
+                (full.top() + 40.0 - card.top()).max(0.0)
+                    + (full.bottom() - 12.0 - card.bottom()).min(0.0),
             ));
             ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
                 *ui.visuals_mut() = egui::Visuals::dark();
-                egui::Frame::new().fill(Color32::from_black_alpha(220)).corner_radius(12).inner_margin(14).show(ui, |ui| {
-                    ui.set_width(size.x - 28.0);
-                    ui.label(RichText::new(&f.app).font(theme::semibold(17.0)).color(Color32::WHITE));
-                    if !f.title.is_empty() {
-                        let title: String = f.title.chars().take(48).collect();
-                        ui.label(RichText::new(title).size(12.0).color(Color32::from_white_alpha(170)));
-                    }
-                    ui.add_space(4.0);
-                    if let Some((w, h)) = home::window_size_row(ui, &mut self.settings, &f.entry) {
-                        let note = match crate::capture::winsize::resize(f.entry.id, w as f64, h as f64) {
-                            Ok((gw, gh)) if (gw.round() as u32, gh.round() as u32) != (w, h) => Some(format!("The app limited the window to {gw:.0} × {gh:.0}")),
-                            Ok(_) => None,
-                            Err(e) => Some(format!("{e:#}")),
-                        };
-                        home::set_resize_note(note);
-                        refresh = true;
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if widgets::primary(ui, if record_after { "Record window" } else { "Use window" }).clicked() {
-                            choose = Some(f.entry.id);
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(220))
+                    .corner_radius(12)
+                    .inner_margin(14)
+                    .show(ui, |ui| {
+                        ui.set_width(size.x - 28.0);
+                        ui.label(
+                            RichText::new(&f.app)
+                                .font(theme::semibold(17.0))
+                                .color(Color32::WHITE),
+                        );
+                        if !f.title.is_empty() {
+                            let title: String = f.title.chars().take(48).collect();
+                            ui.label(
+                                RichText::new(title)
+                                    .size(12.0)
+                                    .color(Color32::from_white_alpha(170)),
+                            );
                         }
-                        if ui.button("Adjust area").on_hover_text("Record a region starting from this window's frame").clicked() {
-                            adjust = Some(f.rect.intersect(full));
+                        ui.add_space(4.0);
+                        if let Some((w, h)) =
+                            home::window_size_row(ui, &mut self.settings, &f.entry)
+                        {
+                            let note = match crate::capture::winsize::resize(
+                                f.entry.id, w as f64, h as f64,
+                            ) {
+                                Ok((gw, gh))
+                                    if (gw.round() as u32, gh.round() as u32) != (w, h) =>
+                                {
+                                    Some(format!("The app limited the window to {gw:.0} × {gh:.0}"))
+                                }
+                                Ok(_) => None,
+                                Err(e) => Some(format!("{e:#}")),
+                            };
+                            home::set_resize_note(note);
+                            refresh = true;
                         }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if widgets::primary(
+                                ui,
+                                if record_after {
+                                    "Record window"
+                                } else {
+                                    "Use window"
+                                },
+                            )
+                            .clicked()
+                            {
+                                choose = Some(f.entry.id);
+                            }
+                            if ui
+                                .button("Adjust area")
+                                .on_hover_text("Record a region starting from this window's frame")
+                                .clicked()
+                            {
+                                adjust = Some(f.rect.intersect(full));
+                            }
+                        });
                     });
-                });
             });
         }
         resp.context_menu(|ui| {
@@ -1683,21 +2430,43 @@ impl App {
             let r = Rect::from_center_size(full.center(), vec2(320.0, 90.0));
             ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
                 *ui.visuals_mut() = egui::Visuals::dark();
-                egui::Frame::new().fill(Color32::from_black_alpha(220)).corner_radius(12).inner_margin(14).show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("No windows to select").font(theme::semibold(16.0)).color(Color32::WHITE));
-                        if ui.button("Record entire display").clicked() {
-                            whole_display = true;
-                        }
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(220))
+                    .corner_radius(12)
+                    .inner_margin(14)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("No windows to select")
+                                    .font(theme::semibold(16.0))
+                                    .color(Color32::WHITE),
+                            );
+                            if ui.button("Record entire display").clicked() {
+                                whole_display = true;
+                            }
+                        });
                     });
-                });
             });
         }
         let hint = "Click a window to choose it  ·  Right-click for more  ·  Esc to cancel";
-        let galley = painter.layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
-        let bg = Rect::from_center_size(pos2(full.center().x, full.top() + 60.0), galley.size() + vec2(28.0, 14.0));
-        painter.rect_filled(bg, egui::CornerRadius::same(10), Color32::from_black_alpha(170));
-        painter.text(bg.center(), Align2::CENTER_CENTER, hint, FontId::proportional(14.0), Color32::WHITE);
+        let galley =
+            painter.layout_no_wrap(hint.into(), FontId::proportional(14.0), Color32::WHITE);
+        let bg = Rect::from_center_size(
+            pos2(full.center().x, full.top() + 60.0),
+            galley.size() + vec2(28.0, 14.0),
+        );
+        painter.rect_filled(
+            bg,
+            egui::CornerRadius::same(10),
+            Color32::from_black_alpha(170),
+        );
+        painter.text(
+            bg.center(),
+            Align2::CENTER_CENTER,
+            hint,
+            FontId::proportional(14.0),
+            Color32::WHITE,
+        );
         if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             choose = choose.or(focus.as_ref().map(|f| f.entry.id));
         }
@@ -1739,7 +2508,11 @@ impl App {
                     self.settings.save();
                 }
                 self.devices = Devices::load();
-                push(if self.area.record_after { Cmd::ToggleRecording } else { Cmd::ShowWindow });
+                push(if self.area.record_after {
+                    Cmd::ToggleRecording
+                } else {
+                    Cmd::ShowWindow
+                });
             }
             None => {
                 if !self.area.record_after || self.settings.source != SourceKind::Display {
@@ -1757,11 +2530,21 @@ impl App {
             Some(r) => {
                 self.settings.source = SourceKind::Area;
                 self.settings.display = self.area.display;
-                self.settings.area = [r.left() as f64, r.top() as f64, r.width() as f64, r.height() as f64];
+                self.settings.area = [
+                    r.left() as f64,
+                    r.top() as f64,
+                    r.width() as f64,
+                    r.height() as f64,
+                ]
+                .map(|v| v * self.area.pixels_per_point.max(1.0));
                 if !self.scripted() {
                     self.settings.save();
                 }
-                push(if self.area.record_after { Cmd::ToggleRecording } else { Cmd::ShowWindow });
+                push(if self.area.record_after {
+                    Cmd::ToggleRecording
+                } else {
+                    Cmd::ShowWindow
+                });
             }
             None => push(Cmd::ShowWindow),
         }
@@ -1771,8 +2554,13 @@ impl App {
         let is = |w: &Option<Win>| w.as_ref().is_some_and(|w| w.window.id() == id);
         if is(&self.main) {
             Some(Which::Main)
+        } else if is(&self.camera_window) {
+            Some(Which::CameraPreview)
         } else {
-            self.overlays.iter().find(|w| w.window.id() == id).map(|w| Which::Overlay(w.display))
+            self.overlays
+                .iter()
+                .find(|w| w.window.id() == id)
+                .map(|w| Which::Overlay(w.display))
         }
     }
 
@@ -1780,6 +2568,7 @@ impl App {
     fn take_window(&mut self, which: Which) -> Option<Win> {
         match which {
             Which::Main => self.main.take(),
+            Which::CameraPreview => self.camera_window.take(),
             Which::Overlay(d) => {
                 let i = self.overlays.iter().position(|w| w.display == d)?;
                 Some(self.overlays.remove(i))
@@ -1790,6 +2579,7 @@ impl App {
     fn window_mut(&mut self, which: Which) -> Option<&mut Win> {
         match which {
             Which::Main => self.main.as_mut(),
+            Which::CameraPreview => self.camera_window.as_mut(),
             Which::Overlay(d) => self.overlays.iter_mut().find(|w| w.display == d),
         }
     }
@@ -1797,6 +2587,7 @@ impl App {
     fn put_back(&mut self, which: Which, win: Win) {
         match which {
             Which::Main => self.main = Some(win),
+            Which::CameraPreview => self.camera_window = Some(win),
             Which::Overlay(_) => self.overlays.push(win),
         }
     }
@@ -1804,10 +2595,15 @@ impl App {
     fn redraw(&mut self, id: WindowId) {
         let Some(which) = self.which(id) else { return };
         let Some(gpu) = self.gpu.clone() else { return };
-        let Some(mut win) = self.take_window(which) else { return };
+        let Some(mut win) = self.take_window(which) else {
+            return;
+        };
         if which == Which::Main {
             let fs = macos::fullscreen_display(&win.window);
-            theme::FULLSCREEN.store(fs.is_some() || macos::is_fullscreen(&win.window), std::sync::atomic::Ordering::Relaxed);
+            theme::FULLSCREEN.store(
+                fs.is_some() || macos::is_fullscreen(&win.window),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             theme::FULLSCREEN_DISPLAY.store(fs.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         }
         let input = win.egui.take_egui_input(&win.window);
@@ -1815,18 +2611,36 @@ impl App {
         let renderer = &mut win.renderer;
         // The overlay may close itself while drawing; remember that.
         let mut keep = true;
-        let out = ctx.run_ui(input, |ui| match which {
+        let mut out = ctx.run_ui(input, |ui| match which {
             Which::Main => self.draw_main(ui, renderer),
+            Which::CameraPreview => {
+                let recorder = self.recording.as_ref().and_then(|r| r.rec.as_ref());
+                let frame = recorder.and_then(Recorder::take_camera_preview);
+                let paused = recorder.is_some_and(Recorder::is_paused);
+                self.camera_monitor
+                    .draw(ui, frame.as_deref(), &self.settings.camera_style, paused);
+                keep = !self.camera_monitor.hidden && recorder.is_some();
+            }
             Which::Overlay(display) => {
-                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                    self.draw_overlay(ui, display);
-                });
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        self.draw_overlay(ui, display);
+                    });
                 keep = !self.area.closed;
             }
         });
-        win.egui.handle_platform_output(&win.window, out.platform_output);
-        let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |v| v.repaint_delay);
-        win.repaint_at = if delay < Duration::from_secs(60) { Some(Instant::now() + delay) } else { None };
+        win.egui
+            .handle_platform_output(&win.window, out.platform_output);
+        let delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        win.repaint_at = if delay < Duration::from_secs(60) {
+            Some(Instant::now() + delay)
+        } else {
+            None
+        };
         let ppp = out.pixels_per_point;
         let prims = win.ctx.tessellate(out.shapes, ppp);
         for (id, deltas) in &out.textures_delta.set {
@@ -1835,7 +2649,8 @@ impl App {
             }
         }
         let frame = match win.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
             _ => {
                 win.surface.configure(&gpu.device, &win.config);
                 None
@@ -1848,9 +2663,14 @@ impl App {
                 macos::inset_traffic_lights(&win.window, x, y);
             }
             let view = frame.texture.create_view(&Default::default());
-            let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [win.config.width, win.config.height], pixels_per_point: ppp };
+            let sd = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [win.config.width, win.config.height],
+                pixels_per_point: ppp,
+            };
             let mut enc = gpu.device.create_command_encoder(&Default::default());
-            let extra = win.renderer.update_buffers(&gpu.device, &gpu.queue, &mut enc, &prims, &sd);
+            let extra = win
+                .renderer
+                .update_buffers(&gpu.device, &gpu.queue, &mut enc, &prims, &sd);
             {
                 let bg = theme::palette(win.ctx.theme() == egui::Theme::Dark).window;
                 let [r, g, b, _] = bg.to_normalized_gamma_f32();
@@ -1865,7 +2685,12 @@ impl App {
                                 load: wgpu::LoadOp::Clear(if win.overlay {
                                     wgpu::Color::TRANSPARENT
                                 } else {
-                                    wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
+                                    wgpu::Color {
+                                        r: r as f64,
+                                        g: g as f64,
+                                        b: b as f64,
+                                        a: 1.0,
+                                    }
                                 }),
                                 store: wgpu::StoreOp::Store,
                             },
@@ -1885,6 +2710,7 @@ impl App {
         for id in &out.textures_delta.free {
             win.renderer.free_texture(id);
         }
+        out.textures_delta.clear();
         if DRAG.swap(false, Ordering::Relaxed) {
             let _ = win.window.drag_window();
         }
@@ -1936,6 +2762,10 @@ impl ApplicationHandler for App {
                     }
                     push(Cmd::Quit);
                 }
+                Which::CameraPreview => {
+                    self.camera_monitor.hidden = true;
+                    self.camera_window = None;
+                }
                 Which::Overlay(_) => {
                     self.area.closed = true;
                     self.area.windows = None;
@@ -1950,7 +2780,9 @@ impl ApplicationHandler for App {
             return;
         }
         let gpu = self.gpu.clone();
-        let Some(win) = self.window_mut(which) else { return };
+        let Some(win) = self.window_mut(which) else {
+            return;
+        };
         let resp = win.egui.on_window_event(&win.window, &event);
         match event {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -1983,7 +2815,21 @@ impl ApplicationHandler for App {
 
     /// ⌘Q from the app menu, logout or our own quit: never lose work.
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        self.close_camera_monitor();
+        for result in [
+            self.live.screen.stop(),
+            self.live.camera.stop(),
+            self.live.mic.stop(),
+        ] {
+            if let Err(error) = result {
+                eprintln!("Cam preview shutdown: {error}");
+            }
+        }
+
         if let View::Editor(ed) = &mut self.view {
+            ed.cancel_export();
+            ed.cancel_transcription();
+            ed.audio.shutdown();
             if ed.voice.is_some() {
                 ed.stop_voiceover();
             }
@@ -1999,7 +2845,8 @@ impl ApplicationHandler for App {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(60);
-        while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline {
+        while self.finishing && self.finished.lock().unwrap().is_none() && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         if !self.scripted() {
@@ -2008,6 +2855,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        hotkey::poll();
         if self.last_tick.elapsed() >= Duration::from_millis(100) {
             self.last_tick = Instant::now();
             self.tick(el);
@@ -2023,7 +2871,12 @@ impl ApplicationHandler for App {
             w.window.request_redraw();
             next = now + Duration::from_millis(8);
         }
-        for w in self.main.iter_mut().chain(self.overlays.iter_mut()) {
+        for w in self
+            .main
+            .iter_mut()
+            .chain(self.overlays.iter_mut())
+            .chain(self.camera_window.iter_mut())
+        {
             if let Some(t) = w.repaint_at {
                 if t <= now {
                     w.repaint_at = None;
@@ -2039,6 +2892,7 @@ impl ApplicationHandler for App {
 
 /// Run the app (blocks until quit). `open` = a project to open at launch.
 pub fn run(open: Option<PathBuf>) -> Result<()> {
+    crate::platform::windows::ensure_dpi_awareness();
     theme::set_accent(theme::system_accent());
     // Let connected iPhones/iPads appear as recordable devices.
     crate::capture::camera::enable_screen_capture_devices();
@@ -2047,7 +2901,10 @@ pub fn run(open: Option<PathBuf>) -> Result<()> {
     let _ = PROXY.set(Mutex::new(el.create_proxy()));
     macos::install_open_handler();
     let mut app = App::new(open);
-    el.run_app(&mut app)?;
+    let result = el.run_app(&mut app);
+    hotkey::shutdown();
+    drop(app);
+    result?;
     Ok(())
 }
 
@@ -2055,7 +2912,45 @@ pub fn run(open: Option<PathBuf>) -> Result<()> {
 /// shows nothing but Cam (left out of the capture): say so over the preview.
 fn covered_note(s: &home::Settings) -> Option<String> {
     let fs = theme::FULLSCREEN_DISPLAY.load(std::sync::atomic::Ordering::Relaxed);
-    let target = if s.display == 0 { macos::main_display() } else { s.display };
+    let target = if s.display == 0 {
+        macos::main_display()
+    } else {
+        s.display
+    };
     (fs != 0 && matches!(s.source, SourceKind::Display | SourceKind::Area) && fs == target)
         .then(|| "Cam is full screen on this display, so there's nothing else to show.\nExit full screen to see what you'll record.".into())
+}
+
+#[cfg(test)]
+mod preview_handoff_tests {
+    use super::*;
+    static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    struct Device;
+    impl Drop for Device {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    fn open(_: &u8) -> Result<Device, String> {
+        std::thread::sleep(Duration::from_millis(20));
+        LIVE.fetch_add(1, Ordering::SeqCst);
+        Ok(Device)
+    }
+    #[test]
+    fn stopping_waits_for_pending_device_startup_and_releases_running_device() {
+        let mut slot: Slot<u8, Device> = Slot::default();
+        for pending in [true, false] {
+            slot.want = Some(1);
+            slot.want_since = None;
+            slot.update(Some(1), "test", open);
+            if !pending {
+                std::thread::sleep(Duration::from_millis(40));
+                slot.update(Some(1), "test", open);
+                assert_eq!(LIVE.load(Ordering::SeqCst), 1);
+            }
+            slot.stop().unwrap();
+            assert!(!slot.active());
+            assert_eq!(LIVE.load(Ordering::SeqCst), 0);
+        }
+    }
 }

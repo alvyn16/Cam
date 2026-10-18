@@ -1,8 +1,8 @@
 //! Windows screen and window queries.
 
-use anyhow::{Result, anyhow, bail};
-use crate::platform::windows::WindowsScreenCaptureBackend;
 use crate::platform::ScreenCaptureBackend;
+use crate::platform::windows::WindowsScreenCaptureBackend;
+use anyhow::{Result, anyhow, bail};
 
 #[derive(Clone, Debug)]
 pub struct DisplayInfo {
@@ -58,8 +58,14 @@ impl WindowHandle {
 
     pub fn frame(&self) -> RectFrame {
         RectFrame {
-            origin: PointOrigin { x: self.x, y: self.y },
-            size: SizeFrame { width: self.width, height: self.height },
+            origin: PointOrigin {
+                x: self.x,
+                y: self.y,
+            },
+            size: SizeFrame {
+                width: self.width,
+                height: self.height,
+            },
         }
     }
 }
@@ -77,33 +83,52 @@ pub struct WindowInfo {
 pub fn displays() -> Result<Vec<DisplayInfo>> {
     let b = WindowsScreenCaptureBackend::new();
     let ds = b.displays()?;
-    Ok(ds.into_iter().map(|d| DisplayInfo {
-        id: d.id,
-        points: d.points,
-        pixels: d.pixels,
-    }).collect())
+    Ok(ds
+        .into_iter()
+        .map(|d| DisplayInfo {
+            id: d.id,
+            points: d.points,
+            pixels: d.pixels,
+        })
+        .collect())
 }
 
 pub fn windows() -> Result<Vec<WindowInfo>> {
     let b = WindowsScreenCaptureBackend::new();
     let ws = b.windows()?;
     let ds = displays().unwrap_or_default();
-    let main_d = ds.first().cloned();
-
-    Ok(ws.into_iter().map(|w| WindowInfo {
-        id: w.id,
-        app: w.app,
-        title: w.title,
-        size: w.size,
-        window: WindowHandle {
-            pid: 0,
-            x: 0.0,
-            y: 0.0,
-            width: w.size.0,
-            height: w.size.1,
-        },
-        display: main_d.clone(),
-    }).collect())
+    Ok(ws
+        .into_iter()
+        .map(|w| {
+            use windows::Win32::{
+                Foundation::{HWND, RECT},
+                Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
+                UI::WindowsAndMessaging::{GetWindowRect, GetWindowThreadProcessId},
+            };
+            let hwnd = HWND(w.id as _);
+            let mut r = RECT::default();
+            let mut pid = 0;
+            unsafe {
+                let _ = GetWindowRect(hwnd, &mut r);
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            }
+            let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as u32;
+            WindowInfo {
+                id: w.id,
+                app: w.app,
+                title: w.title,
+                size: w.size,
+                window: WindowHandle {
+                    pid: pid as i32,
+                    x: r.left as f64,
+                    y: r.top as f64,
+                    width: w.size.0,
+                    height: w.size.1,
+                },
+                display: ds.iter().find(|d| d.id == monitor).cloned(),
+            }
+        })
+        .collect())
 }
 
 pub fn find_window(sel: &str) -> Result<WindowInfo> {
@@ -119,7 +144,11 @@ pub fn find_window(sel: &str) -> Result<WindowInfo> {
     }
     let lower = sel.to_lowercase();
     ws.into_iter()
-        .filter(|w| format!("{} {}", w.app, w.title).to_lowercase().contains(&lower))
+        .filter(|w| {
+            format!("{} {}", w.app, w.title)
+                .to_lowercase()
+                .contains(&lower)
+        })
         .max_by(|a, b| (a.size.0 * a.size.1).total_cmp(&(b.size.0 * b.size.1)))
         .ok_or_else(|| anyhow!("no on-screen window matches {sel:?}"))
 }

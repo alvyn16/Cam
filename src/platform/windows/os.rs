@@ -2,8 +2,12 @@
 
 use anyhow::Result;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_SYSTEMBACKDROP_TYPE};
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_TOPMOST, WS_EX_TOOLWINDOW};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GWL_EXSTYLE, GetWindowLongW, SetWindowLongW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -28,6 +32,10 @@ impl WindowsOsBackend {
     pub fn style_window(window: &Window) {
         if let Some(hwnd) = Self::hwnd(window) {
             unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::WDA_EXCLUDEFROMCAPTURE,
+                );
                 // Enable Immersive Dark Mode for title bar
                 let dark_mode: i32 = 1;
                 let _ = DwmSetWindowAttribute(
@@ -59,7 +67,11 @@ impl OsIntegrationBackend for WindowsOsBackend {
         if let Some(hwnd) = Self::hwnd(window) {
             unsafe {
                 let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex | (WS_EX_TOPMOST.0 as i32) | (WS_EX_TOOLWINDOW.0 as i32));
+                let _ = SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    ex | (WS_EX_TOPMOST.0 as i32) | (WS_EX_TOOLWINDOW.0 as i32),
+                );
             }
         }
     }

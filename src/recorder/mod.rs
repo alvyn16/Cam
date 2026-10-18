@@ -2,6 +2,7 @@
 //! system audio and microphone stems, the camera as its own file, and
 //! input events for re-rendering the cursor, zooms and key badges.
 
+pub mod cursor;
 pub mod input;
 
 use std::path::PathBuf;
@@ -26,14 +27,23 @@ use input::{InputLog, InputLogger};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
-    Display { id: u32 },
-    Window { id: u32 },
+    Display {
+        id: u32,
+    },
+    Window {
+        id: u32,
+    },
     /// A region of a display, in display-local points (top-left origin).
-    Area { display: u32, rect: Rect },
+    Area {
+        display: u32,
+        rect: Rect,
+    },
     /// Generated test pattern (no permission needed).
     Pattern,
     /// A USB-connected iPhone or iPad screen (unique id from `cam devices`).
-    Device { id: String },
+    Device {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -90,21 +100,55 @@ struct CameraRec {
 
 impl CameraRec {
     fn start(sel: Option<&str>, path: &std::path::Path) -> Result<Self> {
-        let spec = VideoSpec { width: 1280, height: 720, fps: 30, codec: CapCodec::H264, bitrate: 8_000_000, quality: None, pixel_format: PIX_BGRA };
+        let spec = VideoSpec {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            codec: CapCodec::H264,
+            bitrate: 8_000_000,
+            quality: None,
+            pixel_format: PIX_BGRA,
+        };
         Self::start_spec(path, &spec, |shared| Camera::start_with(sel, shared, true))
     }
 
     /// An iOS device's screen at its native size.
     fn start_ios(id: &str, path: &std::path::Path, size: (usize, usize)) -> Result<Self> {
         let bitrate = ((size.0 * size.1) as f64 * 60.0 * 0.08) as u64;
-        let spec = VideoSpec { width: size.0, height: size.1, fps: 60, codec: CapCodec::Hevc, bitrate: bitrate.max(4_000_000), quality: None, pixel_format: PIX_BGRA };
+        let spec = VideoSpec {
+            width: size.0,
+            height: size.1,
+            fps: 60,
+            codec: CapCodec::Hevc,
+            bitrate: bitrate.max(4_000_000),
+            quality: None,
+            pixel_format: PIX_BGRA,
+        };
         Self::start_spec(path, &spec, |shared| Camera::start_ios(id, shared))
     }
 
-    fn start_spec(path: &std::path::Path, spec: &VideoSpec, open: impl FnOnce(Arc<Shared>) -> Result<Camera>) -> Result<Self> {
-        let sink = Sink::new(Some(path), spec, false, false, AudioLayout::Stems, [0.0; 2], None, CapScene::Screen, None)?;
+    fn start_spec(
+        path: &std::path::Path,
+        spec: &VideoSpec,
+        open: impl FnOnce(Arc<Shared>) -> Result<Camera>,
+    ) -> Result<Self> {
+        let sink = Sink::new(
+            Some(path),
+            spec,
+            false,
+            false,
+            AudioLayout::Stems,
+            [0.0; 2],
+            None,
+            CapScene::Screen,
+            None,
+        )?;
         let stop = Arc::new(AtomicBool::new(false));
-        let shared = Arc::new(Shared { sink: Mutex::new(Some(sink)), error: Mutex::new(None), stop: stop.clone() });
+        let shared = Arc::new(Shared {
+            sink: Mutex::new(Some(sink)),
+            error: Mutex::new(None),
+            stop: stop.clone(),
+        });
         let cam = open(shared.clone())?;
         let (ps, pstop) = (shared.clone(), stop.clone());
         let pacer = std::thread::spawn(move || {
@@ -114,7 +158,12 @@ impl CameraRec {
                 std::thread::sleep(Duration::from_millis(16));
             }
         });
-        Ok(CameraRec { shared, stop, pacer: Some(pacer), cam })
+        Ok(CameraRec {
+            shared,
+            stop,
+            pacer: Some(pacer),
+            cam,
+        })
     }
 
     fn t0(&self) -> Option<f64> {
@@ -154,6 +203,17 @@ impl CameraRec {
     }
 }
 
+impl Drop for CameraRec {
+    fn drop(&mut self) {
+        self.cam.stop();
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.pacer.take() {
+            let _ = thread.join();
+        }
+        self.shared.sink.lock().unwrap().take();
+    }
+}
+
 pub struct Recorder {
     pub package: Package,
     session: Option<Session>,
@@ -188,28 +248,72 @@ fn even(v: f64) -> usize {
 impl Recorder {
     pub fn start(opts: Options) -> Result<Self> {
         let name = opts.name.clone().unwrap_or_else(|| timestamp_name());
-        let package = Package::new(opts.dir.join(format!("{name}.cam")));
+        let mut package = Package::new(opts.dir.join(format!("{name}.cam")));
+        if opts.name.is_none() {
+            let mut suffix = 2;
+            while package.root.exists() {
+                package = Package::new(opts.dir.join(format!("{name} ({suffix}).cam")));
+                suffix += 1;
+            }
+        }
+        anyhow::ensure!(
+            !package.root.exists(),
+            "recording already exists: {}",
+            package.root.display()
+        );
         let (cap_target, kind, bounds, size, window, app_name) = match &opts.target {
-            Target::Pattern => (None, SourceKind::Display, Rect::new(0.0, 0.0, 1440.0, 900.0), (2880, 1800), None, None),
+            Target::Pattern => (
+                None,
+                SourceKind::Display,
+                Rect::new(0.0, 0.0, 1440.0, 900.0),
+                (2880, 1800),
+                None,
+                None,
+            ),
             Target::Device { id } => {
-                let (w, h) = crate::capture::camera::ios_dimensions(id).context("iPhone/iPad not found — connect it with a cable and unlock it")?;
+                let (w, h) = crate::capture::camera::ios_dimensions(id)
+                    .context("iPhone/iPad not found — connect it with a cable and unlock it")?;
                 let px = (even(w as f64), even(h as f64));
-                (None, SourceKind::Device, Rect::new(0.0, 0.0, px.0 as f64, px.1 as f64), px, None, None)
+                (
+                    None,
+                    SourceKind::Device,
+                    Rect::new(0.0, 0.0, px.0 as f64, px.1 as f64),
+                    px,
+                    None,
+                    None,
+                )
             }
             Target::Display { id } => {
                 let ds = screen::displays()?;
-                let d = ds.into_iter().find(|d| d.id == *id || *id == 0).context("display not found")?;
+                let d = ds
+                    .into_iter()
+                    .find(|d| d.id == *id || *id == 0)
+                    .context("display not found")?;
                 let b = display_bounds(d.id);
                 let px = (even(d.pixels.0 as f64), even(d.pixels.1 as f64));
-                (Some(screen::Target::Display(d, None)), SourceKind::Display, b, px, None, None)
+                (
+                    Some(screen::Target::Display(d, None)),
+                    SourceKind::Display,
+                    b,
+                    px,
+                    None,
+                    None,
+                )
             }
             Target::Area { display, rect } => {
                 let ds = screen::displays()?;
-                let d = ds.into_iter().find(|d| d.id == *display || *display == 0).context("display not found")?;
+                let d = ds
+                    .into_iter()
+                    .find(|d| d.id == *display || *display == 0)
+                    .context("display not found")?;
                 let db = display_bounds(d.id);
                 // Keep the area on the display (a saved area may be from a bigger one).
-                let rect = &rect.intersect(&Rect::new(0.0, 0.0, d.points.0 as f64, d.points.1 as f64));
-                anyhow::ensure!(rect.w >= 8.0 && rect.h >= 8.0, "the selected area is outside this display");
+                let rect =
+                    &rect.intersect(&Rect::new(0.0, 0.0, d.points.0 as f64, d.points.1 as f64));
+                anyhow::ensure!(
+                    rect.w >= 8.0 && rect.h >= 8.0,
+                    "the selected area is outside this display"
+                );
                 let scale = d.pixels.0 as f64 / d.points.0 as f64;
                 let px = (even(rect.w * scale), even(rect.h * scale));
                 let cap_target = Some(screen::Target::Display(d, Some(*rect)));
@@ -218,7 +322,8 @@ impl Recorder {
             }
             Target::Window { id } => {
                 let w = screen::find_window(&id.to_string())?;
-                let b = input::window_bounds(*id).unwrap_or(Rect::new(0.0, 0.0, w.size.0, w.size.1));
+                let b =
+                    input::window_bounds(*id).unwrap_or(Rect::new(0.0, 0.0, w.size.0, w.size.1));
                 // Native pixels of the display the window is on.
                 let on = w.display.as_ref().map(|d| d.id);
                 let ds = screen::displays()?;
@@ -226,16 +331,26 @@ impl Recorder {
                 let scale = d.map_or(2.0, |d| d.pixels.0 as f64 / d.points.0 as f64);
                 let px = (even(w.size.0 * scale), even(w.size.1 * scale));
                 let app = Some(w.app.clone());
-                (Some(screen::Target::Window(w)), SourceKind::Window, b, px, Some(*id), app)
+                (
+                    Some(screen::Target::Window(w)),
+                    SourceKind::Window,
+                    b,
+                    px,
+                    Some(*id),
+                    app,
+                )
             }
         };
         let scale = size.0 as f64 / bounds.w.max(1.0);
         // Only now (the target resolved) create the package folder.
-        std::fs::create_dir_all(package.recording_dir())?;
+        std::fs::create_dir_all(&opts.dir)?;
+        std::fs::create_dir(&package.root)?;
+        std::fs::create_dir(package.recording_dir())?;
         if let Target::Device { id } = &opts.target {
-            let device = CameraRec::start_ios(id, &package.rec("screen.mov"), size).inspect_err(|_| {
-                let _ = std::fs::remove_dir_all(&package.root);
-            })?;
+            let device =
+                CameraRec::start_ios(id, &package.rec("screen.mov"), size).inspect_err(|_| {
+                    let _ = std::fs::remove_dir_all(&package.root);
+                })?;
             return Ok(Recorder {
                 package,
                 session: None,
@@ -266,17 +381,27 @@ impl Recorder {
             system_audio: opts.system_audio,
             mic: opts.mic.clone(),
             webcam: None,
-            pip: PipSpec { size: 0.2, corner: Corner::BottomRight, shape: Shape::Rounded, mirror: false },
+            pip: PipSpec {
+                size: 0.2,
+                corner: Corner::BottomRight,
+                shape: Shape::Rounded,
+                mirror: false,
+            },
             hide_desktop_icons: opts.hide_desktop_icons,
             hide_dock: opts.hide_dock,
             exclude_own_audio: opts.exclude_own_audio,
             mic_backend: MicBackend::Auto,
         };
+        let input = Some(InputLogger::start(
+            package.rec("cursors"),
+            window,
+            opts.keys,
+        ));
         let session = match cap_target {
             Some(t) => Some(Session::start(t, cap).inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&package.root);
             })?),
-            None => None,
+            None => Some(Session::start_pattern(cap)?),
         };
         let camera = opts
             .camera
@@ -286,7 +411,6 @@ impl Recorder {
             .inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&package.root);
             })?;
-        let input = Some(InputLogger::start(package.rec("cursors"), window, opts.keys));
         Ok(Recorder {
             package,
             session,
@@ -309,6 +433,11 @@ impl Recorder {
         self.pauses.last().is_some_and(|p| p.1.is_none())
     }
 
+    /// Newest webcam frame from the existing capture session (one-frame mailbox).
+    pub fn take_camera_preview(&self) -> Option<Arc<crate::capture::grab::Image>> {
+        self.camera.as_ref()?.cam.take_preview_frame()
+    }
+
     pub fn pause(&mut self) {
         if self.is_paused() {
             return;
@@ -327,7 +456,9 @@ impl Recorder {
     }
 
     pub fn resume(&mut self) {
-        let Some(last) = self.pauses.last_mut() else { return };
+        let Some(last) = self.pauses.last_mut() else {
+            return;
+        };
         if last.1.is_some() {
             return;
         }
@@ -382,18 +513,10 @@ impl Recorder {
 
     /// Discard the recording.
     pub fn cancel(mut self) {
-        if let Some(i) = self.input.take() {
-            i.stop();
-        }
-        if let Some(c) = self.camera.take() {
-            let _ = c.finish();
-        }
-        if let Some(d) = self.device.take() {
-            let _ = d.finish();
-        }
-        if let Some(s) = self.session.take() {
-            let _ = s.finish();
-        }
+        drop(self.input.take());
+        drop(self.camera.take());
+        drop(self.device.take());
+        drop(self.session.take());
         let _ = std::fs::remove_dir_all(&self.package.root);
     }
 
@@ -459,12 +582,23 @@ impl Recorder {
         Ok(self.package.root.clone())
     }
 
-    fn write_package(&self, input: InputLog, t0: f64, duration_ms: f64, cam_t0: Option<f64>) -> Result<()> {
+    fn write_package(
+        &self,
+        input: InputLog,
+        t0: f64,
+        duration_ms: f64,
+        cam_t0: Option<f64>,
+    ) -> Result<()> {
         let pkg = &self.package;
         // Window recordings: origin follows the window as it moves.
         let origin_at = |host: f64| -> (f64, f64) {
             if self.window.is_some()
-                && let Some((_, b)) = input.bounds.iter().rev().find(|(h, _)| *h <= host).or(input.bounds.first())
+                && let Some((_, b)) = input
+                    .bounds
+                    .iter()
+                    .rev()
+                    .find(|(h, _)| *h <= host)
+                    .or(input.bounds.first())
             {
                 return (b.x, b.y);
             }
@@ -472,7 +606,10 @@ impl Recorder {
         };
         // The logger starts before the first video frame: keep the last
         // event from before the start so the cursor has a position at 0.
-        let first_inside = input.mouse.iter().position(|m| self.to_ms(m.host, t0).is_some_and(|t| t >= 0.0));
+        let first_inside = input
+            .mouse
+            .iter()
+            .position(|m| self.to_ms(m.host, t0).is_some_and(|t| t >= 0.0));
         let lead = first_inside.unwrap_or(input.mouse.len()).saturating_sub(1);
         let mouse: Vec<MouseEvent> = input
             .mouse
@@ -502,7 +639,13 @@ impl Recorder {
             .iter()
             .filter_map(|k| {
                 let t = self.to_ms(k.host, t0)?;
-                (t >= 0.0 && t <= duration_ms).then(|| KeyEvent { t, code: k.code, key: k.key.clone(), mods: k.mods, down: k.down })
+                (t >= 0.0 && t <= duration_ms).then(|| KeyEvent {
+                    t,
+                    code: k.code,
+                    key: k.key.clone(),
+                    mods: k.mods,
+                    down: k.down,
+                })
             })
             .collect();
         let cursors: Vec<CursorImage> = input.cursors.clone();
@@ -529,10 +672,13 @@ impl Recorder {
                 offset_ms: cam_t0.map_or(0.0, |c| (c - t0) * 1000.0),
             }),
             // Device recordings carry no audio tracks.
-            system_audio: (self.opts.system_audio && self.has_audio_tracks()).then(|| AudioTrack { file: "screen.mov".into(), track: 0 }),
+            system_audio: (self.opts.system_audio && self.has_audio_tracks()).then(|| AudioTrack {
+                file: "system.wav".into(),
+                track: 0,
+            }),
             mic: (self.opts.mic.is_some() && self.has_audio_tracks()).then(|| AudioTrack {
-                file: "screen.mov".into(),
-                track: if self.opts.system_audio { 1 } else { 0 },
+                file: "mic.wav".into(),
+                track: 0,
             }),
             app_name: self.app_name.clone(),
             created_ms: now_ms(),
@@ -552,7 +698,11 @@ impl Recorder {
         }
         // The camera bubble as set up before recording.
         if let Some(cs) = self.opts.camera_style {
-            proj.style.camera = crate::project::model::CameraStyle { zoom_scale: proj.style.camera.zoom_scale, hide: false, ..cs };
+            proj.style.camera = crate::project::model::CameraStyle {
+                zoom_scale: proj.style.camera.zoom_scale,
+                hide: false,
+                ..cs
+            };
         }
         pkg.save_project(&proj)?;
         Ok(())
@@ -560,5 +710,7 @@ impl Recorder {
 }
 
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }

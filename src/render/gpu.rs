@@ -19,6 +19,15 @@ impl Gpu {
         #[cfg(not(target_os = "macos"))]
         let backends = wgpu::Backends::all();
 
+        Self::with_backends(backends)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn headless_dx12() -> Result<Self> {
+        Self::with_backends(wgpu::Backends::DX12)
+    }
+
+    fn with_backends(backends: wgpu::Backends) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -36,7 +45,12 @@ impl Gpu {
             ..Default::default()
         }))
         .context("creating GPU device")?;
-        Ok(Gpu { instance, adapter, device, queue })
+        Ok(Gpu {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
     }
 }
 
@@ -49,7 +63,13 @@ pub fn padded_row(width: u32) -> u32 {
 
 /// Submit `encoder` plus a copy of `texture`, wait, and return tightly
 /// packed 4-byte pixels.
-pub fn read_texture(gpu: &Gpu, texture: &wgpu::Texture, w: u32, h: u32, mut encoder: wgpu::CommandEncoder) -> Vec<u8> {
+pub fn read_texture(
+    gpu: &Gpu,
+    texture: &wgpu::Texture,
+    w: u32,
+    h: u32,
+    mut encoder: wgpu::CommandEncoder,
+) -> Vec<u8> {
     let row = padded_row(w);
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -58,12 +78,25 @@ pub fn read_texture(gpu: &Gpu, texture: &wgpu::Texture, w: u32, h: u32, mut enco
         mapped_at_creation: false,
     });
     encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
         wgpu::TexelCopyBufferInfo {
             buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(h),
+            },
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     gpu.queue.submit([encoder.finish()]);
     let slice = buffer.slice(..);

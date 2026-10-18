@@ -11,6 +11,9 @@ pub struct AudioDeviceInfo {
 
 pub trait AudioStreamSession: Send {
     fn stop(&mut self);
+    fn error(&self) -> Option<String> {
+        None
+    }
 }
 
 pub trait AudioCaptureBackend: Send + Sync {

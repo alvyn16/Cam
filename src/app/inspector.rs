@@ -20,37 +20,39 @@ const GRADIENTS: [(&str, [u8; 3], [u8; 3], f64); 6] = [
 ];
 
 pub fn ui(ui: &mut Ui, ed: &mut Editor) {
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        let mut draft = ed.project.clone();
-        match ed.selection {
-            Selection::Zoom(id) => zoom_panel(ui, ed, &mut draft, id),
-            Selection::Slice(id) => slice_panel(ui, &mut draft, id),
-            Selection::Layout(id) => layout_panel(ui, &mut draft, id),
-            Selection::Mask(id) => mask_panel(ui, ed, &mut draft, id),
-            Selection::None => {
-                tabs(ui, &mut ed.tab);
-                match ed.tab {
-                    Tab::Background => background(ui, ed, &mut draft),
-                    Tab::Cursor => cursor(ui, &mut draft, ed.rec.mouse.is_empty()),
-                    Tab::Camera => camera(ui, &mut draft, ed.rec.meta.camera.is_some()),
-                    Tab::Captions => captions(ui, ed, &mut draft),
-                    Tab::Audio => audio(ui, ed, &mut draft),
-                    Tab::Shortcuts => shortcuts(ui, &mut draft, ed.rec.keys.len()),
-                    Tab::Animation => animation(ui, ed, &mut draft),
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            let mut draft = ed.project.clone();
+            match ed.selection {
+                Selection::Zoom(id) => zoom_panel(ui, ed, &mut draft, id),
+                Selection::Slice(id) => slice_panel(ui, &mut draft, id),
+                Selection::Layout(id) => layout_panel(ui, &mut draft, id),
+                Selection::Mask(id) => mask_panel(ui, ed, &mut draft, id),
+                Selection::None => {
+                    tabs(ui, &mut ed.tab);
+                    match ed.tab {
+                        Tab::Background => background(ui, ed, &mut draft),
+                        Tab::Cursor => cursor(ui, &mut draft, ed.rec.mouse.is_empty()),
+                        Tab::Camera => camera(ui, &mut draft, ed.rec.meta.camera.is_some()),
+                        Tab::Captions => captions(ui, ed, &mut draft),
+                        Tab::Audio => audio(ui, ed, &mut draft),
+                        Tab::Shortcuts => shortcuts(ui, &mut draft, ed.rec.keys.len()),
+                        Tab::Animation => animation(ui, ed, &mut draft),
+                    }
                 }
             }
-        }
-        if ui.input(|i| i.pointer.any_released()) {
-            // End of a drag: the next change starts a new undo step.
-        }
-        ed.commit(draft);
-        // Actions that edit the project themselves run after the draft lands.
-        match ed.deferred.take() {
-            Some(Deferred::StartVoice) => ed.start_voiceover(),
-            Some(Deferred::StopVoice) => ed.stop_voiceover(),
-            None => {}
-        }
-    });
+            if ui.input(|i| i.pointer.any_released()) {
+                // End of a drag: the next change starts a new undo step.
+            }
+            ed.commit(draft);
+            // Actions that edit the project themselves run after the draft lands.
+            match ed.deferred.take() {
+                Some(Deferred::StartVoice) => ed.start_voiceover(),
+                Some(Deferred::StopVoice) => ed.stop_voiceover(),
+                None => {}
+            }
+        });
 }
 
 fn tabs(ui: &mut Ui, tab: &mut Tab) {
@@ -59,10 +61,18 @@ fn tabs(ui: &mut Ui, tab: &mut Tab) {
         ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
         for (t, label) in Tab::ALL {
             let sel = *tab == t;
-            let b = egui::Button::new(RichText::new(label).size(12.0).color(if sel { Color32::WHITE } else { p.text }))
-                .fill(if sel { theme::accent() } else { p.control })
-                .stroke(if sel { Stroke::NONE } else { Stroke::new(0.5, p.control_border) })
-                .corner_radius(CornerRadius::same(12));
+            let b = egui::Button::new(RichText::new(label).size(12.0).color(if sel {
+                Color32::WHITE
+            } else {
+                p.text
+            }))
+            .fill(if sel { theme::accent() } else { p.control })
+            .stroke(if sel {
+                Stroke::NONE
+            } else {
+                Stroke::new(0.5, p.control_border)
+            })
+            .corner_radius(CornerRadius::same(12));
             if ui.add(b).clicked() {
                 *tab = t;
             }
@@ -74,8 +84,11 @@ fn tabs(ui: &mut Ui, tab: &mut Tab) {
 
 /// Ask for a PNG or JPEG, check it decodes, and copy it into the package.
 fn choose_image(ed: &mut Editor) -> Option<String> {
-    let f = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg"]).pick_file()?;
-    match crate::render::Image::from_png(&f).and_then(|_| ed.package.import_asset(&f, "background")) {
+    let f = rfd::FileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg"])
+        .pick_file()?;
+    match crate::render::Image::from_png(&f).and_then(|_| ed.package.import_asset(&f, "background"))
+    {
         Ok(rel) => Some(rel),
         Err(e) => {
             ed.status = Some(format!("Couldn't use that image: {e:#}"));
@@ -84,11 +97,25 @@ fn choose_image(ed: &mut Editor) -> Option<String> {
     }
 }
 
-fn swatch(ui: &mut Ui, size: egui::Vec2, selected: bool, paint: impl FnOnce(&egui::Painter, egui::Rect)) -> bool {
+fn swatch(
+    ui: &mut Ui,
+    size: egui::Vec2,
+    selected: bool,
+    paint: impl FnOnce(&egui::Painter, egui::Rect),
+) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     paint(ui.painter(), rect);
-    let stroke = if selected { Stroke::new(2.5, theme::accent()) } else { Stroke::new(1.0, pal(ui).control_border) };
-    ui.painter().rect_stroke(rect, CornerRadius::same(6), stroke, egui::StrokeKind::Outside);
+    let stroke = if selected {
+        Stroke::new(2.5, theme::accent())
+    } else {
+        Stroke::new(1.0, pal(ui).control_border)
+    };
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        stroke,
+        egui::StrokeKind::Outside,
+    );
     resp.clicked()
 }
 
@@ -97,7 +124,10 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     let s = &mut d.style;
     section(ui, "Background", |ui| {
         if s.padding <= 0.0 && s.device == DeviceFrame::None {
-            caption(ui, "Hidden at 0 % padding. Pick a background (or raise Padding) to show it.");
+            caption(
+                ui,
+                "Hidden at 0 % padding. Pick a background (or raise Padding) to show it.",
+            );
         }
         #[derive(Clone, Copy, PartialEq)]
         enum K {
@@ -112,13 +142,33 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             Background::Color { .. } => K::Col,
             Background::Image { .. } => K::Img,
         };
-        if segmented(ui, &mut k, &[(K::Wall, "Wallpaper"), (K::Grad, "Gradient"), (K::Col, "Color"), (K::Img, "Image")]) {
+        if segmented(
+            ui,
+            &mut k,
+            &[
+                (K::Wall, "Wallpaper"),
+                (K::Grad, "Gradient"),
+                (K::Col, "Color"),
+                (K::Img, "Image"),
+            ],
+        ) {
             s.background = match k {
-                K::Wall => Background::Wallpaper { id: "aurora".into() },
-                K::Grad => Background::Gradient { angle: 135.0, stops: vec![(Color::rgb(255, 120, 80), 0.0), (Color::rgb(130, 70, 220), 1.0)] },
-                K::Col => Background::Color { color: Color::rgb(52, 120, 246) },
+                K::Wall => Background::Wallpaper {
+                    id: "aurora".into(),
+                },
+                K::Grad => Background::Gradient {
+                    angle: 135.0,
+                    stops: vec![
+                        (Color::rgb(255, 120, 80), 0.0),
+                        (Color::rgb(130, 70, 220), 1.0),
+                    ],
+                },
+                K::Col => Background::Color {
+                    color: Color::rgb(52, 120, 246),
+                },
                 // Ask for the image straight away; cancelling keeps the old background.
-                K::Img => choose_image(ed).map_or_else(|| s.background.clone(), |path| Background::Image { path }),
+                K::Img => choose_image(ed)
+                    .map_or_else(|| s.background.clone(), |path| Background::Image { path }),
             };
         }
         ui.add_space(6.0);
@@ -130,7 +180,11 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                         .map(|w| {
                             let img = crate::render::art::wallpaper(w.0, 96, 60);
                             let ci = egui::ColorImage::from_rgba_unmultiplied([96, 60], &img.rgba);
-                            ui.ctx().load_texture(format!("wall-{}", w.0), ci, egui::TextureOptions::LINEAR)
+                            ui.ctx().load_texture(
+                                format!("wall-{}", w.0),
+                                ci,
+                                egui::TextureOptions::LINEAR,
+                            )
                         })
                         .collect()
                 });
@@ -139,7 +193,15 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                     for (i, w) in WALLPAPERS.iter().enumerate() {
                         let tex = thumbs[i].id();
                         let clicked = swatch(ui, vec2(52.0, 34.0), *id == w.0, |p, r| {
-                            p.image(tex, r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            p.image(
+                                tex,
+                                r,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                Color32::WHITE,
+                            );
                         });
                         if clicked {
                             *id = w.0.into();
@@ -151,7 +213,10 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                     for (_, a, b, ang) in GRADIENTS {
-                        let (ca, cb) = (Color32::from_rgb(a[0], a[1], a[2]), Color32::from_rgb(b[0], b[1], b[2]));
+                        let (ca, cb) = (
+                            Color32::from_rgb(a[0], a[1], a[2]),
+                            Color32::from_rgb(b[0], b[1], b[2]),
+                        );
                         let sel = stops.first().map(|s| s.0) == Some(Color::rgb(a[0], a[1], a[2]));
                         if swatch(ui, vec2(34.0, 34.0), sel, |p, r| {
                             let mut mesh = egui::Mesh::default();
@@ -164,7 +229,10 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                             p.add(mesh);
                         }) {
                             *angle = ang;
-                            *stops = vec![(Color::rgb(a[0], a[1], a[2]), 0.0), (Color::rgb(b[0], b[1], b[2]), 1.0)];
+                            *stops = vec![
+                                (Color::rgb(a[0], a[1], a[2]), 0.0),
+                                (Color::rgb(b[0], b[1], b[2]), 1.0),
+                            ];
                         }
                     }
                 });
@@ -187,20 +255,39 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                     {
                         *path = rel;
                     }
-                    if ui.button("Desktop wallpaper").on_hover_text("Use your current Windows desktop wallpaper").clicked() {
-                        let tmp = std::env::temp_dir().join(format!("cam-wallpaper-{}.png", std::process::id()));
-                        match super::os::save_desktop_wallpaper(&tmp).and_then(|_| ed.package.import_asset(&tmp, "wallpaper")) {
+                    if ui
+                        .button("Desktop wallpaper")
+                        .on_hover_text("Use your current Windows desktop wallpaper")
+                        .clicked()
+                    {
+                        let tmp = std::env::temp_dir()
+                            .join(format!("cam-wallpaper-{}.png", std::process::id()));
+                        match super::os::save_desktop_wallpaper(&tmp)
+                            .and_then(|_| ed.package.import_asset(&tmp, "wallpaper"))
+                        {
                             Ok(rel) => *path = rel,
-                            Err(e) => ed.status = Some(format!("Couldn't use the desktop wallpaper: {e:#}")),
+                            Err(e) => {
+                                ed.status =
+                                    Some(format!("Couldn't use the desktop wallpaper: {e:#}"))
+                            }
                         }
                         let _ = std::fs::remove_file(&tmp);
                     }
                 });
-                caption(ui, &std::path::Path::new(path.as_str()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "No image".into()));
+                caption(
+                    ui,
+                    &std::path::Path::new(path.as_str())
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "No image".into()),
+                );
             }
         }
         // Blurring a flat colour or a gradient changes nothing.
-        if matches!(s.background, Background::Wallpaper { .. } | Background::Image { .. }) {
+        if matches!(
+            s.background,
+            Background::Wallpaper { .. } | Background::Image { .. }
+        ) {
             slider(ui, "Blur", &mut s.background_blur, 0.0..=60.0, " px");
         }
     });
@@ -208,7 +295,16 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         slider(ui, "Padding", &mut s.padding, 0.0..=40.0, "%");
         row(ui, "Device", |ui| {
             use crate::project::model::DeviceFrame as D;
-            segmented(ui, &mut s.device, &[(D::None, "None"), (D::Laptop, "Laptop"), (D::Phone, "Phone"), (D::Tablet, "Tablet")]);
+            segmented(
+                ui,
+                &mut s.device,
+                &[
+                    (D::None, "None"),
+                    (D::Laptop, "Laptop"),
+                    (D::Phone, "Phone"),
+                    (D::Tablet, "Tablet"),
+                ],
+            );
         });
         if s.device == DeviceFrame::None {
             slider(ui, "Roundness", &mut s.corner_radius, 0.0..=60.0, " px");
@@ -221,12 +317,17 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             slider(ui, "Inset opacity", &mut s.inset.alpha, 0.0..=1.0, "");
         }
         row(ui, "Aspect ratio", |ui| {
-            let label = Aspect::PRESETS.iter().find(|(_, a)| *a == s.aspect).map_or("Custom", |(n, _)| n);
-            egui::ComboBox::from_id_salt("aspect").selected_text(label).show_ui(ui, |ui| {
-                for (n, a) in Aspect::PRESETS {
-                    ui.selectable_value(&mut s.aspect, a, n);
-                }
-            });
+            let label = Aspect::PRESETS
+                .iter()
+                .find(|(_, a)| *a == s.aspect)
+                .map_or("Custom", |(n, _)| n);
+            egui::ComboBox::from_id_salt("aspect")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for (n, a) in Aspect::PRESETS {
+                        ui.selectable_value(&mut s.aspect, a, n);
+                    }
+                });
         });
     });
     section(ui, "Shadow", |ui| {
@@ -236,7 +337,10 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         slider(ui, "Blur", &mut s.shadow.blur, 0.0..=100.0, " px");
     });
     if s.reveal_background(&before) {
-        ed.status = Some(format!("Padding was 0 %, which hides the background, so it's now {} %.", Style::REVEAL_PADDING));
+        ed.status = Some(format!(
+            "Padding was 0 %, which hides the background, so it's now {} %.",
+            Style::REVEAL_PADDING
+        ));
     }
     section(ui, "Crop", |ui| {
         let c = &mut s.crop;
@@ -247,7 +351,12 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         ch |= slider(ui, "Top", &mut t, 0.0..=0.45, "");
         ch |= slider(ui, "Bottom", &mut b, 0.0..=0.45, "");
         if ch {
-            *c = crate::engine::geom::Rect::new(l, t, (1.0 - l - r).max(0.1), (1.0 - t - b).max(0.1));
+            *c = crate::engine::geom::Rect::new(
+                l,
+                t,
+                (1.0 - l - r).max(0.1),
+                (1.0 - t - b).max(0.1),
+            );
         }
         if ui.small_button("Reset crop").clicked() {
             *c = crate::engine::geom::Rect::UNIT;
@@ -255,7 +364,12 @@ fn background(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     });
 }
 
-fn spring_picker(ui: &mut Ui, label: &str, cfg: &mut Option<SpringConfig>, presets: &[(&str, Option<SpringConfig>)]) {
+fn spring_picker(
+    ui: &mut Ui,
+    label: &str,
+    cfg: &mut Option<SpringConfig>,
+    presets: &[(&str, Option<SpringConfig>)],
+) {
     ui.label(label);
     ui.horizontal_wrapped(|ui| {
         for (name, p) in presets {
@@ -266,12 +380,14 @@ fn spring_picker(ui: &mut Ui, label: &str, cfg: &mut Option<SpringConfig>, prese
         }
     });
     if let Some(c) = cfg {
-        egui::CollapsingHeader::new("Customize").id_salt(label).show(ui, |ui| {
-            caption(ui, "Motion follows Newtonian physics: a mass on a spring.");
-            slider(ui, "Rigidity", &mut c.stiffness, 5.0..=1500.0, "");
-            slider(ui, "Smoothness", &mut c.damping, 5.0..=200.0, "");
-            slider(ui, "Momentum", &mut c.mass, 0.1..=15.0, "");
-        });
+        egui::CollapsingHeader::new("Customize")
+            .id_salt(label)
+            .show(ui, |ui| {
+                caption(ui, "Motion follows Newtonian physics: a mass on a spring.");
+                slider(ui, "Rigidity", &mut c.stiffness, 5.0..=1500.0, "");
+                slider(ui, "Smoothness", &mut c.damping, 5.0..=200.0, "");
+                slider(ui, "Momentum", &mut c.mass, 0.1..=15.0, "");
+            });
     }
 }
 
@@ -284,7 +400,15 @@ fn cursor(ui: &mut Ui, d: &mut Project, no_data: bool) {
         toggle_row(ui, "Hide cursor", &mut c.hide);
         slider(ui, "Size", &mut c.size, 0.5..=4.0, "×");
         row(ui, "Style", |ui| {
-            segmented(ui, &mut c.skin, &[(CursorSkin::Touch, "Touch"), (CursorSkin::Vector, "Vector"), (CursorSkin::System, "System")]);
+            segmented(
+                ui,
+                &mut c.skin,
+                &[
+                    (CursorSkin::Touch, "Touch"),
+                    (CursorSkin::Vector, "Vector"),
+                    (CursorSkin::System, "System"),
+                ],
+            );
         });
     });
     section(ui, "Movement", |ui| {
@@ -340,7 +464,13 @@ fn cursor(ui: &mut Ui, d: &mut Project, no_data: bool) {
         }
         toggle_row(ui, "Click sounds", &mut d.style.audio.click_sounds);
         if d.style.audio.click_sounds {
-            slider(ui, "Click volume", &mut d.style.audio.click_volume, 0.0..=1.0, "");
+            slider(
+                ui,
+                "Click volume",
+                &mut d.style.audio.click_volume,
+                0.0..=1.0,
+                "",
+            );
         }
     });
 }
@@ -356,7 +486,16 @@ fn camera(ui: &mut Ui, d: &mut Project, has: bool) {
         widgets::camera_look(ui, c);
         if !c.shape.is_square() {
             row(ui, "Aspect", |ui| {
-                segmented(ui, &mut c.aspect, &[(CameraAspect::Horizontal, "16:9"), (CameraAspect::Vertical, "9:16"), (CameraAspect::Square, "1:1"), (CameraAspect::Original, "Auto")]);
+                segmented(
+                    ui,
+                    &mut c.aspect,
+                    &[
+                        (CameraAspect::Horizontal, "16:9"),
+                        (CameraAspect::Vertical, "9:16"),
+                        (CameraAspect::Square, "1:1"),
+                        (CameraAspect::Original, "Auto"),
+                    ],
+                );
             });
         }
         slider(ui, "Size while zoomed", &mut c.zoom_scale, 0.3..=1.0, "×");
@@ -379,7 +518,10 @@ fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 caption(ui, "Record with the microphone to generate captions.");
             }
         } else {
-            caption(ui, &format!("{} words — click a line to fix it", ed.rec.transcript.len()));
+            caption(
+                ui,
+                &format!("{} words — click a line to fix it", ed.rec.transcript.len()),
+            );
             ui.collapsing("Transcribe again", |ui| {
                 caption(ui, "Replaces the current captions, including your edits.");
                 transcribe_controls(ui, ed);
@@ -388,10 +530,21 @@ fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             let mut edited = None;
             for (i, line) in lines.iter().enumerate() {
                 let id = ui.id().with(("caption-line", i, line.start.to_bits()));
-                let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| line.text());
+                let mut buf = ui
+                    .data_mut(|d| d.get_temp::<String>(id))
+                    .unwrap_or_else(|| line.text());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(widgets::fmt_time(line.start)).size(10.0).color(pal(ui).secondary).monospace());
-                    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(f32::INFINITY).font(egui::FontId::proportional(12.0)));
+                    ui.label(
+                        RichText::new(widgets::fmt_time(line.start))
+                            .size(10.0)
+                            .color(pal(ui).secondary)
+                            .monospace(),
+                    );
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut buf)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::FontId::proportional(12.0)),
+                    );
                     if r.changed() {
                         ui.data_mut(|d| d.insert_temp(id, buf.clone()));
                     }
@@ -406,7 +559,10 @@ fn captions(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             if let Some((line, text)) = edited {
                 let mut words = ed.rec.transcript.clone();
                 crate::engine::captions::edit_line(&mut words, &line, &text);
-                match crate::project::write_json(&crate::transcribe::transcript_path(&ed.package), &words) {
+                match crate::project::write_json(
+                    &crate::transcribe::transcript_path(&ed.package),
+                    &words,
+                ) {
                     Ok(()) => {
                         ed.rec.transcript = words;
                         ed.preview.set_project(&ed.project, &ed.rec);
@@ -427,29 +583,41 @@ fn transcribe_controls(ui: &mut Ui, ed: &mut Editor) {
         let p = &ed.transcribe_progress;
         let pct = p.permille.load(Ordering::Relaxed) as f32 / 10.0;
         let text = match (ed.caption_engine, p.phase.load(Ordering::Relaxed)) {
-            (Engine::Whisper(m), 0) if !m.is_downloaded() => format!("Downloading Whisper {}… {pct:.0}%", m.name()),
+            (Engine::Whisper(m), 0) if !m.is_downloaded() => {
+                format!("Downloading Whisper {}… {pct:.0}%", m.name())
+            }
             (Engine::Whisper(_), _) => format!("Transcribing on device… {pct:.0}%"),
         };
         ui.horizontal(|ui| {
             ui.spinner();
             caption(ui, &text);
         });
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(250));
         return;
     }
     let Engine::Whisper(mut model) = ed.caption_engine;
     let label = |m: Model| {
-        if m.is_downloaded() { format!("{} (downloaded)", m.name()) } else { format!("{} ({} MB download)", m.name(), m.size_mb()) }
+        if m.is_downloaded() {
+            format!("{} (downloaded)", m.name())
+        } else {
+            format!("{} ({} MB download)", m.name(), m.size_mb())
+        }
     };
     row(ui, "Model", |ui| {
-        egui::ComboBox::from_id_salt("whisper-model").selected_text(label(model)).show_ui(ui, |ui| {
-            for m in Model::ALL {
-                ui.selectable_value(&mut model, m, label(m));
-            }
-        });
+        egui::ComboBox::from_id_salt("whisper-model")
+            .selected_text(label(model))
+            .show_ui(ui, |ui| {
+                for m in Model::ALL {
+                    ui.selectable_value(&mut model, m, label(m));
+                }
+            });
     });
     ed.caption_engine = Engine::Whisper(model);
-    caption(ui, "Runs on device with Whisper. Larger models are more accurate but slower.");
+    caption(
+        ui,
+        "Runs on device with Whisper. Larger models are more accurate but slower.",
+    );
     if ui.button("Transcribe microphone").clicked() {
         ed.start_transcription();
     }
@@ -471,12 +639,18 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 caption(ui, "On-device voice isolation removes background noise.");
             }
         } else if ed.rec.meta.system_audio.is_some() {
-            caption(ui, "The microphone was off for this recording (turn it on in the Record options next time).");
+            caption(
+                ui,
+                "The microphone was off for this recording (turn it on in the Record options next time).",
+            );
         }
         if ed.rec.meta.system_audio.is_some() {
             toggle_row(ui, "Mute system audio", &mut a.mute_system);
             if silent(peaks.and_then(|p| p.system)) {
-                caption(ui, "System audio is silent: nothing played that ScreenCaptureKit could capture (sounds from command-line tools aren't).");
+                caption(
+                    ui,
+                    "System audio is silent. Check the Windows output device and play audio while recording.",
+                );
             }
         }
         if ed.rec.meta.mic.is_none() && ed.rec.meta.system_audio.is_none() {
@@ -486,7 +660,9 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     section(ui, "Background music", |ui| {
         ui.horizontal(|ui| {
             if ui.button("Choose…").clicked()
-                && let Some(f) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "m4a", "wav", "aac", "aiff"]).pick_file()
+                && let Some(f) = rfd::FileDialog::new()
+                    .add_filter("Audio", &["mp3", "m4a", "wav", "aac", "aiff"])
+                    .pick_file()
             {
                 a.music = Some(f.to_string_lossy().into_owned());
             }
@@ -495,7 +671,13 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             }
         });
         if let Some(m) = &a.music {
-            caption(ui, &std::path::Path::new(m).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            caption(
+                ui,
+                &std::path::Path::new(m)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
             slider(ui, "Music volume", &mut a.music_volume, 0.0..=1.0, "");
         }
     });
@@ -504,7 +686,8 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
             Some(elapsed) => {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 5.0, Color32::from_rgb(255, 59, 48));
+                    ui.painter()
+                        .circle_filled(rect.center(), 5.0, Color32::from_rgb(255, 59, 48));
                     ui.label(format!("Recording {elapsed:.1} s"));
                     if ui.button("Stop").clicked() {
                         ed.deferred = Some(Deferred::StopVoice);
@@ -512,21 +695,41 @@ fn audio(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
                 });
             }
             None => {
-                if ui.button("Record from playhead").on_hover_text("Narrate over the video; the preview plays silently").clicked() {
+                if ui
+                    .button("Record from playhead")
+                    .on_hover_text("Narrate over the video; the preview plays silently")
+                    .clicked()
+                {
                     ed.deferred = Some(Deferred::StartVoice);
                 }
-                
             }
         }
         if !d.timeline.voiceovers.is_empty() {
-            toggle_row(ui, "Lower recorded audio", &mut d.style.audio.duck_under_voiceover);
+            toggle_row(
+                ui,
+                "Lower recorded audio",
+                &mut d.style.audio.duck_under_voiceover,
+            );
             if d.style.audio.duck_under_voiceover {
-                slider(ui, "Level under voice", &mut d.style.audio.duck_level, 0.0..=1.0, "");
+                slider(
+                    ui,
+                    "Level under voice",
+                    &mut d.style.audio.duck_level,
+                    0.0..=1.0,
+                    "",
+                );
             }
             let mut remove = None;
             for vo in &mut d.timeline.voiceovers {
                 ui.horizontal(|ui| {
-                    caption(ui, &format!("{} · {:.1} s", widgets::fmt_time(vo.start), vo.duration / 1000.0));
+                    caption(
+                        ui,
+                        &format!(
+                            "{} · {:.1} s",
+                            widgets::fmt_time(vo.start),
+                            vo.duration / 1000.0
+                        ),
+                    );
                     ui.add(egui::Slider::new(&mut vo.volume, 0.0..=2.0).show_value(false));
                     if ui.small_button("Delete").clicked() {
                         remove = Some(vo.id);
@@ -547,7 +750,10 @@ fn shortcuts(ui: &mut Ui, d: &mut Project, keys: usize) {
         toggle_row(ui, "Include single keys", &mut s.single_keys);
         slider(ui, "Size", &mut s.size, 0.5..=2.0, "×");
         if keys == 0 {
-            caption(ui, "No key presses were recorded. Key logging requires appropriate permissions on Windows.");
+            caption(
+                ui,
+                "No key presses were recorded. Enable key logging before recording; Windows may block input from elevated applications.",
+            );
         } else {
             caption(ui, &format!("{keys} key events recorded"));
         }
@@ -557,7 +763,15 @@ fn shortcuts(ui: &mut Ui, d: &mut Project, keys: usize) {
 fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     section(ui, "Zoom animation", |ui| {
         let mut cfg = Some(d.style.screen_spring);
-        spring_picker(ui, "Style", &mut cfg, &[("Focused", Some(SpringConfig::SCREEN_FOCUSED)), ("Smooth", Some(SpringConfig::SCREEN_SMOOTH))]);
+        spring_picker(
+            ui,
+            "Style",
+            &mut cfg,
+            &[
+                ("Focused", Some(SpringConfig::SCREEN_FOCUSED)),
+                ("Smooth", Some(SpringConfig::SCREEN_SMOOTH)),
+            ],
+        );
         if let Some(c) = cfg {
             d.style.screen_spring = c;
         }
@@ -572,10 +786,21 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
         });
     });
     section(ui, "Automatic zooms", |ui| {
-        slider(ui, "Default zoom", &mut d.style.default_zoom, 1.2..=4.0, "×");
+        slider(
+            ui,
+            "Default zoom",
+            &mut d.style.default_zoom,
+            1.2..=4.0,
+            "×",
+        );
         if ui.button("Regenerate from clicks").clicked() {
             let events = crate::engine::events::Events::new(ed.rec.mouse.clone());
-            let zooms = crate::engine::zoom::auto_zooms(&events.downs, ed.rec.meta.duration_ms, d.style.default_zoom, &mut d.timeline);
+            let zooms = crate::engine::zoom::auto_zooms(
+                &events.downs,
+                ed.rec.meta.duration_ms,
+                d.style.default_zoom,
+                &mut d.timeline,
+            );
             d.timeline.zooms = zooms;
         }
         let n = d.timeline.zooms.len();
@@ -584,16 +809,33 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
     section(ui, "Typing", |ui| {
         let runs = crate::engine::typing::ranges(&ed.rec.keys);
         if runs.is_empty() {
-            caption(ui, if ed.rec.keys.is_empty() { "No key presses were recorded." } else { "No typing sections found." });
+            caption(
+                ui,
+                if ed.rec.keys.is_empty() {
+                    "No key presses were recorded."
+                } else {
+                    "No typing sections found."
+                },
+            );
             return;
         }
         let secs: f64 = runs.iter().map(|(s, e)| e - s).sum::<f64>() / 1000.0;
-        caption(ui, &format!("{} typing section{} ({secs:.1} s). Speed them up:", runs.len(), if runs.len() == 1 { "" } else { "s" }));
+        caption(
+            ui,
+            &format!(
+                "{} typing section{} ({secs:.1} s). Speed them up:",
+                runs.len(),
+                if runs.len() == 1 { "" } else { "s" }
+            ),
+        );
         ui.horizontal(|ui| {
             for speed in [2.0, 3.0, 4.0] {
                 if ui.button(format!("{speed}×")).clicked() {
                     let n = crate::engine::typing::speed_up(&mut d.timeline, &runs, speed);
-                    ed.status = Some(format!("Sped up {n} typing section{} to {speed}×", if n == 1 { "" } else { "s" }));
+                    ed.status = Some(format!(
+                        "Sped up {n} typing section{} to {speed}×",
+                        if n == 1 { "" } else { "s" }
+                    ));
                 }
             }
         });
@@ -601,7 +843,9 @@ fn animation(ui: &mut Ui, ed: &mut Editor, d: &mut Project) {
 }
 
 fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
-    let Some(z) = d.timeline.zooms.iter_mut().find(|z| z.id == id) else { return };
+    let Some(z) = d.timeline.zooms.iter_mut().find(|z| z.id == id) else {
+        return;
+    };
     let mut delete = false;
     section(ui, "Zoom", |ui| {
         slider(ui, "Zoom level", &mut z.scale, 1.0..=5.0, "×");
@@ -610,9 +854,15 @@ fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
             ZoomMode::Manual { .. } => 1,
             ZoomMode::FollowMouse => 2,
         };
-        if segmented(ui, &mut mode, &[(0, "Auto"), (1, "Manual"), (2, "Follow mouse")]) {
+        if segmented(
+            ui,
+            &mut mode,
+            &[(0, "Auto"), (1, "Manual"), (2, "Follow mouse")],
+        ) {
             z.mode = match mode {
-                1 => ZoomMode::Manual { target: v2(0.5, 0.5) },
+                1 => ZoomMode::Manual {
+                    target: v2(0.5, 0.5),
+                },
                 2 => ZoomMode::FollowMouse,
                 _ => ZoomMode::Auto,
             };
@@ -626,7 +876,14 @@ fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
         }
         toggle_row(ui, "Instant (no animation)", &mut z.instant);
         toggle_row(ui, "Disabled", &mut z.disabled);
-        caption(ui, &format!("{} – {}", widgets::fmt_time(z.start), widgets::fmt_time(z.end)));
+        caption(
+            ui,
+            &format!(
+                "{} – {}",
+                widgets::fmt_time(z.start),
+                widgets::fmt_time(z.end)
+            ),
+        );
         delete = ui.button("Delete zoom").clicked();
     });
     if delete {
@@ -639,12 +896,17 @@ fn zoom_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
 }
 
 fn slice_panel(ui: &mut Ui, d: &mut Project, id: u64) {
-    let Some(s) = d.timeline.slices.iter_mut().find(|s| s.id == id) else { return };
+    let Some(s) = d.timeline.slices.iter_mut().find(|s| s.id == id) else {
+        return;
+    };
     section(ui, "Clip", |ui| {
         ui.label("Speed");
         ui.horizontal_wrapped(|ui| {
             for sp in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 8.0] {
-                if ui.selectable_label((s.speed - sp).abs() < 1e-6, format!("{sp}×")).clicked() {
+                if ui
+                    .selectable_label((s.speed - sp).abs() < 1e-6, format!("{sp}×"))
+                    .clicked()
+                {
                     s.speed = sp;
                 }
             }
@@ -653,14 +915,31 @@ fn slice_panel(ui: &mut Ui, d: &mut Project, id: u64) {
         slider(ui, "System volume", &mut s.system_volume, 0.0..=2.0, "");
         toggle_row(ui, "Hide cursor", &mut s.hide_cursor);
         toggle_row(ui, "Raw cursor movement", &mut s.no_smoothing);
-        caption(ui, &format!("Source {} – {}", widgets::fmt_time(s.start), widgets::fmt_time(s.end)));
+        caption(
+            ui,
+            &format!(
+                "Source {} – {}",
+                widgets::fmt_time(s.start),
+                widgets::fmt_time(s.end)
+            ),
+        );
     });
 }
 
 fn layout_panel(ui: &mut Ui, d: &mut Project, id: u64) {
-    let Some(l) = d.timeline.layouts.iter_mut().find(|l| l.id == id) else { return };
+    let Some(l) = d.timeline.layouts.iter_mut().find(|l| l.id == id) else {
+        return;
+    };
     section(ui, "Camera layout", |ui| {
-        segmented(ui, &mut l.kind, &[(LayoutKind::Both, "Both"), (LayoutKind::ScreenOnly, "Screen"), (LayoutKind::CameraOnly, "Camera")]);
+        segmented(
+            ui,
+            &mut l.kind,
+            &[
+                (LayoutKind::Both, "Both"),
+                (LayoutKind::ScreenOnly, "Screen"),
+                (LayoutKind::CameraOnly, "Camera"),
+            ],
+        );
         if l.kind == LayoutKind::Both {
             let mut size = l.camera_size.unwrap_or(0.35);
             if slider(ui, "Camera size", &mut size, 0.1..=0.8, "") {
@@ -672,11 +951,21 @@ fn layout_panel(ui: &mut Ui, d: &mut Project, id: u64) {
 
 fn mask_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
     use crate::project::model::{Mask, MaskKind};
-    let Some(m) = d.timeline.masks.iter_mut().find(|m| m.id == id) else { return };
+    let Some(m) = d.timeline.masks.iter_mut().find(|m| m.id == id) else {
+        return;
+    };
     let mut delete = false;
     section(ui, "Mask", |ui| {
         let before = m.kind;
-        segmented(ui, &mut m.kind, &[(MaskKind::Blur, "Blur"), (MaskKind::Pixelate, "Pixelate"), (MaskKind::Highlight, "Highlight")]);
+        segmented(
+            ui,
+            &mut m.kind,
+            &[
+                (MaskKind::Blur, "Blur"),
+                (MaskKind::Pixelate, "Pixelate"),
+                (MaskKind::Highlight, "Highlight"),
+            ],
+        );
         if m.kind != before {
             m.amount = Mask::default_amount(m.kind);
         }
@@ -686,14 +975,24 @@ fn mask_panel(ui: &mut Ui, ed: &mut Editor, d: &mut Project, id: u64) {
             MaskKind::Highlight => slider(ui, "Dim", &mut m.amount, 0.1..=0.95, ""),
         };
         slider(ui, "Roundness", &mut m.radius, 0.0..=60.0, " px");
-        caption(ui, "Drag on the preview to draw the region; drag inside it to move.");
+        caption(
+            ui,
+            "Drag on the preview to draw the region; drag inside it to move.",
+        );
         egui::CollapsingHeader::new("Position").show(ui, |ui| {
             slider(ui, "Left", &mut m.rect.x, 0.0..=1.0, "");
             slider(ui, "Top", &mut m.rect.y, 0.0..=1.0, "");
             slider(ui, "Width", &mut m.rect.w, 0.01..=1.0, "");
             slider(ui, "Height", &mut m.rect.h, 0.01..=1.0, "");
         });
-        caption(ui, &format!("{} – {}", widgets::fmt_time(m.start), widgets::fmt_time(m.end)));
+        caption(
+            ui,
+            &format!(
+                "{} – {}",
+                widgets::fmt_time(m.start),
+                widgets::fmt_time(m.end)
+            ),
+        );
         ui.horizontal(|ui| {
             if ui.button("Delete mask").clicked() {
                 delete = true;

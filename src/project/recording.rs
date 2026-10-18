@@ -128,7 +128,7 @@ pub struct Word {
 }
 
 /// Everything loaded from `recording/`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Recording {
     pub meta: RecordingMeta,
     pub mouse: Vec<MouseEvent>,

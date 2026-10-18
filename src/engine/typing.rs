@@ -17,7 +17,9 @@ pub const MARGIN_MS: f64 = 150.0;
 pub fn ranges(keys: &[KeyEvent]) -> Vec<(f64, f64)> {
     let mut out = vec![];
     let mut run: Option<(f64, f64, usize)> = None;
-    let typing = keys.iter().filter(|k| k.down && k.mods & (mods::CMD | mods::CTRL) == 0);
+    let typing = keys.iter().filter(|k| {
+        k.down && !crate::engine::keys::modifier_only(k) && k.mods & (mods::CMD | mods::CTRL) == 0
+    });
     for k in typing {
         run = match run {
             Some((s, e, n)) if k.t - e <= MAX_GAP_MS => Some((s, k.t, n + 1)),
@@ -36,17 +38,28 @@ pub fn ranges(keys: &[KeyEvent]) -> Vec<(f64, f64)> {
     {
         out.push((s, e));
     }
-    out.into_iter().map(|(s, e)| (s + MARGIN_MS, e - MARGIN_MS)).filter(|(s, e)| e > s).collect()
+    out.into_iter()
+        .map(|(s, e)| (s + MARGIN_MS, e - MARGIN_MS))
+        .filter(|(s, e)| e > s)
+        .collect()
 }
 
 /// Split slices at a source time (at least 100 ms from slice edges).
 /// Returns false when no slice could be split there.
 pub fn split_at(tl: &mut Timeline, t: f64) -> bool {
-    let Some(i) = tl.slices.iter().position(|s| t > s.start + 100.0 && t < s.end - 100.0) else {
+    let Some(i) = tl
+        .slices
+        .iter()
+        .position(|s| t > s.start + 100.0 && t < s.end - 100.0)
+    else {
         return false;
     };
     let id = tl.new_id();
-    let right = Slice { id, start: t, ..tl.slices[i] };
+    let right = Slice {
+        id,
+        start: t,
+        ..tl.slices[i]
+    };
     tl.slices[i].end = t;
     tl.slices.insert(i + 1, right);
     true
@@ -62,7 +75,10 @@ pub fn speed_up(tl: &mut Timeline, ranges: &[(f64, f64)], speed: f64) -> usize {
     let mut n = 0;
     for slice in &mut tl.slices {
         let mid = (slice.start + slice.end) * 0.5;
-        if ranges.iter().any(|&(s, e)| mid > s && mid < e && slice.start >= s - 1.0 && slice.end <= e + 1.0) {
+        if ranges
+            .iter()
+            .any(|&(s, e)| mid > s && mid < e && slice.start >= s - 1.0 && slice.end <= e + 1.0)
+        {
             slice.speed = speed;
             n += 1;
         }
@@ -78,7 +94,12 @@ pub fn cut(tl: &mut Timeline, duration: f64, s: f64, e: f64) -> bool {
     const MIN_PIECE_MS: f64 = 100.0;
     if tl.slices.is_empty() {
         let id = tl.new_id();
-        tl.slices.push(Slice { id, start: 0.0, end: duration, ..Default::default() });
+        tl.slices.push(Slice {
+            id,
+            start: 0.0,
+            end: duration,
+            ..Default::default()
+        });
     }
     let mut out = Vec::with_capacity(tl.slices.len() + 1);
     let mut changed = false;
@@ -110,8 +131,34 @@ pub fn cut(tl: &mut Timeline, duration: f64, s: f64, e: f64) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn modifier_rows_do_not_count_as_typing_but_shifted_letters_do() {
+        let mut events: Vec<_> = (0..10)
+            .map(|i| KeyEvent {
+                t: i as f64 * 400.0,
+                code: 0x10,
+                key: "Shift".into(),
+                mods: mods::SHIFT,
+                down: true,
+            })
+            .collect();
+        assert!(ranges(&events).is_empty());
+        for event in &mut events {
+            event.code = 0x41;
+            event.key = "A".into();
+        }
+        assert_eq!(ranges(&events).len(), 1);
+    }
+
     fn key(t: f64, m: u8) -> KeyEvent {
-        KeyEvent { t, code: 0, key: "A".into(), mods: m, down: true }
+        KeyEvent {
+            t,
+            code: 0,
+            key: "A".into(),
+            mods: m,
+            down: true,
+        }
     }
 
     #[test]
@@ -122,7 +169,10 @@ mod tests {
         keys.push(key(20_000.0, 0));
         let r = ranges(&keys);
         assert_eq!(r.len(), 1);
-        assert!((r[0].0 - 1150.0).abs() < 1e-9 && (r[0].1 - 4650.0).abs() < 1e-9, "{r:?}");
+        assert!(
+            (r[0].0 - 1150.0).abs() < 1e-9 && (r[0].1 - 4650.0).abs() < 1e-9,
+            "{r:?}"
+        );
     }
 
     #[test]
@@ -135,11 +185,28 @@ mod tests {
     fn speed_up_splits_and_sets_speed() {
         let mut tl = Timeline::default();
         let id = tl.new_id();
-        tl.slices.push(Slice { id, start: 0.0, end: 10_000.0, speed: 1.0, ..Default::default() });
+        tl.slices.push(Slice {
+            id,
+            start: 0.0,
+            end: 10_000.0,
+            speed: 1.0,
+            ..Default::default()
+        });
         let n = speed_up(&mut tl, &[(2000.0, 5000.0)], 3.0);
         assert_eq!(n, 1);
-        let spans: Vec<_> = tl.slices.iter().map(|s| (s.start, s.end, s.speed)).collect();
-        assert_eq!(spans, vec![(0.0, 2000.0, 1.0), (2000.0, 5000.0, 3.0), (5000.0, 10_000.0, 1.0)]);
+        let spans: Vec<_> = tl
+            .slices
+            .iter()
+            .map(|s| (s.start, s.end, s.speed))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (0.0, 2000.0, 1.0),
+                (2000.0, 5000.0, 3.0),
+                (5000.0, 10_000.0, 1.0)
+            ]
+        );
     }
 
     #[test]

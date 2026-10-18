@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const KEY_R: u32 = 15;
+pub const KEY_R: u32 = 0x52;
 pub const CMD: u32 = 1 << 8;
 pub const SHIFT: u32 = 1 << 9;
 pub const OPTION: u32 = 1 << 11;
@@ -26,7 +26,12 @@ impl Combo {
     /// "Ctrl+Shift+R" style label.
     pub fn label(&self) -> String {
         let mut s = String::new();
-        for (bit, glyph) in [(CONTROL, "Ctrl+"), (OPTION, "Alt+"), (SHIFT, "Shift+"), (CMD, "Win+")] {
+        for (bit, glyph) in [
+            (CONTROL, "Ctrl+"),
+            (OPTION, "Alt+"),
+            (SHIFT, "Shift+"),
+            (CMD, "Win+"),
+        ] {
             if self.mods & bit != 0 {
                 s.push_str(glyph);
             }
@@ -39,7 +44,7 @@ impl Combo {
     pub fn from_egui(key: egui::Key, m: egui::Modifiers) -> Option<Combo> {
         let code = egui_to_vk(key)?;
         let mut mods = 0;
-        if m.mac_cmd || m.command {
+        if m.mac_cmd {
             mods |= CMD;
         }
         if m.shift {
@@ -48,7 +53,7 @@ impl Combo {
         if m.alt {
             mods |= OPTION;
         }
-        if m.ctrl && !m.command {
+        if m.ctrl {
             mods |= CONTROL;
         }
         let is_fkey = K_F_KEYS.iter().any(|(k, _)| *k == code);
@@ -56,18 +61,93 @@ impl Combo {
     }
 }
 
-thread_local! {
-    static CALLBACKS: RefCell<HashMap<u32, Box<dyn Fn()>>> = RefCell::new(HashMap::new());
+struct Binding {
+    callback: Box<dyn Fn()>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread_id: u32,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
-
-/// Bind `combo` to slot `id` (replacing any previous binding of that slot).
-pub fn bind(id: u32, _combo: Combo, callback: impl Fn() + 'static) -> Result<(), i32> {
+impl Drop for Binding {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                self.thread_id,
+                windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+thread_local! {static CALLBACKS:RefCell<HashMap<u32,Binding>>=RefCell::new(HashMap::new());}
+pub fn bind(id: u32, combo: Combo, callback: impl Fn() + 'static) -> Result<(), i32> {
     unbind(id);
-    CALLBACKS.with(|c| c.borrow_mut().insert(id, Box::new(callback)));
+    let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = pending.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        use windows::Win32::{
+            System::Threading::GetCurrentThreadId,
+            UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        };
+        let mut mods = MOD_NOREPEAT;
+        for (bit, win) in [
+            (CONTROL, MOD_CONTROL),
+            (SHIFT, MOD_SHIFT),
+            (OPTION, MOD_ALT),
+            (CMD, MOD_WIN),
+        ] {
+            if combo.mods & bit != 0 {
+                mods |= win;
+            }
+        }
+        unsafe {
+            let mut message = MSG::default();
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            match RegisterHotKey(None, id as i32, mods, combo.key) {
+                Ok(()) => {
+                    let _ = tx.send(Ok(GetCurrentThreadId()));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.code().0));
+                    return;
+                }
+            }
+            while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+                if message.message == WM_HOTKEY {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                    super::wake();
+                }
+            }
+            let _ = UnregisterHotKey(None, id as i32);
+        }
+    });
+    let thread_id = rx.recv().map_err(|_| -1)??;
+    CALLBACKS.with(|c| {
+        c.borrow_mut().insert(
+            id,
+            Binding {
+                callback: Box::new(callback),
+                pending,
+                thread_id,
+                thread: Some(thread),
+            },
+        )
+    });
     Ok(())
 }
-
-/// Remove the binding of slot `id`, if any.
+pub fn poll() {
+    CALLBACKS.with(|c| {
+        for b in c.borrow().values() {
+            if b.pending.swap(false, std::sync::atomic::Ordering::Acquire) {
+                (b.callback)();
+            }
+        }
+    });
+}
 pub fn unbind(id: u32) {
     CALLBACKS.with(|c| c.borrow_mut().remove(&id));
 }
@@ -78,60 +158,113 @@ pub fn register(key: u32, modifiers: u32, callback: impl Fn() + 'static) -> Resu
 }
 
 const K_F_KEYS: [(u32, &str); 12] = [
-    (122, "F1"),
-    (120, "F2"),
-    (99, "F3"),
-    (118, "F4"),
-    (96, "F5"),
-    (97, "F6"),
-    (98, "F7"),
-    (100, "F8"),
-    (101, "F9"),
-    (109, "F10"),
-    (103, "F11"),
-    (111, "F12"),
+    (112, "F1"),
+    (113, "F2"),
+    (114, "F3"),
+    (115, "F4"),
+    (116, "F5"),
+    (117, "F6"),
+    (118, "F7"),
+    (119, "F8"),
+    (120, "F9"),
+    (121, "F10"),
+    (122, "F11"),
+    (123, "F12"),
 ];
-
-/// Virtual key codes for letters and digits.
-const LETTERS: [(u32, char); 36] = [
-    (0, 'A'), (11, 'B'), (8, 'C'), (2, 'D'), (14, 'E'), (3, 'F'), (5, 'G'), (4, 'H'), (34, 'I'),
-    (38, 'J'), (40, 'K'), (37, 'L'), (46, 'M'), (45, 'N'), (31, 'O'), (35, 'P'), (12, 'Q'), (15, 'R'),
-    (1, 'S'), (17, 'T'), (32, 'U'), (9, 'V'), (13, 'W'), (7, 'X'), (16, 'Y'), (6, 'Z'), (29, '0'),
-    (18, '1'), (19, '2'), (20, '3'), (21, '4'), (23, '5'), (22, '6'), (26, '7'), (28, '8'), (25, '9'),
-];
-
 fn key_name(code: u32) -> String {
-    if let Some((_, c)) = LETTERS.iter().find(|(k, _)| *k == code) {
-        return c.to_string();
+    if (0x30..=0x5a).contains(&code) {
+        return char::from_u32(code).unwrap().to_string();
     }
     if let Some((_, n)) = K_F_KEYS.iter().find(|(k, _)| *k == code) {
         return n.to_string();
     }
     match code {
-        49 => "Space".into(),
-        36 => "Enter".into(),
-        53 => "Esc".into(),
+        32 => "Space".into(),
+        13 => "Enter".into(),
+        27 => "Esc".into(),
         _ => format!("Key {code}"),
     }
 }
-
 fn egui_to_vk(key: egui::Key) -> Option<u32> {
-    use egui::Key::*;
-    let c = match key {
-        A => 'A', B => 'B', C => 'C', D => 'D', E => 'E', F => 'F', G => 'G', H => 'H',
-        I => 'I', J => 'J', K => 'K', L => 'L', M => 'M', N => 'N', O => 'O', P => 'P',
-        Q => 'Q', R => 'R', S => 'S', T => 'T', U => 'U', V => 'V', W => 'W', X => 'X',
-        Y => 'Y', Z => 'Z',
-        Num0 => '0', Num1 => '1', Num2 => '2', Num3 => '3', Num4 => '4',
-        Num5 => '5', Num6 => '6', Num7 => '7', Num8 => '8', Num9 => '9',
-        F1 => return Some(122), F2 => return Some(120), F3 => return Some(99),
-        F4 => return Some(118), F5 => return Some(96), F6 => return Some(97),
-        F7 => return Some(98), F8 => return Some(100), F9 => return Some(101),
-        F10 => return Some(109), F11 => return Some(103), F12 => return Some(111),
-        Space => return Some(49),
-        Enter => return Some(36),
-        Escape => return Some(53),
-        _ => return None,
-    };
-    LETTERS.iter().find(|(_, ch)| *ch == c).map(|(k, _)| *k)
+    let name = format!("{key:?}");
+    if name.len() == 1 {
+        return Some(name.as_bytes()[0] as u32);
+    }
+    if let Some(d) = name.strip_prefix("Num") {
+        return d.parse::<u32>().ok().map(|n| 0x30 + n);
+    }
+    if let Some(f) = name.strip_prefix('F').and_then(|s| s.parse::<u32>().ok()) {
+        if (1..=12).contains(&f) {
+            return Some(111 + f);
+        }
+    }
+    match key {
+        egui::Key::Space => Some(32),
+        egui::Key::Enter => Some(13),
+        egui::Key::Escape => Some(27),
+        _ => None,
+    }
+}
+
+/// Release registrations while Windows worker threads are still running.
+pub fn shutdown() {
+    CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+}
+
+/// Migrate pre-port settings, which stored Apple key codes even on Windows.
+pub fn migrate_legacy(mut combo: Combo) -> Combo {
+    let original = combo;
+    let codes = [
+        0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16,
+        6, 29, 18, 19, 20, 21, 23, 22, 26, 28, 25,
+    ];
+    if let Some(i) = codes.iter().position(|k| *k == combo.key) {
+        combo.key = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[i] as u32;
+    } else {
+        combo.key = match combo.key {
+            49 => 32,
+            36 => 13,
+            53 => 27,
+            122 => 112,
+            120 => 113,
+            99 => 114,
+            118 => 115,
+            96 => 116,
+            97 => 117,
+            98 => 118,
+            100 => 119,
+            101 => 120,
+            109 => 121,
+            103 => 122,
+            111 => 123,
+            key => key,
+        };
+    }
+    if combo.mods & CMD != 0 {
+        combo.mods = (combo.mods & !CMD) | CONTROL;
+    }
+    if [15, 35].contains(&original.key) && original.mods == CMD | SHIFT | OPTION {
+        combo.mods = CONTROL | SHIFT;
+    }
+    combo
+}
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn old_defaults_become_windows_defaults() {
+        assert_eq!(
+            migrate_legacy(Combo::new(15, CMD | SHIFT | OPTION)),
+            Combo::new(0x52, CONTROL | SHIFT)
+        );
+        assert_eq!(
+            migrate_legacy(Combo::new(35, CMD | SHIFT | OPTION)),
+            Combo::new(0x50, CONTROL | SHIFT)
+        );
+        assert_eq!(
+            migrate_legacy(Combo::new(8, CMD)),
+            Combo::new(0x43, CONTROL)
+        );
+        assert_eq!(migrate_legacy(Combo::new(122, 0)), Combo::new(112, 0));
+    }
 }

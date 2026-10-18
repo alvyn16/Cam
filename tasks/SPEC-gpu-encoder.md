@@ -1,0 +1,13 @@
+# Spec: gpu-encoder
+
+Consume gpu-surfaces NativeFrame textures using Media Foundation's DXGI device manager and DXGI surface buffers. Encode H.264/HEVC with accurate rational timestamps and configured bitrate. Use owned staging output and finalize before publication. Drop/error/cancel must clean only the encoder's staging file. Keep COM/MF lifetime on the creating thread and release sink objects before MF shutdown.
+
+Select hardware transforms explicitly through the sink writer and verify the actual encoder's identity/attributes against hardware enumeration. Inspect intermediate transforms for D3D11 awareness; accepting texture-shaped input alone is not proof of a hardware/GPU pipeline. If the native route cannot satisfy these conditions, return a contextual error for the established FFmpeg fallback. Do not change production selection until the native encoder independently passes.
+
+An explicit connected-GPU test must encode moving/alternating color surfaces, independently probe codec/dimensions/frame count/duration and decode representative pixels. Cover early drop, invalid frame dimensions and preservation of an existing destination. Track native encoder identity and intermediate GPU transform evidence. Run H.264 and HEVC where supported; document unsupported codecs rather than substituting silently.
+
+Commands: `cargo test -j1 --lib media::mf_encoder::tests -- --ignored --test-threads=1 --nocapture`. The subsequent gpu-export slice must preserve file-backed audio muxing, file-size fitting, cancellation and CPU/software fallback. This encoder test alone does not complete production GPU export, GPU decoding/capture or USB parity.
+
+Prototype evidence: NVIDIA H.264/HEVC MFT identities matched adapter-filtered hardware enumeration, all selected transforms were D3D11-aware, 60 frames per codec independently decoded with correct dimensions/timing/colors, and drop before/after queued frames preserved the old destination and removed staging files. GPU conversion matched BT.709 limited-range NV12 for red/blue/black/white. Windows explicitly forbids combining MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS and MF_READWRITE_DISABLE_CONVERTERS; inspect the selected pipeline instead of setting that incompatible pair. See https://learn.microsoft.com/en-us/windows/win32/medfound/mf-readwrite-enable-hardware-transforms.
+
+Subsequent integration now supplies callback-driven finalization/cancellation, bounded shared-target/MF input pools, native GPU completion fencing, actual quality parameters, and a shared disk-audio mux boundary. See SPEC-gpu-export.md for sustained allocation, edited/audio/size-target evidence and remaining default/release checks. These additions still do not supply GPU source decoding/capture or direct USB capture.

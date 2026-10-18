@@ -1,11 +1,13 @@
-//! Windows screen and window capture using Windows Graphics Capture (WGC).
+//! Windows display/window enumeration and native frame callbacks.
 
 use anyhow::Result;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::platform::capture::{CaptureSession, CaptureTarget, DisplayInfo, ScreenCaptureBackend, WindowInfo};
+use crate::platform::capture::{
+    CaptureSession, CaptureTarget, DisplayInfo, ScreenCaptureBackend, WindowInfo,
+};
 use crate::render::VideoFrame;
 
 pub struct WindowsScreenCaptureBackend;
@@ -17,12 +19,20 @@ impl WindowsScreenCaptureBackend {
 }
 
 pub struct WindowsCaptureSession {
-    _active: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
-
 impl CaptureSession for WindowsCaptureSession {
     fn stop(&mut self) {
-        self._active = false;
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+impl Drop for WindowsCaptureSession {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -41,8 +51,8 @@ unsafe extern "system" fn enum_monitors_callback(
         let w = (r.right - r.left).max(0) as usize;
         let h = (r.bottom - r.top).max(0) as usize;
         list.push(DisplayInfo {
-            id: list.len() as u32,
-            points: (r.left as i64, r.top as i64),
+            id: hmonitor.0 as u32,
+            points: (w as i64, h as i64),
             pixels: (w, h),
         });
     }
@@ -71,7 +81,37 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
 
     list.push(WindowInfo {
         id: hwnd.0 as u32,
-        app: "Windows App".into(),
+        app: {
+            use windows::Win32::System::Threading::*;
+            let mut pid = 0;
+            unsafe {
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            }
+            let mut name = format!("Process {pid}");
+            unsafe {
+                if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    let mut buf = [0u16; 1024];
+                    let mut size = buf.len() as u32;
+                    if QueryFullProcessImageNameW(
+                        process,
+                        PROCESS_NAME_WIN32,
+                        windows::core::PWSTR(buf.as_mut_ptr()),
+                        &mut size,
+                    )
+                    .is_ok()
+                    {
+                        let path = String::from_utf16_lossy(&buf[..size as usize]);
+                        name = std::path::Path::new(&path)
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                    }
+                    let _ = CloseHandle(process);
+                }
+            }
+            name
+        },
         title,
         size: (w, h),
     });
@@ -81,7 +121,8 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
 
 impl ScreenCaptureBackend for WindowsScreenCaptureBackend {
     fn displays(&self) -> Result<Vec<DisplayInfo>> {
-        let mut list = Vec::new();
+        super::ensure_dpi_awareness();
+        let mut list: Vec<DisplayInfo> = Vec::new();
         unsafe {
             let _ = EnumDisplayMonitors(
                 None,
@@ -90,10 +131,14 @@ impl ScreenCaptureBackend for WindowsScreenCaptureBackend {
                 LPARAM(&mut list as *mut _ as isize),
             );
         }
+        let primary =
+            unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) }.0 as u32;
+        list.sort_by_key(|d| d.id != primary);
         Ok(list)
     }
 
     fn windows(&self) -> Result<Vec<WindowInfo>> {
+        super::ensure_dpi_awareness();
         let mut list = Vec::new();
         unsafe {
             let _ = EnumWindows(
@@ -106,11 +151,72 @@ impl ScreenCaptureBackend for WindowsScreenCaptureBackend {
 
     fn start_capture(
         &self,
-        _target: &CaptureTarget,
-        _fps: u32,
-        _on_frame: Box<dyn FnMut(&VideoFrame) + Send + 'static>,
+        target: &CaptureTarget,
+        fps: u32,
+        mut on_frame: Box<dyn FnMut(&VideoFrame) + Send + 'static>,
     ) -> Result<Box<dyn CaptureSession>> {
-        // Initializes WGC Direct3D11CaptureFramePool
-        Ok(Box::new(WindowsCaptureSession { _active: true }))
+        let target = match target {
+            CaptureTarget::Display { id } | CaptureTarget::Area { display: id, .. } => {
+                let d = crate::capture::screen::displays()?
+                    .into_iter()
+                    .find(|d| *id == 0 || d.id == *id)
+                    .ok_or_else(|| anyhow::anyhow!("display unavailable"))?;
+                let area = if let CaptureTarget::Area { rect, .. } = target {
+                    Some(*rect)
+                } else {
+                    None
+                };
+                Some(crate::capture::screen::Target::Display(d, area))
+            }
+            CaptureTarget::Window { id } => Some(crate::capture::screen::Target::Window(
+                crate::capture::screen::find_window(&id.to_string())?,
+            )),
+            CaptureTarget::Pattern => None,
+            CaptureTarget::Device { .. } => anyhow::bail!("device capture uses the camera backend"),
+        };
+        let capture = target
+            .as_ref()
+            .map(|t| crate::capture::wgc::Stream::start(t, fps, false))
+            .transpose()?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let end = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !end.load(std::sync::atomic::Ordering::Acquire) {
+                let now = std::time::Instant::now();
+                let image = match &capture {
+                    Some(c) => c.snapshot(),
+                    None => Ok(crate::capture::grab::Image {
+                        width: 640,
+                        height: 400,
+                        bgra: crate::synth::screen_bgra(
+                            640,
+                            400,
+                            start.elapsed().as_secs_f64() * 1000.0,
+                        ),
+                    }),
+                };
+                match image {
+                    Ok(f) => on_frame(&VideoFrame {
+                        width: f.width,
+                        height: f.height,
+                        stride: (f.width * 4) as usize,
+                        bgra: &f.bgra,
+                    }),
+                    Err(e) => {
+                        eprintln!("capture stopped: {e:#}");
+                        break;
+                    }
+                }
+                std::thread::sleep(
+                    std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64)
+                        .saturating_sub(now.elapsed()),
+                );
+            }
+        });
+        Ok(Box::new(WindowsCaptureSession {
+            stop,
+            thread: Some(thread),
+        }))
     }
 }

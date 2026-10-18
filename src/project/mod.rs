@@ -50,7 +50,10 @@ impl Package {
         self.recording_dir().join(name)
     }
     pub fn name(&self) -> String {
-        self.root.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        self.root
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     pub fn load_recording(&self) -> Result<Recording> {
@@ -80,12 +83,19 @@ impl Package {
     /// Copy a file into the package's `assets/` folder; returns the path
     /// relative to the package, so projects stay self-contained.
     pub fn import_asset(&self, src: &Path, stem: &str) -> Result<String> {
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin").to_ascii_lowercase();
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_ascii_lowercase();
         let dir = self.root.join("assets");
         std::fs::create_dir_all(&dir)?;
-        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
         let name = format!("{stem}-{ms}.{ext}");
-        std::fs::copy(src, dir.join(&name)).with_context(|| format!("copying {}", src.display()))?;
+        std::fs::copy(src, dir.join(&name))
+            .with_context(|| format!("copying {}", src.display()))?;
         Ok(format!("assets/{name}"))
     }
 
@@ -97,8 +107,14 @@ impl Package {
 /// A fresh project for a recording: one slice covering everything,
 /// automatic zooms on clicks, and a style suited to the source.
 pub fn new_project(name: &str, rec: &Recording) -> Project {
-    let mut p = Project { name: name.into(), ..Default::default() };
-    p.id = format!("{:016x}", rec.meta.created_ms as u64 ^ 0x9e37_79b9_7f4a_7c15);
+    let mut p = Project {
+        name: name.into(),
+        ..Default::default()
+    };
+    p.id = format!(
+        "{:016x}",
+        rec.meta.created_ms as u64 ^ 0x9e37_79b9_7f4a_7c15
+    );
     p.created_ms = rec.meta.created_ms;
     p.updated_ms = rec.meta.created_ms;
     if rec.meta.kind == SourceKind::Display {
@@ -110,13 +126,27 @@ pub fn new_project(name: &str, rec: &Recording) -> Project {
     if rec.meta.kind == SourceKind::Device {
         // iPhone/iPad screens get a device frame; there's no cursor to follow.
         let (w, h) = (rec.meta.screen.width, rec.meta.screen.height);
-        p.style.device = if h > w { DeviceFrame::Phone } else { DeviceFrame::Tablet };
+        p.style.device = if h > w {
+            DeviceFrame::Phone
+        } else {
+            DeviceFrame::Tablet
+        };
         p.style.padding = 8.0;
     }
     let id = p.timeline.new_id();
-    p.timeline.slices.push(Slice { id, start: 0.0, end: rec.meta.duration_ms, ..Default::default() });
+    p.timeline.slices.push(Slice {
+        id,
+        start: 0.0,
+        end: rec.meta.duration_ms,
+        ..Default::default()
+    });
     let events = crate::engine::events::Events::new(rec.mouse.clone());
-    let zooms = zoom::auto_zooms(&events.downs, rec.meta.duration_ms, p.style.default_zoom, &mut p.timeline);
+    let zooms = zoom::auto_zooms(
+        &events.downs,
+        rec.meta.duration_ms,
+        p.style.default_zoom,
+        &mut p.timeline,
+    );
     p.timeline.zooms = zooms;
     p
 }
@@ -127,17 +157,74 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
-    if path.exists() { read_json(path) } else { Ok(T::default()) }
+    if path.exists() {
+        read_json(path)
+    } else {
+        Ok(T::default())
+    }
 }
 
 /// Write JSON atomically (temp file + rename) so a crash never leaves a
 /// half-written project.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_vec_pretty(value)?;
-    fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("saving {}", path.display()))?;
+    write_json_cancellable(path, value, &|| false)
+}
+
+pub(crate) fn write_json_cancellable<T: Serialize>(
+    path: &Path,
+    value: &T,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    anyhow::ensure!(!cancelled(), "saving JSON cancelled");
+    let pending = crate::media::mux::temporary(&path.with_extension("json.tmp"), "json")?;
+    let mut file = std::io::BufWriter::with_capacity(
+        65536,
+        fs::OpenOptions::new().write(true).open(pending.path())?,
+    );
+    serde_json::to_writer_pretty(&mut file, value)
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::flush(&mut file)?;
+    file.get_ref().sync_all()?;
+    drop(file);
+    anyhow::ensure!(!cancelled(), "saving JSON cancelled");
+    fs::rename(pending.path(), path).with_context(|| format!("saving {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod atomic_json_tests {
+    use super::*;
+    #[test]
+    fn cancelled_and_failed_writes_preserve_destination_and_foreign_temporary_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "cam-atomic-json-{}-{}",
+            std::process::id(),
+            crate::util::host_now().to_bits()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("transcript.json");
+        let foreign = path.with_extension("json.tmp");
+        fs::write(&path, b"old transcript").unwrap();
+        fs::write(&foreign, b"foreign temporary file").unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(
+            write_json_cancellable(&path, &vec!["new"], &|| calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                > 0)
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"old transcript");
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign temporary file");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        write_json(&path, &vec!["new"]).unwrap();
+        assert_eq!(read_json::<Vec<String>>(&path).unwrap(), ["new"]);
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign temporary file");
+        let blocked = dir.join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(write_json(&blocked, &vec!["new"]).is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+    }
 }
 
 /// Default folder for new projects.

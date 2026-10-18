@@ -35,14 +35,46 @@ pub struct Shot<'a> {
 pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
     let gpu = Gpu::headless()?;
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let mut renderer = egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
+    let mut renderer =
+        egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
     let ctx = egui::Context::default();
-    ctx.set_theme(if shot.dark { egui::Theme::Dark } else { egui::Theme::Light });
+    ctx.set_theme(if shot.dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
     theme::apply(&ctx);
     let ppp = 2.0f32;
     let (w, h) = shot.size;
 
-    let mut editor = match shot.project {
+    let monitor = shot.select.as_deref() == Some("camera-preview");
+    let mut camera_monitor = super::camera_preview::Preview::default();
+    let mut camera_style = crate::project::model::CameraStyle::default();
+    let monitor_frame = if monitor {
+        let package = crate::project::Package::new(
+            shot.project
+                .ok_or_else(|| anyhow::anyhow!("camera preview snapshot requires a recording"))?,
+        );
+        let (project, recording) = package.load()?;
+        camera_style = project.style.camera;
+        let track = recording
+            .meta
+            .camera
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("recording has no camera track"))?;
+        let mut source = crate::media::FrameSource::open(&package.rec(&track.file))?;
+        let frame = source
+            .frame_at((shot.playhead_ms - track.offset_ms).max(0.0))
+            .ok_or_else(|| anyhow::anyhow!("camera frame unavailable"))?;
+        Some(crate::capture::grab::Image {
+            width: frame.width,
+            height: frame.height,
+            bgra: frame.bgra.clone(),
+        })
+    } else {
+        None
+    };
+    let mut editor = match shot.project.filter(|_| !monitor) {
         Some(p) => Some(Editor::open(p, gpu.clone())?),
         None => None,
     };
@@ -52,9 +84,18 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         }
         let tl = &ed.project.timeline;
         ed.selection = match shot.select.as_deref() {
-            Some("zoom") => tl.zooms.first().map_or(Selection::None, |z| Selection::Zoom(z.id)),
-            Some("mask") => tl.masks.first().map_or(Selection::None, |m| Selection::Mask(m.id)),
-            Some("slice") => tl.slices.first().map_or(Selection::None, |s| Selection::Slice(s.id)),
+            Some("zoom") => tl
+                .zooms
+                .first()
+                .map_or(Selection::None, |z| Selection::Zoom(z.id)),
+            Some("mask") => tl
+                .masks
+                .first()
+                .map_or(Selection::None, |m| Selection::Mask(m.id)),
+            Some("slice") => tl
+                .slices
+                .first()
+                .map_or(Selection::None, |s| Selection::Slice(s.id)),
             _ => Selection::None,
         };
         ed.export.open = shot.export_sheet;
@@ -80,10 +121,20 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
             for p in px.chunks_exact_mut(4) {
                 p.swap(0, 2);
             }
-            Some(ctx.load_texture("live-preview", egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px), egui::TextureOptions::LINEAR))
+            Some(ctx.load_texture(
+                "live-preview",
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px),
+                egui::TextureOptions::LINEAR,
+            ))
         }
         Some(_) => {
-            let p = crate::capture::preview::LivePreview::start(&crate::capture::preview::Source::Display { id: 0 }, 1280, 10, false, || {})?;
+            let p = crate::capture::preview::LivePreview::start(
+                &crate::capture::preview::Source::Display { id: 0 },
+                1280,
+                10,
+                false,
+                || {},
+            )?;
             let t0 = std::time::Instant::now();
             let frame = loop {
                 if let Some(f) = p.take_frame() {
@@ -92,7 +143,10 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
                 anyhow::ensure!(t0.elapsed().as_secs() < 5, "no live preview frame");
                 std::thread::sleep(std::time::Duration::from_millis(50));
             };
-            let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
             Some(ctx.load_texture("live-preview", img, egui::TextureOptions::LINEAR))
         }
         None => None,
@@ -106,11 +160,19 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
             for x in 0..w {
                 let (dx, dy) = (x as f32 - 320.0, y as f32 - 200.0);
                 let face = dx * dx / 1.0 + dy * dy / 1.4 < 110.0 * 110.0;
-                let c = if face { [224, 182, 150] } else { [60 + (y / 8) as u8, 80, 110] };
+                let c = if face {
+                    [224, 182, 150]
+                } else {
+                    [60 + (y / 8) as u8, 80, 110]
+                };
                 px.extend_from_slice(&[c[0], c[1], c[2], 255]);
             }
         }
-        ctx.load_texture("camera-preview", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)
+        ctx.load_texture(
+            "camera-preview",
+            egui::ColorImage::from_rgba_unmultiplied([w, h], &px),
+            egui::TextureOptions::LINEAR,
+        )
     });
     if synthetic {
         settings.camera = true;
@@ -128,12 +190,23 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
     let mut last: Option<egui::FullOutput> = None;
     for i in 0..8 {
         let mut input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(w, h),
+            )),
             time: Some(i as f64 * 0.1),
-            system_theme: Some(if shot.dark { egui::Theme::Dark } else { egui::Theme::Light }),
+            system_theme: Some(if shot.dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            }),
             ..Default::default()
         };
-        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(ppp);
         // Thumbnails load on background threads.
         let wait = match (i, editor.is_some()) {
             (4, _) if shot.recents => 5000,
@@ -154,23 +227,50 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
             }
         }
         let out = ctx.run_ui(input, |ui| {
+            if monitor {
+                camera_monitor.draw(ui, monitor_frame.as_ref(), &camera_style, false);
+                return;
+            }
             match &mut editor {
                 Some(ed) => {
-                    let mut chrome = home::Chrome { settings: &mut settings, devices: &mut devices, projects: &projects, thumbs: &mut thumbs, action: home::Action::None };
+                    let mut chrome = home::Chrome {
+                        settings: &mut settings,
+                        devices: &mut devices,
+                        projects: &projects,
+                        thumbs: &mut thumbs,
+                        action: home::Action::None,
+                    };
                     ed.ui(ui, &mut renderer, &mut chrome);
                 }
                 None => {
-                    home::start_view(ui, &mut settings, &mut devices, &projects, &mut thumbs, None, &live);
+                    home::start_view(
+                        ui,
+                        &mut settings,
+                        &mut devices,
+                        &projects,
+                        &mut thumbs,
+                        None,
+                        &live,
+                    );
                 }
             }
             // The popover itself (a menu only opens from a click).
             if shot.recents {
                 let current = editor.as_ref().map(|e| e.package.root.clone());
-                egui::Area::new(egui::Id::new("recents-preview")).fixed_pos(egui::pos2(130.0, 50.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        home::recents(ui, &projects, &mut thumbs, current.as_deref(), &settings.dir());
+                egui::Area::new(egui::Id::new("recents-preview"))
+                    .fixed_pos(egui::pos2(130.0, 50.0))
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            home::recents(
+                                ui,
+                                &projects,
+                                &mut thumbs,
+                                current.as_deref(),
+                                &settings.dir(),
+                            );
+                        });
                     });
-                });
             }
         });
 
@@ -193,7 +293,11 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
     let (pw, ph) = ((w * ppp) as u32, (h * ppp) as u32);
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("snapshot"),
-        size: wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: pw,
+            height: ph,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -202,7 +306,10 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [pw, ph], pixels_per_point: out.pixels_per_point };
+    let sd = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [pw, ph],
+        pixels_per_point: out.pixels_per_point,
+    };
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     let extra = renderer.update_buffers(&gpu.device, &gpu.queue, &mut enc, &prims, &sd);
     gpu.queue.submit(extra);
@@ -217,7 +324,12 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: r as f64,
+                            g: g as f64,
+                            b: b as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -238,7 +350,11 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
 /// consecutive frames, as playback does. Returns frames per second.
 pub fn bench_preview(project: &Path, size: (u32, u32), frames: u32) -> Result<f64> {
     let gpu = Gpu::headless()?;
-    let mut renderer = egui_wgpu::Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
+    let mut renderer = egui_wgpu::Renderer::new(
+        &gpu.device,
+        wgpu::TextureFormat::Rgba8Unorm,
+        egui_wgpu::RendererOptions::default(),
+    );
     let mut ed = Editor::open(project, gpu.clone())?;
     let preview = &mut ed.preview;
     let step = 1000.0 / 60.0;

@@ -11,7 +11,54 @@ pub const HOLD_MS: f64 = 1500.0;
 const TYPING_MS: f64 = 1000.0;
 
 /// Keys worth showing even without modifiers.
-const SPECIAL: [&str; 13] = ["⏎", "⎋", "⇥", "⌫", "⌦", "←", "→", "↑", "↓", "Space", "Home", "End", "⇞"];
+const SPECIAL: [&str; 13] = [
+    "⏎", "⎋", "⇥", "⌫", "⌦", "←", "→", "↑", "↓", "Space", "Home", "End", "⇞",
+];
+
+fn special(key: &str) -> bool {
+    SPECIAL.contains(&key)
+        || cfg!(target_os = "windows")
+            && matches!(
+                key,
+                "Enter"
+                    | "Esc"
+                    | "Escape"
+                    | "Tab"
+                    | "Backspace"
+                    | "Delete"
+                    | "Left"
+                    | "Right"
+                    | "Up"
+                    | "Down"
+                    | "Page Up"
+                    | "Page Down"
+                    | "Insert"
+            )
+}
+/// Ignore modifier-only events from older Windows recordings as well as new
+/// captures. Text names avoid confusing legacy Mac scan codes with Windows VKs.
+pub(crate) fn modifier_only(e: &KeyEvent) -> bool {
+    #[cfg(target_os = "windows")]
+    if matches!(e.code, 0x10..=0x12 | 0x5b | 0x5c | 0xa0..=0xa5) {
+        return [
+            "Ctrl",
+            "Control",
+            "Shift",
+            "Alt",
+            "Left Ctrl",
+            "Right Ctrl",
+            "Left Shift",
+            "Right Shift",
+            "Left Alt",
+            "Right Alt",
+            "Left Windows",
+            "Right Windows",
+        ]
+        .iter()
+        .any(|name| e.key.eq_ignore_ascii_case(name));
+    }
+    false
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Badge {
@@ -23,7 +70,23 @@ pub struct Badge {
 
 pub fn label(e: &KeyEvent) -> String {
     let mut s = String::new();
-    for (bit, glyph) in [(mods::CTRL, "⌃"), (mods::OPT, "⌥"), (mods::SHIFT, "⇧"), (mods::CMD, "⌘"), (mods::FN, "fn ")] {
+    #[cfg(target_os = "windows")]
+    let modifiers = [
+        (mods::CTRL, "Ctrl+"),
+        (mods::OPT, "Alt+"),
+        (mods::SHIFT, "Shift+"),
+        (mods::CMD, "Win+"),
+        (mods::FN, "Fn+"),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let modifiers = [
+        (mods::CTRL, "⌃"),
+        (mods::OPT, "⌥"),
+        (mods::SHIFT, "⇧"),
+        (mods::CMD, "⌘"),
+        (mods::FN, "fn "),
+    ];
+    for (bit, glyph) in modifiers {
         if e.mods & bit != 0 {
             s.push_str(glyph);
         }
@@ -38,7 +101,10 @@ fn modifier_count(e: &KeyEvent) -> u32 {
 
 /// Turn raw key events into badges.
 pub fn badges(events: &[KeyEvent], single_keys: bool) -> Vec<Badge> {
-    let downs: Vec<&KeyEvent> = events.iter().filter(|e| e.down && !e.key.is_empty()).collect();
+    let downs: Vec<&KeyEvent> = events
+        .iter()
+        .filter(|e| e.down && !e.key.is_empty() && !modifier_only(e))
+        .collect();
     let mut shown: Vec<&KeyEvent> = vec![];
     for (i, e) in downs.iter().enumerate() {
         let n = modifier_count(e);
@@ -46,11 +112,13 @@ pub fn badges(events: &[KeyEvent], single_keys: bool) -> Vec<Badge> {
         let keep = if single_keys {
             true
         } else if n == 0 {
-            SPECIAL.contains(&e.key.as_str())
+            special(&e.key)
         } else if plain {
             // Shift+letter: show only when not part of typing.
-            let typing = downs.get(i + 1).is_some_and(|nx| modifier_count(nx) == 0 && nx.t - e.t < TYPING_MS);
-            !typing || SPECIAL.contains(&e.key.as_str())
+            let typing = downs
+                .get(i + 1)
+                .is_some_and(|nx| modifier_count(nx) == 0 && nx.t - e.t < TYPING_MS);
+            !typing || special(&e.key)
         } else {
             true
         };
@@ -66,7 +134,12 @@ pub fn badges(events: &[KeyEvent], single_keys: bool) -> Vec<Badge> {
                 b.end = e.t + HOLD_MS;
                 b.count += 1;
             }
-            _ => out.push(Badge { label: l, start: e.t, end: e.t + HOLD_MS, count: 1 }),
+            _ => out.push(Badge {
+                label: l,
+                start: e.t,
+                end: e.t + HOLD_MS,
+                count: 1,
+            }),
         }
     }
     // A new badge replaces the previous one.
@@ -82,8 +155,38 @@ pub fn badges(events: &[KeyEvent], single_keys: bool) -> Vec<Badge> {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_badges_use_native_labels_and_skip_legacy_modifier_rows() {
+        let mut ctrl = key(0.0, "Ctrl", mods::CTRL);
+        ctrl.code = 0x11;
+        let mut left_ctrl = ctrl.clone();
+        left_ctrl.code = 0xa2;
+        let events = [
+            ctrl,
+            left_ctrl,
+            key(10.0, "C", mods::CTRL),
+            key(2000.0, "Enter", 0),
+            key(4000.0, "Page Down", 0),
+        ];
+        let badges = badges(&events, false);
+        assert_eq!(
+            badges.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),
+            ["Ctrl+C", "Enter", "Page Down"]
+        );
+        let mut legacy_letter = key(0.0, "Y", 0);
+        legacy_letter.code = 0x10;
+        assert!(!modifier_only(&legacy_letter));
+    }
+
     fn key(t: f64, k: &str, m: u8) -> KeyEvent {
-        KeyEvent { t, code: 0, key: k.into(), mods: m, down: true }
+        KeyEvent {
+            t,
+            code: 0,
+            key: k.into(),
+            mods: m,
+            down: true,
+        }
     }
 
     #[test]
@@ -98,6 +201,9 @@ mod tests {
         ];
         let b = badges(&ev, false);
         let labels: Vec<_> = b.iter().map(|b| b.label.as_str()).collect();
+        #[cfg(target_os = "windows")]
+        assert_eq!(labels, ["Win+S", "⏎", "Shift+Win+C"]);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(labels, ["⌘S", "⏎", "⇧⌘C"]);
         assert_eq!(b[0].count, 2);
         assert_eq!(b[0].end, 1500.0 + HOLD_MS);
