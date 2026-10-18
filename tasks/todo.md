@@ -1,5 +1,7 @@
 # Cam implementation checklist
 
+- [x] Fix rapid playhead dragging freezes: background latest-request decoding, obsolete seek cancellation, bounded preview buffers, correct final frames/camera tail and explicit worker shutdown. Real-project and opening-seconds native timeline checks passed with zero message timeouts; details in IMPLEMENTATION_STATUS.md.
+
 - [x] Real MP4/MOV encoding, full-frame decoding, compressed audio/resampling; external ffprobe and changing-frame tests.
 - [x] Correct monitor IDs/dimensions/origins and window PID/position/z-order; area and multi-monitor regression checks, including full picker coverage at 100% and 125% DPI scaling.
 - [x] Real display/window/area/pattern recording, pause/resume, cancel, graceful Ctrl-C; independently decode live recording.

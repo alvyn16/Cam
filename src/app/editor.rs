@@ -56,6 +56,7 @@ impl Tab {
 /// quitting) finishes a voice-over in progress and saves.
 impl Drop for Editor {
     fn drop(&mut self) {
+        self.preview.shutdown();
         self.cancel_export();
         self.cancel_transcription();
         if self.voice.is_some() {
@@ -396,9 +397,12 @@ impl Editor {
             self.stop_voiceover();
         }
         self.playhead = ms.clamp(0.0, self.duration());
+        if super::scrub_trace() {
+            super::scrub_log(format_args!("scrub: seek_ms={:.3}", self.playhead));
+        }
         if self.playing.is_some() {
             self.playing = Some((Instant::now(), self.playhead));
-            self.audio.play(self.playhead);
+            self.audio.seek(self.playhead);
         }
     }
 
@@ -995,6 +999,7 @@ impl Editor {
         let p = pal(ui);
 
         // Toolbar.
+        if super::scrub_trace() && self.playhead > 0.0 { super::scrub_log(format_args!("scrub-stage: toolbar")); }
         egui::Panel::top("editor-toolbar")
             .exact_size(theme::TOOLBAR_H)
             .frame(
@@ -1037,6 +1042,7 @@ impl Editor {
             });
 
         // Inspector.
+        if super::scrub_trace() && self.playhead > 0.0 { super::scrub_log(format_args!("scrub-stage: inspector")); }
         egui::Panel::right("inspector")
             .exact_size(320.0)
             .resizable(false)
@@ -1050,6 +1056,7 @@ impl Editor {
             });
 
         // Timeline.
+        if super::scrub_trace() && self.playhead > 0.0 { super::scrub_log(format_args!("scrub-stage: timeline")); }
         egui::Panel::bottom("timeline")
             .exact_size(
                 if self.rec.meta.camera.is_some() {
@@ -1070,6 +1077,7 @@ impl Editor {
             });
 
         // Preview.
+        if super::scrub_trace() && self.playhead > 0.0 { super::scrub_log(format_args!("scrub-stage: preview")); }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(if ui.visuals().dark_mode { Color32::from_rgb(0x1c, 0x1c, 0x1e) } else { Color32::from_rgb(0xe4, 0xe4, 0xe7) }))
             .show(ui, |ui| {
@@ -1087,6 +1095,8 @@ impl Editor {
                     ui.painter().add(shadow.as_shape(rect, CornerRadius::same(4)));
                     ui.painter().image(id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                 }
+                if self.preview.pending() { ctx.request_repaint_after(std::time::Duration::from_millis(16)); }
+                if let Some(error) = self.preview.error.take() { self.status = Some(error); }
                 // Click on the preview while a manual zoom is selected picks its
                 // target; with a mask selected, dragging draws or moves it.
                 let resp = ui.interact(rect, ui.id().with("preview"), Sense::click_and_drag());

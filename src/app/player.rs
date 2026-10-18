@@ -315,7 +315,7 @@ impl AudioPreview {
         }
     }
 
-    fn seek(&self, at_ms: f64) {
+    pub fn seek(&self, at_ms: f64) {
         let frames = (at_ms.max(0.0) / 1000.0 * RATE).max(0.0);
         self.shared.pos.store(frames.to_bits(), Ordering::Relaxed);
     }

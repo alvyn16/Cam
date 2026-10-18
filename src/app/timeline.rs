@@ -136,6 +136,10 @@ pub fn ui(ui: &mut Ui, ed: &mut Editor) {
 
         // Ruler.
         let ruler = Rect::from_min_size(rect.min, vec2(width, RULER_H));
+        if super::scrub_trace() {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| super::scrub_log(format_args!("scrub-ruler: x={} y={} w={} h={} ppp={}",ruler.left(),ruler.top(),ruler.width(),ruler.height(),ui.ctx().pixels_per_point())));
+        }
         let step_s = [0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0].into_iter().find(|s| *s * ed.px_per_sec as f64 >= 60.0).unwrap_or(120.0);
         let mut t = 0.0;
         while t * 1000.0 <= dur {

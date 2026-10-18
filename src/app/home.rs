@@ -152,9 +152,10 @@ impl Settings {
         }
     }
     pub fn dir(&self) -> PathBuf {
+        static DEFAULT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         self.projects_dir
             .clone()
-            .unwrap_or_else(project::projects_dir)
+            .unwrap_or_else(|| DEFAULT.get_or_init(project::projects_dir).clone())
     }
 
     /// Keep the chosen window when its id is gone: find it again by app and

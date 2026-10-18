@@ -12,6 +12,7 @@ pub mod os;
 pub use os as windows;
 pub use os as macos;
 mod camera_preview;
+mod scrub_trace_log;
 pub mod menubar;
 pub mod player;
 pub mod preview;
@@ -64,6 +65,11 @@ pub enum Cmd {
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
 static PROXY: OnceLock<Mutex<EventLoopProxy<()>>> = OnceLock::new();
 static DRAG: AtomicBool = AtomicBool::new(false);
+
+fn scrub_trace() -> bool {
+    scrub_trace_log::enabled()
+}
+fn scrub_log(message: std::fmt::Arguments<'_>) { scrub_trace_log::log(message); }
 
 fn wake() {
     if let Some(p) = PROXY.get() {
@@ -376,6 +382,7 @@ fn permission_note() -> Option<String> {
 
 impl App {
     fn new(open: Option<PathBuf>) -> App {
+        let _ = scrub_trace();
         let selftest = std::env::var_os("CAM_GUI_SELFTEST").map(|_| SelfTest {
             phase: 0,
             at: Instant::now(),
@@ -2593,6 +2600,8 @@ impl App {
     }
 
     fn redraw(&mut self, id: WindowId) {
+        let profile = scrub_trace();
+        let profile_start = Instant::now();
         let Some(which) = self.which(id) else { return };
         let Some(gpu) = self.gpu.clone() else { return };
         let Some(mut win) = self.take_window(which) else {
@@ -2630,6 +2639,7 @@ impl App {
                 keep = !self.area.closed;
             }
         });
+        let profile_ui = profile_start.elapsed();
         win.egui
             .handle_platform_output(&win.window, out.platform_output);
         let delay = out
@@ -2656,6 +2666,7 @@ impl App {
                 None
             }
         };
+        let profile_acquire = profile_start.elapsed();
         if let Some(frame) = frame {
             #[cfg(target_os = "macos")]
             if !win.overlay {
@@ -2704,14 +2715,19 @@ impl App {
                 win.renderer.render(&mut pass, &prims, &sd);
             }
             gpu.queue.submit(extra.into_iter().chain([enc.finish()]));
+            let profile_submit = profile_start.elapsed();
             win.window.pre_present_notify();
             gpu.queue.present(frame);
+            if profile && profile_start.elapsed() > Duration::from_millis(25) {
+                scrub_log(format_args!("scrub-profile: ui_ms={:.2} acquire_ms={:.2} draw_ms={:.2} present_ms={:.2}", profile_ui.as_secs_f64()*1000.0, (profile_acquire-profile_ui).as_secs_f64()*1000.0, (profile_submit-profile_acquire).as_secs_f64()*1000.0, (profile_start.elapsed()-profile_submit).as_secs_f64()*1000.0));
+            }
         }
         for id in &out.textures_delta.free {
             win.renderer.free_texture(id);
         }
         out.textures_delta.clear();
         if DRAG.swap(false, Ordering::Relaxed) {
+            if profile { scrub_log(format_args!("scrub-profile: native-window-drag")); }
             let _ = win.window.drag_window();
         }
         if keep {
@@ -2829,6 +2845,7 @@ impl ApplicationHandler for App {
         if let View::Editor(ed) = &mut self.view {
             ed.cancel_export();
             ed.cancel_transcription();
+            ed.preview.shutdown();
             ed.audio.shutdown();
             if ed.voice.is_some() {
                 ed.stop_voiceover();
@@ -2852,6 +2869,7 @@ impl ApplicationHandler for App {
         if !self.scripted() {
             self.settings.save();
         }
+        scrub_trace_log::shutdown();
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {

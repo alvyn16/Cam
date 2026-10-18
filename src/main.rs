@@ -185,6 +185,9 @@ enum Cmd {
     #[command(hide = true)]
     BenchPreview {
         project: PathBuf,
+        /// Measure rapid timeline seeks and final-frame settling instead.
+        #[arg(long)]
+        scrub: bool,
         #[arg(long, default_value_t = 2400)]
         width: u32,
         #[arg(long, default_value_t = 1500)]
@@ -329,7 +332,12 @@ fn main() -> Result<()> {
             project,
             width,
             height,
+            scrub,
         }) => {
+            if scrub {
+                println!("{}", cam::app::snapshot::bench_scrub(&project, (width,height))?);
+                return Ok(());
+            }
             let fps = cam::app::snapshot::bench_preview(&project, (width, height), 240)?;
             println!("preview {width}x{height}: {fps:.0} frames/s");
             Ok(())

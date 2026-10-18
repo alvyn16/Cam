@@ -19,6 +19,7 @@ Cam is a high-performance, native Rust screen recording and video editing applic
   - Clean options to hide desktop icons and the Windows taskbar during capture.
   - Configurable global hotkeys (default `Ctrl+Shift+R`) to start, pause, and stop recording.
 - **Automatic Zoom & Spring Physics**:
+  - Responsive playhead dragging with background video decoding and cancellation of outdated seeks. Interactive source frames are capped at a 1280-pixel longest edge; exports use full-resolution footage.
   - Smooth spring-animated zooms focused on mouse click clusters.
   - Edge snapping and motion blur for seamless focus shifts.
   - Configurable manual and follow-mouse zooms.

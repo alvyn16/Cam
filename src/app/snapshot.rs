@@ -79,6 +79,7 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
         None => None,
     };
     if let Some(ed) = &mut editor {
+        ed.preview.set_synchronous();
         if let Some(t) = shot.tab {
             ed.tab = t;
         }
@@ -346,7 +347,56 @@ pub fn render(shot: &Shot, out_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Time the editor preview path (decode + zero-copy upload + render) over
+/// Measure UI work while rapidly reversing direction, then wait for the exact
+/// final request. Uses the real editor renderer without changing the package.
+pub fn bench_scrub(project: &Path, size: (u32,u32)) -> Result<serde_json::Value> {
+    use std::time::{Duration,Instant};
+    let package = crate::project::Package::new(project);
+    let (project, recording) = package.load()?;
+    let gpu = Gpu::headless()?;
+    let mut renderer = egui_wgpu::Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
+    let mut preview = super::preview::Preview::new(gpu.clone(), package.root.clone(), &project, &recording);
+    let duration = preview.scene.map.duration();
+    preview.render(&mut renderer, 0.0, size);
+    let started = Instant::now();
+    while preview.pending() {
+        anyhow::ensure!(started.elapsed() < Duration::from_secs(10), "initial preview timed out");
+        std::thread::sleep(Duration::from_millis(5));
+        preview.render(&mut renderer,0.0,size);
+    }
+    if let Some(error) = preview.error.take() { anyhow::bail!(error); }
+    gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let mut samples = Vec::new();
+    for i in 0..120 {
+        let fraction = if i%2 == 0 { 0.05+(i%17) as f64/100.0 } else { 0.95-(i%17) as f64/100.0 };
+        let watch=Instant::now();
+        preview.render(&mut renderer, duration*fraction, size);
+        samples.push(watch.elapsed().as_secs_f64()*1000.0);
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let final_at = duration*0.37;
+    let settled=Instant::now();
+    preview.render(&mut renderer, final_at, size);
+    while preview.pending() {
+        anyhow::ensure!(settled.elapsed()<Duration::from_secs(10), "last seek did not settle");
+        std::thread::sleep(Duration::from_millis(5));
+        preview.render(&mut renderer, final_at, size);
+    }
+    if let Some(error)=preview.error.take() { anyhow::bail!(error); }
+    // Readback waits for the final GPU work too. Compare with the existing
+    // full-resolution offline path; the interactive path uses scaled frames.
+    let (_,_,actual)=preview.read_pixels().unwrap();
+    let settle_ms=settled.elapsed().as_secs_f64()*1000.0;
+    preview.set_synchronous();
+    preview.render(&mut renderer,final_at,size);
+    let (_,_,expected)=preview.read_pixels().unwrap();
+    let squared:f64=actual.chunks_exact(4).zip(expected.chunks_exact(4)).map(|(a,b)| (0..3).map(|i| (a[i] as f64-b[i] as f64).powi(2)).sum::<f64>()).sum();
+    let mse=squared/(actual.len()/4*3) as f64;
+    samples.sort_by(f64::total_cmp);
+    Ok(serde_json::json!({"requests":samples.len(),"median_ui_ms":samples[samples.len()/2],"p95_ui_ms":samples[samples.len()*95/100],"worst_ui_ms":samples.last(),"final_settle_ms":settle_ms,"final_frame_mse":mse,"final_playhead_ms":final_at,"preview_size":[size.0,size.1]}))
+}
+
+/// Time the editor preview path (decode + upload + render) over
 /// consecutive frames, as playback does. Returns frames per second.
 pub fn bench_preview(project: &Path, size: (u32, u32), frames: u32) -> Result<f64> {
     let gpu = Gpu::headless()?;
@@ -357,6 +407,7 @@ pub fn bench_preview(project: &Path, size: (u32, u32), frames: u32) -> Result<f6
     );
     let mut ed = Editor::open(project, gpu.clone())?;
     let preview = &mut ed.preview;
+    preview.set_synchronous();
     let step = 1000.0 / 60.0;
     // Warm up (first decode, pipeline creation).
     preview.render(&mut renderer, 0.0, size);
