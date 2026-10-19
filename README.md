@@ -21,7 +21,7 @@ Cam is a high-performance, native Rust screen recording and video editing applic
   - Configurable global hotkeys (default `Ctrl+Shift+R`) to start, pause, and stop recording.
 - **Automatic Zoom & Spring Physics**:
   - Responsive playhead dragging with background video decoding and cancellation of outdated seeks. Interactive source frames are capped at a 1280-pixel longest edge; exports use full-resolution footage.
-  - Persistent hardware decoding and GPU downsampling for supported high-resolution previews.
+  - Persistent hardware decoding with fused GPU color conversion and downsampling for supported high-resolution previews.
   - Smooth spring-animated zooms focused on mouse click clusters.
   - Edge snapping and motion blur for seamless focus shifts.
   - Configurable manual and follow-mouse zooms.
@@ -53,11 +53,11 @@ Cam is a high-performance, native Rust screen recording and video editing applic
 
 ### Install on Windows (recommended)
 
-Download **[Cam-0.1.1-Windows-x64-Setup.exe](https://github.com/alvyn16/Cam/releases/download/v0.1.1/Cam-0.1.1-Windows-x64-Setup.exe)** from the [release page](https://github.com/alvyn16/Cam/releases/tag/v0.1.1) and open it. Setup installs Cam for your Windows account, downloads and verifies FFmpeg/ffprobe automatically, and creates desktop and Start menu shortcuts. No administrator access or PATH changes are needed. Internet access is required during setup (about 110 MB for media tools).
+Download **[Cam-0.1.2-Windows-x64-Setup.exe](https://github.com/alvyn16/Cam/releases/download/v0.1.2/Cam-0.1.2-Windows-x64-Setup.exe)** from the [release page](https://github.com/alvyn16/Cam/releases/tag/v0.1.2) and open it. Setup installs Cam for your Windows account, downloads and verifies FFmpeg/ffprobe automatically, and creates desktop and Start menu shortcuts. No administrator access or PATH changes are needed. Internet access is required during setup (about 110 MB for media tools).
 
 Open **Cam** from your desktop or Start menu afterward. Keep the installed media tools beside Cam. To remove the app, use **Settings → Apps → Installed apps → Cam → Uninstall**; recordings and settings are retained. Close Cam before running setup again to update it.
 
-If you prefer an archive, download **Cam-0.1.1-Windows-x64-Setup.zip**, extract all files, and open **Install.cmd**. The ZIP uses the same setup flow and requires internet during installation. The separate `cam.exe` asset is still available for users who already have FFmpeg and ffprobe.
+If you prefer an archive, download **Cam-0.1.2-Windows-x64-Setup.zip**, extract all files, and open **Install.cmd**. The ZIP uses the same setup flow and requires internet during installation. The separate `cam.exe` asset is still available for users who already have FFmpeg and ffprobe.
 
 ### Building from source
 

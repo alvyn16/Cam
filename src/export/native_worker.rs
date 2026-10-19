@@ -327,20 +327,16 @@ mod tests {
     fn forced_cleanup_terminates_descendants() {
         use windows62::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::*};
         let dir = Directory::create(&std::env::temp_dir().join("job-cleanup.mp4")).unwrap();
-        let script = dir.0.join("child.ps1");
-        std::fs::write(&script, r#"param([string]$ChildProgram)
-$ErrorActionPreference = 'Stop'
-$null = [Console]::ReadLine()
-$child = Start-Process -FilePath $ChildProgram -ArgumentList @('-v','error','-re','-f','lavfi','-i','anullsrc=r=48000:cl=stereo','-t','60','-f','null','NUL') -PassThru -WindowStyle Hidden
-[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'child.pid'), [string]$child.Id)
-Start-Sleep -Seconds 60
-"#).unwrap();
+        // Use a native fixture: terminating the PowerShell CLR can itself
+        // stall on this PC, independently of whether the job killed FFmpeg.
+        let script = dir.0.join("child.cmd");
+        std::fs::write(&script, "@echo off\r\nset /p cam_handshake=\r\n\"%CAM_CLEANUP_CHILD%\" -v error -re -f lavfi -i anullsrc=r=48000:cl=stereo -t 60 -f null NUL\r\n").unwrap();
         let job = cleanup_job().unwrap();
         let command = crate::media::ffmpeg::command("ffmpeg");
-        let child = Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&script)
-            .arg(command.get_program())
+        let child = Command::new("cmd.exe")
+            .args(["/d", "/s", "/c"])
+            .raw_arg(format!("\"\"{}\"\"", script.display()))
+            .env("CAM_CLEANUP_CHILD", command.get_program())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -359,11 +355,13 @@ Start-Sleep -Seconds 60
             .write_all(b"start\n")
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
+        #[repr(C)]
+        struct ProcessIds { assigned: u32, count: u32, ids: [usize; 16] }
         let pid = loop {
-            if let Ok(text) = std::fs::read_to_string(dir.0.join("child.pid")) {
-                if let Ok(pid) = text.parse::<u32>() {
-                    break pid;
-                }
+            let mut list = ProcessIds { assigned: 0, count: 0, ids: [0; 16] };
+            unsafe { QueryInformationJobObject(Some(process.job.0), JobObjectBasicProcessIdList, (&mut list as *mut ProcessIds).cast(), std::mem::size_of_val(&list) as u32, None).unwrap(); }
+            if let Some(pid) = list.ids[..list.count as usize].iter().copied().find(|&pid| pid != process.child.id() as usize) {
+                break pid as u32;
             }
             assert!(
                 Instant::now() < deadline,
