@@ -762,6 +762,11 @@ impl Editor {
 
     /// Per-frame housekeeping. Returns true while something animates.
     pub fn tick(&mut self) -> bool {
+        if let Some(error) = self.voice.as_ref().and_then(|voice| voice.error()) {
+            self.stop_voiceover();
+            let saved = self.status.take().unwrap_or_default();
+            self.status = Some(format!("Voice-over stopped: {error}. {saved}"));
+        }
         if let Some((t0, from)) = self.playing {
             self.playhead = from + t0.elapsed().as_secs_f64() * 1000.0;
             if self.playhead >= self.duration() && self.voice.is_some() {

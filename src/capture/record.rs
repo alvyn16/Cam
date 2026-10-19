@@ -208,20 +208,11 @@ impl Session {
     }
     pub fn pause(&self, now: f64) -> bool {
         let mut c = self.clock.lock().unwrap();
-        if c.pause.is_some() {
-            return false;
-        }
-        c.pause = Some(now);
-        true
+        c.pause(now)
     }
     pub fn resume(&self, now: f64) -> bool {
         let mut c = self.clock.lock().unwrap();
-        if let Some(p) = c.pause.take() {
-            c.paused += now - p;
-            true
-        } else {
-            false
-        }
+        c.resume(now)
     }
     pub fn is_paused(&self) -> bool {
         self.clock.lock().unwrap().pause.is_some()

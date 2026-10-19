@@ -159,12 +159,10 @@ impl Sink {
     }
     pub fn pause(&mut self, now: f64) {
         self.emit_until(now);
-        self.clock.pause.get_or_insert(now);
+        self.clock.pause(now);
     }
     pub fn resume(&mut self, now: f64) {
-        if let Some(p) = self.clock.pause.take() {
-            self.clock.paused += now - p;
-        }
+        self.clock.resume(now);
     }
     pub fn finish(&mut self, end: f64) -> anyhow::Result<Stats> {
         self.emit_until(end);

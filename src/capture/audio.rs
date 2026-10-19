@@ -13,12 +13,89 @@ pub struct Clock {
     pub start: Option<f64>,
     pub pause: Option<f64>,
     pub paused: f64,
+    pub pauses: Vec<Pause>,
+}
+pub struct Pause {
+    start: f64,
+    end: f64,
+    total: f64,
+}
+struct AudioSpan {
+    offset: usize,
+    end: usize,
+    at: u64,
 }
 impl Clock {
     pub fn elapsed(&self, now: f64) -> f64 {
         self.start.map_or(0.0, |s| {
             (self.pause.unwrap_or(now) - s - self.paused).max(0.0)
         })
+    }
+    pub fn pause(&mut self, now: f64) -> bool {
+        if self.pause.is_some() {
+            return false;
+        }
+        self.pause = Some(now);
+        true
+    }
+    pub fn resume(&mut self, now: f64) -> bool {
+        let Some(start) = self.pause.take() else {
+            return false;
+        };
+        self.paused += (now - start).max(0.0);
+        self.pauses.push(Pause {
+            start,
+            end: now.max(start),
+            total: self.paused,
+        });
+        true
+    }
+    // A delayed packet may straddle pause/resume, or arrive after several
+    // transitions. Map its capture time, rather than the UI's current state.
+    fn audio_spans(&self, pts: f64, frames: usize) -> Vec<AudioSpan> {
+        let Some(start) = self.start else {
+            return vec![];
+        };
+        if !pts.is_finite() {
+            return vec![];
+        }
+        let end = pts + frames as f64 / 48_000.0;
+        let mut from = pts.max(start);
+        if from >= end {
+            return vec![];
+        }
+        let first = self.pauses.partition_point(|pause| pause.end <= from);
+        let mut removed = first.checked_sub(1).map_or(0.0, |i| self.pauses[i].total);
+        let mut spans = Vec::new();
+        let mut append = |from: f64, until: f64, removed: f64| {
+            // Tolerate floating-point error at an exact sample boundary.
+            let index =
+                |time: f64| (((time - pts) * 48_000.0 - 1e-6).ceil().max(0.0) as usize).min(frames);
+            let offset = index(from);
+            let end = index(until);
+            if offset < end {
+                spans.push(AudioSpan {
+                    offset,
+                    end,
+                    at: ((pts + offset as f64 / 48_000.0 - start - removed) * 48_000.0)
+                        .round()
+                        .max(0.0) as u64,
+                });
+            }
+        };
+        for pause in &self.pauses[first..] {
+            if pause.start >= end {
+                break;
+            }
+            append(from, pause.start.min(end), removed);
+            from = from.max(pause.end);
+            removed = pause.total;
+            if from >= end {
+                break;
+            }
+        }
+        append(from, end.min(self.pause.unwrap_or(end)), removed);
+        spans
     }
 }
 pub enum Source<'a> {
@@ -147,39 +224,39 @@ impl Spool {
         let queued = self.queued.clone();
         Box::new(move |data, pts| {
             let c = clock.lock().unwrap();
-            let Some(start) = c.start else { return };
-            if c.pause.is_some() || !pts.is_finite() {
-                return;
-            }
-            let at = ((pts - start - c.paused) * 48000.0).round() as i64;
+            let spans = c.audio_spans(pts, data.len() / 2);
             drop(c);
-            let skip = at.saturating_neg().max(0).min((data.len() / 2) as i64) as usize;
-            for (i, samples) in data[skip * 2..].chunks(PACKET_FRAMES * 2).enumerate() {
-                let frame = at.max(0) as u64 + (i * PACKET_FRAMES) as u64;
-                let bytes = samples.len() * 4;
-                let reserved = queued.fetch_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |n| (n + bytes <= QUEUE_BYTES).then_some(n + bytes),
-                );
-                if reserved.is_err() {
-                    *error.lock().unwrap() = Some("Audio disk writer cannot keep up; recording stopped to avoid losing audio.".into());
-                    return;
-                }
-                let packet = Packet {
-                    at: frame,
-                    samples: samples.to_vec(),
-                    queued: queued.clone(),
-                };
-                if let Err(e) = tx.try_send(packet) {
-                    let mut error = error.lock().unwrap();
-                    if error.is_none() {
-                        *error = Some(match e {
+            for span in spans {
+                for (i, samples) in data[span.offset * 2..span.end * 2]
+                    .chunks(PACKET_FRAMES * 2)
+                    .enumerate()
+                {
+                    let frame = span.at + (i * PACKET_FRAMES) as u64;
+                    let bytes = samples.len() * 4;
+                    let reserved = queued.fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |n| (n + bytes <= QUEUE_BYTES).then_some(n + bytes),
+                    );
+                    if reserved.is_err() {
+                        *error.lock().unwrap() = Some("Audio disk writer cannot keep up; recording stopped to avoid losing audio.".into());
+                        return;
+                    }
+                    let packet = Packet {
+                        at: frame,
+                        samples: samples.to_vec(),
+                        queued: queued.clone(),
+                    };
+                    if let Err(e) = tx.try_send(packet) {
+                        let mut error = error.lock().unwrap();
+                        if error.is_none() {
+                            *error = Some(match e {
                             mpsc::TrySendError::Full(_) => "Audio disk writer cannot keep up; recording stopped to avoid losing audio.".into(),
                             mpsc::TrySendError::Disconnected(_) => "Audio disk writer stopped unexpectedly.".into(),
                         });
+                        }
+                        return;
                     }
-                    return;
                 }
             }
         })
@@ -228,6 +305,112 @@ impl Drop for Spool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "compares connected microphone samples with the actual timestamped WAV under screen capture"]
+    fn microphone_stem_matches_received_samples_during_screen_capture() {
+        let root = std::env::temp_dir().join(format!(
+            "cam-mic-source-{}-{}",
+            std::process::id(),
+            crate::util::host_now().to_bits()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let recorder = crate::recorder::Recorder::start(crate::recorder::Options {
+            target: crate::recorder::Target::Area {
+                display: 0,
+                rect: crate::engine::geom::Rect::new(100.0, 100.0, 320.0, 200.0),
+            },
+            dir: root.clone(),
+            name: Some("Screen".into()),
+            mic: None,
+            system_audio: false,
+            fps: 30,
+            ..Default::default()
+        })
+        .unwrap();
+        let path = root.join("microphone.wav");
+        let spool = Spool::start(&path).unwrap();
+        let clock = Arc::new(Mutex::new(Clock::default()));
+        let mut sink = spool.callback(clock.clone());
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let received = packets.clone();
+        let mut session = crate::platform::windows::WindowsAudioBackend::new()
+            .start_microphone(
+                None,
+                48000,
+                2,
+                Box::new(move |samples, at| {
+                    received.lock().unwrap().push((at, samples.to_vec()));
+                    sink(samples, at);
+                }),
+            )
+            .unwrap();
+        let start = crate::util::host_now();
+        clock.lock().unwrap().start = Some(start);
+        packets.lock().unwrap().clear();
+        eprintln!("Microphone source capture ready: {}", root.display());
+        std::thread::sleep(std::time::Duration::from_secs(16));
+        session.stop();
+        assert!(session.error().is_none(), "{:?}", session.error());
+        let frames = ((crate::util::host_now() - start) * 48000.0).round() as usize;
+        spool.finish(frames as f64 / 48000.0).unwrap();
+        recorder.stop().unwrap();
+        let packets = packets.lock().unwrap();
+        let mut expected = vec![[0.0; 2]; frames];
+        let mut native = Vec::new();
+        let (mut gaps, mut overlaps) = (0usize, 0usize);
+        let mut previous = None;
+        for (at, data) in packets.iter() {
+            if *at >= start {
+                if let Some(end) = previous {
+                    let delta: f64 = at - end;
+                    gaps += usize::from(delta > 1.5 / 48000.0);
+                    overlaps += usize::from(delta < -1.5 / 48000.0);
+                }
+                previous = Some(at + data.len() as f64 / 96000.0);
+            }
+            let position = ((at - start) * 48000.0).round() as i64;
+            for (i, sample) in data.chunks_exact(2).enumerate() {
+                let frame = [sample[0], sample[1]];
+                native.push(frame);
+                if let Some(out) = expected.get_mut((position + i as i64) as usize) {
+                    *out = frame;
+                }
+            }
+        }
+        let actual = crate::media::read_audio(&path, 0).unwrap();
+        let zero_runs = |samples: &[[f32; 2]]| {
+            let (mut run, mut count, mut total) = (0usize, 0usize, 0usize);
+            for sample in samples {
+                if *sample == [0.0; 2] {
+                    run += 1;
+                } else {
+                    if run >= 24 {
+                        count += 1;
+                        total += run;
+                    }
+                    run = 0;
+                }
+            }
+            (count, total)
+        };
+        let metrics = serde_json::json!({"packets":packets.len(),"capture_gaps":gaps,"capture_overlaps":overlaps,"source_zero_runs_and_frames":zero_runs(&native),"saved_zero_runs_and_frames":zero_runs(&actual)});
+        std::fs::write(root.join("result.json"), metrics.to_string()).unwrap();
+        eprintln!(
+            "Microphone source comparison: {metrics}; artifacts {}",
+            root.display()
+        );
+        assert!(packets.len() > 100);
+        assert_eq!(
+            &actual[4800..],
+            &expected[4800..],
+            "saved microphone differs from received samples"
+        );
+        assert_eq!(
+            (gaps, overlaps),
+            (0, 0),
+            "capture lost packets under screen-recording load"
+        );
+    }
     fn path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cam-stem-{label}-{}-{}.wav",
@@ -248,12 +431,11 @@ mod tests {
             &[0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4],
             100.0 - 2.0 / 48000.0,
         );
-        clock.lock().unwrap().pause = Some(100.1);
+        clock.lock().unwrap().pause(100.0 + 2.0 / 48000.0);
         callback(&[0.8; 20], 100.1);
         {
             let mut c = clock.lock().unwrap();
-            c.pause = None;
-            c.paused = 1.0;
+            c.resume(101.0 + 2.0 / 48000.0);
         }
         callback(&[0.5, -0.5], 101.0 + 10.0 / 48000.0);
         drop(callback);
@@ -264,6 +446,56 @@ mod tests {
         assert_eq!(audio[1], [0.4; 2]);
         assert_eq!(audio[10], [0.5, -0.5]);
         assert!(audio[2..10].iter().all(|s| *s == [0.0; 2]));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn delayed_packets_crossing_multiple_pauses_keep_only_active_samples() {
+        let path = path("delayed-pause");
+        let mut clock = Clock {
+            start: Some(10.0),
+            ..Default::default()
+        };
+        clock.pause(10.0 + 4.0 / 48000.0);
+        clock.resume(10.0 + 8.0 / 48000.0);
+        clock.pause(10.0 + 12.0 / 48000.0);
+        clock.resume(10.0 + 16.0 / 48000.0);
+        let spool = Spool::start(&path).unwrap();
+        let mut callback = spool.callback(Arc::new(Mutex::new(clock)));
+        let input: Vec<_> = (0..24).map(|i| [0.1 + i as f32 * 0.01; 2]).collect();
+        let flat: Vec<_> = input.iter().flatten().copied().collect();
+        callback(&flat, 10.0); // delivered only after both resumes
+        drop(callback);
+        spool.finish(16.0 / 48000.0).unwrap();
+        let actual = crate::media::read_audio(&path, 0).unwrap();
+        let expected: Vec<_> = input[..4]
+            .iter()
+            .chain(&input[8..12])
+            .chain(&input[16..])
+            .copied()
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "paused samples must neither leak nor overwrite earlier speech"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn packet_delivered_while_paused_keeps_its_pre_pause_samples() {
+        let path = path("pause-boundary");
+        let mut clock = Clock {
+            start: Some(10.0),
+            ..Default::default()
+        };
+        clock.pause(10.0 + 4.0 / 48000.0);
+        let spool = Spool::start(&path).unwrap();
+        let mut callback = spool.callback(Arc::new(Mutex::new(clock)));
+        callback(&[0.25; 16], 10.0);
+        drop(callback);
+        spool.finish(4.0 / 48000.0).unwrap();
+        assert_eq!(
+            crate::media::read_audio(&path, 0).unwrap(),
+            vec![[0.25; 2]; 4]
+        );
         std::fs::remove_file(path).unwrap();
     }
     #[test]

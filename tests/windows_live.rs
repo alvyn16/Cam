@@ -6,6 +6,62 @@ use cam::{
 use std::{sync::atomic::AtomicBool, time::Duration};
 
 #[test]
+#[ignore = "records the connected microphone while deliberately delaying some callbacks"]
+fn microphone_device_clock_survives_callback_jitter() {
+    use cam::platform::AudioCaptureBackend;
+    use cpal::traits::{DeviceTrait, HostTrait};
+    use std::sync::{Arc, Mutex};
+    let device = cpal::default_host().default_input_device().expect("connected microphone");
+    eprintln!("Microphone: {:?}, {:?}", device.description(), device.default_input_config());
+    let packets = Arc::new(Mutex::new(Vec::new()));
+    let recorded = packets.clone();
+    let mut count = 0;
+    let backend = cam::platform::windows::WindowsAudioBackend::new();
+    let mut session = backend.start_microphone(None, 48000, 2, Box::new(move |data, at| {
+        recorded.lock().unwrap().push((at, cam::util::host_now(), data.to_vec()));
+        count += 1;
+        if count > 100 && count % 17 == 0 {
+            // Delay more than two normal 10-ms packets. The 100-ms ring must
+            // retain them, and draining the backlog must not overlap samples.
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    })).unwrap();
+    let warmup = std::time::Instant::now();
+    while packets.lock().unwrap().len() < 100 {
+        assert!(warmup.elapsed() < Duration::from_secs(12), "microphone did not start delivering samples");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    packets.lock().unwrap().clear();
+    std::thread::sleep(Duration::from_secs(6));
+    session.stop();
+    assert!(session.error().is_none(), "{:?}", session.error());
+    let packets = packets.lock().unwrap();
+    assert!(packets.len() > 500, "not enough microphone packets");
+    let mut max_error = 0.0f64;
+    let mut gaps = 0;
+    let mut overlaps = 0;
+    let mut arrival_error = 0.0f64;
+    for pair in packets.windows(2) {
+        let duration = pair[0].2.len() as f64 / 2.0 / 48_000.0;
+        let error = pair[1].0 - pair[0].0 - duration;
+        max_error = max_error.max(error.abs());
+        gaps += usize::from(error > 1.5 / 48_000.0);
+        overlaps += usize::from(error < -1.5 / 48_000.0);
+        arrival_error = arrival_error.max((pair[1].1 - pair[0].1 - duration).abs());
+    }
+    let samples: Vec<_> = packets.iter().flat_map(|(_,_,samples)| samples.chunks_exact(2).map(|s| [s[0],s[1]])).collect();
+    assert!(samples.iter().flatten().all(|s| s.is_finite()));
+    let dir = std::env::temp_dir().join(format!("cam-mic-clock-{}-{}", std::process::id(),cam::util::host_now().to_bits()));
+    std::fs::create_dir_all(&dir).unwrap();
+    cam::app::player::write_wav(&dir.join("microphone.wav"), &samples).unwrap();
+    let metrics = serde_json::json!({"packets":packets.len(),"frames":samples.len(),"max_capture_error_ms":max_error*1000.0,"max_arrival_jitter_ms":arrival_error*1000.0,"gaps":gaps,"overlaps":overlaps});
+    std::fs::write(dir.join("result.json"), metrics.to_string()).unwrap();
+    eprintln!("Microphone timing: {metrics}; artifacts {}", dir.display());
+    assert_eq!((gaps,overlaps), (0,0), "device-clocked audio must be contiguous");
+    assert!(arrival_error > 0.001, "test did not exercise callback jitter");
+}
+
+#[test]
 #[ignore = "uses the connected webcam, microphone and speakers"]
 fn capture_audio_camera_pause_and_export_round_trip() {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

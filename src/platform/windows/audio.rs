@@ -1,4 +1,6 @@
 //! Windows WASAPI capture. cpal enables loopback on an output device.
+mod convert;
+mod dispatch;
 mod process;
 use crate::platform::audio::{AudioCaptureBackend, AudioDeviceInfo, AudioStreamSession};
 use anyhow::{Context, Result, bail};
@@ -84,7 +86,7 @@ fn start(
     loopback: bool,
     rate: u32,
     channels: u16,
-    mut callback: Box<dyn FnMut(&[f32], f64) + Send>,
+    callback: Box<dyn FnMut(&[f32], f64) + Send>,
 ) -> Result<Box<dyn AudioStreamSession>> {
     anyhow::ensure!(
         rate == 48000 && channels == 2,
@@ -96,7 +98,7 @@ fn start(
     let errors = error.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
-        let open = || -> Result<cpal::Stream> {
+        let open = || -> Result<(cpal::Stream, dispatch::Processor)> {
             let host = cpal::default_host();
             let device = if loopback {
                 host.default_output_device()
@@ -112,23 +114,28 @@ fn start(
             } else {
                 device.default_input_config()?
             };
-            let config = supported.config();
+            let mut config = supported.config();
+            // WASAPI's default ring on this Realtek input is only 10 ms.
+            // Shared-mode buffer capacity does not change its 10-ms callback
+            // period; retain 100 ms so brief game/driver scheduling stalls do
+            // not overwrite audio before we can drain the packets.
+            config.buffer_size = cpal::BufferSize::Fixed((config.sample_rate / 10).max(1));
             let n = config.channels as usize;
-            let source_rate = config.sample_rate as f64;
-            let mut receive = move |data: Vec<f32>| {
-                let stereo: Vec<_> = data
-                    .chunks(n)
-                    .map(|c| [c[0], *c.get(1).unwrap_or(&c[0])])
-                    .collect();
-                let stereo = crate::capture::mixer::resample(stereo, source_rate);
-                let flat: Vec<_> = stereo.iter().flat_map(|s| s.iter().copied()).collect();
-                callback(
-                    &flat,
-                    crate::util::host_now() - stereo.len() as f64 / 48000.0,
-                );
+            anyhow::ensure!(n > 0 && config.sample_rate > 0, "invalid capture format");
+            // CPAL's WASAPI capture timestamp is the QPC time of the first
+            // sample. Map that clock once, rather than using callback arrival
+            // time (callbacks often drain several queued packets under load).
+            let host_offset = qpc_host_offset()?;
+            let processor =
+                dispatch::Processor::new(config.sample_rate, n, callback, errors.clone());
+            let input = processor.input();
+            let receive = move |data: Vec<f32>, info: &cpal::InputCallbackInfo| {
+                let capture = info.timestamp().capture.as_nanos() as f64 / 1e9 + host_offset;
+                input.push(data, capture);
             };
             let err = move |e: cpal::Error| {
-                eprintln!("Cam audio stream: {e}");
+                // Never write to a potentially blocked stderr pipe from the
+                // device thread, including during recoverable startup xruns.
                 if !matches!(
                     e.kind(),
                     cpal::ErrorKind::Xrun
@@ -138,33 +145,31 @@ fn start(
                     *errors.lock().unwrap() = Some(format!("Audio capture device failed: {e}"));
                 }
             };
+            use cpal::SampleFormat as F;
             let stream = match supported.sample_format() {
-                cpal::SampleFormat::F32 => device.build_input_stream(
-                    config,
-                    move |d: &[f32], _: &_| receive(d.to_vec()),
-                    err,
-                    None,
-                )?,
-                cpal::SampleFormat::I16 => device.build_input_stream(
-                    config,
-                    move |d: &[i16], _: &_| {
-                        receive(d.iter().map(|s| *s as f32 / 32768.0).collect())
-                    },
-                    err,
-                    None,
-                )?,
-                cpal::SampleFormat::I32 => device.build_input_stream(
-                    config,
-                    move |d: &[i32], _: &_| {
-                        receive(d.iter().map(|s| *s as f32 / 2147483648.0).collect())
-                    },
-                    err,
-                    None,
-                )?,
+                F::F32 => capture_stream::<f32>(&device, config, receive, err)?,
+                F::F64 => capture_stream::<f64>(&device, config, receive, err)?,
+                F::I8 => capture_stream::<i8>(&device, config, receive, err)?,
+                F::I16 => capture_stream::<i16>(&device, config, receive, err)?,
+                F::I24 => capture_stream::<cpal::I24>(&device, config, receive, err)?,
+                F::I32 => capture_stream::<i32>(&device, config, receive, err)?,
+                F::I64 => capture_stream::<i64>(&device, config, receive, err)?,
+                F::U8 => capture_stream::<u8>(&device, config, receive, err)?,
+                F::U16 => capture_stream::<u16>(&device, config, receive, err)?,
+                F::U32 => capture_stream::<u32>(&device, config, receive, err)?,
+                F::U64 => capture_stream::<u64>(&device, config, receive, err)?,
                 format => bail!("unsupported capture sample format {format:?}"),
             };
             stream.play()?;
-            Ok(stream)
+            // Starting a CPAL stream only queues its start command. Wait for
+            // real, steady microphone packets before starting the video clock.
+            // Loopback may legitimately deliver nothing while speakers are idle.
+            if !loopback {
+                processor.wait_ready()?;
+            }
+            // Tuple fields drop in order: stop the native stream and release
+            // its queue sender before joining the processor's drain.
+            Ok((stream, processor))
         };
         match open() {
             Ok(stream) => {
@@ -202,4 +207,39 @@ fn start(
         thread: Some(thread),
         error,
     }))
+}
+
+fn capture_stream<T: cpal::SizedSample>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    mut receive: impl FnMut(Vec<f32>, &cpal::InputCallbackInfo) + Send + 'static,
+    error: impl FnMut(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream>
+where
+    f32: cpal::FromSample<T>,
+{
+    Ok(device.build_input_stream(
+        config,
+        move |samples: &[T], info| {
+            receive(
+                samples
+                    .iter()
+                    .map(|sample| sample.to_sample::<f32>())
+                    .collect(),
+                info,
+            );
+        },
+        error,
+        None,
+    )?)
+}
+
+fn qpc_host_offset() -> Result<f64> {
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    let (mut counter, mut frequency) = (0, 0);
+    unsafe {
+        QueryPerformanceFrequency(&mut frequency)?;
+        QueryPerformanceCounter(&mut counter)?;
+    }
+    Ok(crate::util::host_now() - counter as f64 / frequency as f64)
 }
