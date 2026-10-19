@@ -3,6 +3,8 @@
 mod callback;
 mod downsample;
 mod scale;
+#[cfg(test)]
+mod performance_tests;
 use super::{Frame, mf_encoder::Runtime, preview_decode::Track};
 use anyhow::{Context, Result, bail, ensure};
 use std::{os::windows::ffi::OsStrExt, sync::Arc};

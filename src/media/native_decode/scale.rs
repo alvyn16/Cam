@@ -218,10 +218,6 @@ impl Scale {
             }
             self.context.Unmap(&self.staging, 0);
         }
-        for pixel in bgra.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
         Ok(bgra)
     }
 }

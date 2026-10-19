@@ -22,5 +22,6 @@ void main(uint3 id : SV_DispatchThreadID) {
             weight_sum += weight;
         }
     }
-    output_image[id.xy] = sum / max(weight_sum, 1e-6);
+    // Store BGRA bytes in the RGBA UAV so readback needs no CPU swizzle.
+    output_image[id.xy] = float4((sum / max(weight_sum, 1e-6)).bgr, 1.0);
 }
