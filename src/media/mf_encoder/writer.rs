@@ -9,10 +9,7 @@ use super::{
 use crate::{
     media::writer::WriterSpec,
     project::model::Codec,
-    render::{
-        Gpu,
-        dx12::{GpuInterop, NativeFrame},
-    },
+    render::{Gpu, dx12::NativeFrame},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -50,7 +47,7 @@ pub struct NativeWriter {
     // Keep the manager and device alive until the sink/encoder has gone away.
     _manager: IMFDXGIDeviceManager,
     converter: Converter,
-    interop: GpuInterop,
+    interop: super::device::Device,
     output: PathBuf,
     stream: u32,
     fps: u32,
@@ -94,6 +91,20 @@ fn video_type(width: u32, height: u32, fps: u32, subtype: &GUID) -> Result<IMFMe
 
 impl NativeWriter {
     pub fn create(output: &Path, spec: &WriterSpec, gpu: &Gpu) -> Result<Self> {
+        Self::create_with(output, spec, || super::device::Device::render_device(gpu))
+    }
+    pub fn create_for_capture(
+        output: &Path,
+        spec: &WriterSpec,
+        device: windows62::Win32::Graphics::Direct3D11::ID3D11Device,
+    ) -> Result<Self> {
+        Self::create_with(output, spec, || super::device::Device::capture(device))
+    }
+    fn create_with(
+        output: &Path,
+        spec: &WriterSpec,
+        device: impl FnOnce() -> Result<super::device::Device>,
+    ) -> Result<Self> {
         ensure!(
             !spec.audio,
             "native video encoder requires separate audio muxing"
@@ -121,14 +132,20 @@ impl NativeWriter {
             "invalid native encoder bitrate"
         );
         let runtime = Runtime::new()?;
-        let interop = GpuInterop::new(gpu)?;
+        let interop = device()?;
         let hardware = hardware_encoders(interop.adapter_luid(), spec.codec)?;
         ensure!(
             !hardware.is_empty(),
             "no native hardware {:?} encoder for this GPU",
             spec.codec
         );
-        let converter = Converter::new(&interop, spec.width, spec.height, spec.fps)?;
+        let converter = Converter::new_device(
+            interop.device(),
+            interop.context(),
+            spec.width,
+            spec.height,
+            spec.fps,
+        )?;
         let (mut token, mut manager) = (0, None);
         unsafe {
             MFCreateDXGIDeviceManager(&mut token, &mut manager)
@@ -320,12 +337,36 @@ impl NativeWriter {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<()> {
         ensure!(
+            frame.size() == self.converter.output_size(),
+            "GPU encoder frame dimensions changed"
+        );
+        self.push_texture(frame.texture(), cancelled)
+    }
+    pub fn push_texture(
+        &mut self,
+        texture: &windows62::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let mut desc = windows62::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut desc);
+        }
+        if self.converter.input_size() != (desc.Width, desc.Height) {
+            self.converter = Converter::new_sized(
+                self.interop.device(),
+                self.interop.context(),
+                (desc.Width, desc.Height),
+                self.converter.output_size(),
+                self.fps,
+            )?;
+        }
+        ensure!(
             self.frames <= u32::MAX as u64,
             "native encoder frame index overflow"
         );
-        let (sample, texture, subresource) = self.samples.acquire(cancelled)?;
+        let (sample, output, subresource) = self.samples.acquire(cancelled)?;
         self.converter
-            .convert_into(frame, &texture, subresource, self.frames as u32)?;
+            .convert_texture(texture, &output, subresource, self.frames as u32)?;
         self.interop.wait_for_native()?;
         unsafe {
             let start = self.frames as i64 * 10_000_000 / self.fps as i64;

@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$PackageResult,
     [Parameter(Mandatory=$true)][string]$RuntimeArchive,
     [switch]$Download,
-    [switch]$Integration
+    [switch]$Integration,
+    [string]$HighResolutionProject
 )
 $ErrorActionPreference = 'Stop'
 $package = Get-Content $PackageResult -Raw | ConvertFrom-Json
@@ -53,6 +54,9 @@ $previousPath = $env:PATH
 $previousFfmpeg = $env:CAM_FFMPEG
 $previousFfprobe = $env:CAM_FFPROBE
 $previousEncoder = $env:CAM_ENCODER
+$previousGpuCapture = $env:CAM_GPU_CAPTURE
+$previousGpuPreview = $env:CAM_GPU_PREVIEW
+if ($HighResolutionProject) { $HighResolutionProject = (Resolve-Path -LiteralPath $HighResolutionProject).Path }
 try {
     $env:CAM_FFMPEG = $null
     $env:CAM_FFPROBE = $null
@@ -77,6 +81,23 @@ try {
         if (!$gui.HasExited) { $null = $gui.CloseMainWindow(); if (!$gui.WaitForExit(15000)) { $gui.Kill(); throw 'Installed GUI did not close cleanly.' } }
     }
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+    if ($HighResolutionProject) {
+        # Exercise the native codecs with the packaged app-local C++ runtime.
+        $env:CAM_GPU_PREVIEW = 'require'
+        & $cam bench-preview $HighResolutionProject --scrub --width 1280 --height 720 > (Join-Path $root 'native-preview.json') 2> (Join-Path $root 'native-preview.log')
+        if ($LASTEXITCODE -ne 0) { throw 'Installed native high-resolution preview failed.' }
+        $preview = Get-Content (Join-Path $root 'native-preview.json') -Raw | ConvertFrom-Json
+        if ($null -eq $preview.final_frame_mse -or $preview.final_frame_mse -ge 100) { throw 'Installed native preview failed pixel comparison.' }
+        $env:CAM_ENCODER = $null
+        $env:CAM_GPU_CAPTURE = 'require'
+        & $cam record --area 100,100,320,200 --duration 1 --fps 10 --no-system-audio --dir $root --name NativeRecorded > (Join-Path $root 'native-record.log') 2>&1
+        if ($LASTEXITCODE -ne 0 -or !(Select-String -LiteralPath (Join-Path $root 'native-record.log') -Pattern 'GPU' -Quiet)) { throw 'Installed native GPU capture failed.' }
+        & (Join-Path $target 'ffmpeg.exe') -v error -nostdin -i (Join-Path $root 'NativeRecorded.cam\recording\screen.mov') -f null - 2> (Join-Path $root 'native-record-decode.log')
+        if ($LASTEXITCODE -ne 0) { throw 'Installed native recording failed independent decoding.' }
+        $env:CAM_GPU_CAPTURE = $previousGpuCapture
+        $env:CAM_GPU_PREVIEW = $previousGpuPreview
+        $env:CAM_ENCODER = 'software'
+    }
     & $cam record --area 100,100,320,200 --duration 1 --fps 10 --no-system-audio --dir $root --name Recorded > (Join-Path $root 'record.log') 2>&1
     if ($LASTEXITCODE -ne 0) { throw 'Installed screen recording failed.' }
     & (Join-Path $target 'ffmpeg.exe') -v error -nostdin -i (Join-Path $root 'Recorded.cam\recording\screen.mov') -f null - 2> (Join-Path $root 'record-decode.log')
@@ -102,10 +123,13 @@ try {
     $env:CAM_FFMPEG = $previousFfmpeg
     $env:CAM_FFPROBE = $previousFfprobe
     $env:CAM_ENCODER = $previousEncoder
+    $env:CAM_GPU_CAPTURE = $previousGpuCapture
+    $env:CAM_GPU_PREVIEW = $previousGpuPreview
     Set-Location (Split-Path $PSScriptRoot -Parent)
 }
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $target 'Uninstall.ps1') -Quiet > (Join-Path $root 'uninstall.log') 2>&1
 if ($LASTEXITCODE -ne 0 -or (Test-Path (Join-Path $target 'cam.exe')) -or (Get-Content (Join-Path $target 'keep-me.txt')) -ne 'user data') { throw 'Uninstall failed to preserve user files.' }
 if ($Integration -and ((Test-Path $key) -or @($links | Where-Object { Test-Path -LiteralPath $_ }).Count)) { throw 'Uninstall left registration/shortcuts behind.' }
 @{status='PASS';checks=@('self-extraction','Windows PowerShell 5.1 installation','update preserves user files','corrupt download preserves installation','GUI loads app-local C++ runtime','real screen recording without tools on PATH','H.264/AAC export without tools on PATH','full independent decode','uninstall preserves user files');download_tested=[bool]$Download;integration_tested=[bool]$Integration;artifacts=$root} |
+    ForEach-Object { $_.high_resolution_tested = [bool]$HighResolutionProject; $_ } |
     ConvertTo-Json -Depth 4 | Tee-Object -FilePath (Join-Path $root 'result.json')

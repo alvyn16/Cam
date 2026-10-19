@@ -5,6 +5,7 @@ pub mod mf_encoder;
 pub mod audio_file;
 pub mod audio_stream;
 pub mod preview_decode;
+mod native_decode;
 pub(crate) mod audio_cache;
 pub mod ffmpeg;
 pub(crate) mod mux;

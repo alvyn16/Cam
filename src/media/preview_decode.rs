@@ -214,14 +214,23 @@ struct Source {
     stream: Option<Stream>,
     current: Option<Arc<Frame>>,
     next: Option<Arc<Frame>>,
+    native: Option<super::native_decode::Reader>,
+    tried_native: bool,
+    native_required: bool,
 }
 impl Source {
     fn new(track: Track) -> Self {
+        let policy = std::env::var("CAM_GPU_PREVIEW").unwrap_or_default();
+        let tried_native =
+            policy == "off" || (track.width.max(track.height) <= 1280 && policy != "require");
         Self {
             track,
             stream: None,
             current: None,
             next: None,
+            native: None,
+            tried_native,
+            native_required: policy == "require",
         }
     }
     fn reset(&mut self) {
@@ -230,6 +239,28 @@ impl Source {
         self.next = None;
     }
     fn frame_at(&mut self, at: f64, cancelled: &impl Fn() -> bool) -> Result<Option<Arc<Frame>>> {
+        if !self.tried_native {
+            self.tried_native = true;
+            match super::native_decode::Reader::open(&self.track) {
+                Ok(reader) => self.native = Some(reader),
+                Err(error) if self.native_required => return Err(error),
+                Err(error) => eprintln!("Cam GPU preview unavailable; using FFmpeg: {error:#}"),
+            }
+        }
+        ensure!(
+            !self.native_required || self.native.is_some(),
+            "native GPU preview required but unavailable"
+        );
+        if let Some(reader) = &mut self.native {
+            match reader.frame_at(at, cancelled) {
+                Ok(frame) => return Ok(frame),
+                Err(error) if cancelled() || self.native_required => return Err(error),
+                Err(error) => {
+                    eprintln!("Cam GPU preview unavailable; using FFmpeg: {error:#}");
+                    self.native = None;
+                }
+            }
+        }
         ensure!(
             self.track.fps.is_finite() && self.track.fps > 0.0,
             "invalid video rate"
@@ -393,8 +424,128 @@ impl Drop for Stream {
 mod tests {
     use super::*;
     use std::time::Instant;
+    #[test]
+    fn required_native_decoder_never_silently_switches_to_software() {
+        let mut source = Source::new(Track {
+            path: PathBuf::from("unused"),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            duration_ms: 1000.0,
+        });
+        source.tried_native = true;
+        source.native_required = true;
+        let error = source.frame_at(0.0, &|| false).err().unwrap();
+        assert!(error.to_string().contains("required but unavailable"));
+    }
+
+    #[test]
+    #[ignore = "compares the persistent D3D11 preview with FFmpeg on the selected video and GPU"]
+    fn native_gpu_preview_seek_pixels_match_software() {
+        let track = if let Some(path) = std::env::var_os("CAM_TEST_VIDEO") {
+            let path = PathBuf::from(path);
+            let video = super::super::VideoReader::open(&path).unwrap();
+            Track {
+                path,
+                width: video.size.0,
+                height: video.size.1,
+                fps: video.fps,
+                duration_ms: video.duration_ms,
+            }
+        } else {
+            // Exercise the high-resolution path selected in production;
+            // small source previews intentionally retain the CPU decoder.
+            fixture_sized(1920, 1080)
+        };
+        let root = std::env::temp_dir().join(format!(
+            "cam-native-preview-{}-{}",
+            std::process::id(),
+            crate::util::host_now().to_bits()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut native = super::super::native_decode::Reader::open(&track).unwrap();
+        let mut software = Source::new(track.clone());
+        software.tried_native = true;
+        let mut metrics = vec![];
+        for at in [0.0, 1000.0, 2960.0, 7000.0, 2100.0, 7950.0] {
+            let started = Instant::now();
+            let actual = native.frame_at(at, &|| false).unwrap().unwrap();
+            let native_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let expected = software.frame_at(at, &|| false).unwrap().unwrap();
+            assert_eq!(actual.size(), expected.size());
+            let mut squared = 0.0;
+            let mut bias = [0.0; 3];
+            for (a, b) in actual
+                .bgra
+                .chunks_exact(4)
+                .zip(expected.bgra.chunks_exact(4))
+            {
+                for channel in 0..3 {
+                    let difference = a[channel] as f64 - b[channel] as f64;
+                    squared += difference * difference;
+                    bias[channel] += difference;
+                }
+            }
+            let pixels = (actual.bgra.len() / 4) as f64;
+            let mse = squared / (pixels * 3.0);
+            for value in &mut bias {
+                *value /= pixels;
+            }
+            metrics.push(serde_json::json!({"at_ms":at,"decoded_ms":actual.pts_ms,"mse":mse,"bias_bgr":bias,"native_ms":native_ms}));
+            for (name, frame) in [("native", &actual), ("software", &expected)] {
+                let mut rgba = frame.bgra.clone();
+                for p in rgba.chunks_exact_mut(4) {
+                    p.swap(0, 2);
+                }
+                image::save_buffer(
+                    root.join(format!("{at}-{name}.png")),
+                    &rgba,
+                    frame.width,
+                    frame.height,
+                    image::ColorType::Rgba8,
+                )
+                .unwrap();
+            }
+        }
+        let cancelled = std::sync::atomic::AtomicUsize::new(0);
+        let started = Instant::now();
+        assert!(
+            native
+                .frame_at(2960.0, &|| cancelled.fetch_add(1, Ordering::Relaxed) >= 1)
+                .is_err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "native read cancellation blocked"
+        );
+        let after = native.frame_at(0.0, &|| false).unwrap().unwrap();
+        assert!(
+            after.pts_ms.abs() < 1.0,
+            "stale callback after cancelled seek"
+        );
+        eprintln!(
+            "Native preview: {}; artifacts {}",
+            serde_json::to_string(&metrics).unwrap(),
+            root.display()
+        );
+        std::fs::write(
+            root.join("result.json"),
+            serde_json::to_vec_pretty(&metrics).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric["mse"].as_f64().unwrap() < 100.0),
+            "native preview differs from reference: {}",
+            root.display()
+        );
+    }
 
     fn fixture() -> Track {
+        fixture_sized(128, 72)
+    }
+    fn fixture_sized(width: u32, height: u32) -> Track {
         let path = std::env::temp_dir().join(format!(
             "cam-scrub-{}-{}.mp4",
             std::process::id(),
@@ -411,7 +562,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=size=128x72:rate=24",
+                &format!("testsrc2=size={width}x{height}:rate=24"),
                 "-t",
                 "8",
                 "-c:v",
@@ -433,8 +584,8 @@ mod tests {
         );
         Track {
             path,
-            width: 128,
-            height: 72,
+            width,
+            height,
             fps: 24.0,
             duration_ms: 8000.0,
         }
@@ -493,12 +644,16 @@ mod tests {
         let mut received = 0;
         for i in 1..=60 {
             decoder.request(i as f64 * 1000.0 / 60.0, None);
-            if decoder.take_ready().is_some() {
+            if let Some(frame) = decoder.take_ready() {
+                assert!(frame.error.is_none(), "{:?}", frame.error);
                 received += 1;
             }
             std::thread::sleep(Duration::from_millis(16));
         }
-        finish(&mut decoder);
+        // The final frame may already have been consumed inside the loop.
+        if decoder.pending() {
+            finish(&mut decoder);
+        }
         assert!(received > 5, "playback starved: {received}");
         decoder.request(7000.0, None);
         let stop = Instant::now();

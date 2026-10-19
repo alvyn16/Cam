@@ -109,18 +109,55 @@ impl Session {
             o.hide_desktop_icons,
             o.hide_dock,
         ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+        let frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let policy = std::env::var("CAM_GPU_CAPTURE").unwrap_or_default();
+        // Keep the classic-window repaint fallback on its established path.
+        let native = target.as_ref().filter(|target| {
+            matches!(target, screen::Target::Display(..))
+                && policy != "off"
+                && std::env::var("CAM_ENCODER").as_deref() != Ok("software")
+                && spec.codec != crate::project::model::Codec::Prores
+        });
+        if let Some(target) = native {
+            let native_error = Arc::new(Mutex::new(None));
+            let state = super::native::State {
+                clock: clock.clone(),
+                stop: stop.clone(),
+                cancelled: cancelled.clone(),
+                error: native_error.clone(),
+                frames: frames.clone(),
+            };
+            match super::native::start(target, &o.output, spec.clone(), state) {
+                Ok(thread) => {
+                    return Ok(Self {
+                        output: Some(o.output),
+                        started: Instant::now(),
+                        description: "Windows GPU capture".into(),
+                        clock,
+                        stop,
+                        error: native_error,
+                        frames,
+                        thread: Some(thread),
+                        stems,
+                        desktop,
+                        cancelled,
+                    });
+                }
+                Err(error) if policy == "require" => return Err(error),
+                Err(error) => eprintln!("Cam GPU capture unavailable; using FFmpeg: {error:#}"),
+            }
+        }
         let capture = target
             .as_ref()
             .map(|t| super::wgc::Stream::start(t, o.fps, false))
             .transpose()?;
         let mut writer = crate::media::writer::MovieWriter::create(&o.output, &spec)?;
-        let stop = Arc::new(AtomicBool::new(false));
         let end = stop.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
         let abort = cancelled.clone();
-        let error = Arc::new(Mutex::new(None));
         let err = error.clone();
-        let frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let count = frames.clone();
         let timing = clock.clone();
         let thread = std::thread::spawn(move || {

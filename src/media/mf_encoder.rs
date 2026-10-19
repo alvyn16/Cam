@@ -5,6 +5,9 @@ mod convert;
 mod finalize;
 mod samples;
 mod writer;
+mod device;
+#[cfg(test)]
+mod capture_tests;
 use windows62::{
     Win32::{
         Foundation::{LUID, RPC_E_CHANGED_MODE},
@@ -15,13 +18,13 @@ use windows62::{
 };
 pub use writer::NativeWriter;
 
-struct Runtime {
+pub(crate) struct Runtime {
     uninitialize: bool,
     // COM and MF must be shut down on the creating thread.
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl Runtime {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let status = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         if status.is_err() && status != RPC_E_CHANGED_MODE {
             status.ok().context("initializing encoder COM")?;

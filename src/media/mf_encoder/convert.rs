@@ -1,4 +1,5 @@
 //! GPU video-processor conversion; no CPU mapping or pixel readback.
+#[cfg(test)]
 use crate::render::dx12::{GpuInterop, NativeFrame};
 use anyhow::{Context, Result, ensure};
 use windows62::{
@@ -12,21 +13,53 @@ pub(super) struct Converter {
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     size: (u32, u32),
+    input: (u32, u32),
 }
 impl Converter {
+    #[cfg(test)]
     pub fn new(interop: &GpuInterop, width: u32, height: u32, fps: u32) -> Result<Self> {
+        Self::new_device(interop.device(), interop.context(), width, height, fps)
+    }
+    pub fn new_device(
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self> {
+        Self::new_sized(
+            device,
+            device_context,
+            (width, height),
+            (width, height),
+            fps,
+        )
+    }
+    pub fn input_size(&self) -> (u32, u32) {
+        self.input
+    }
+    pub fn output_size(&self) -> (u32, u32) {
+        self.size
+    }
+    pub fn new_sized(
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        input_size: (u32, u32),
+        output_size: (u32, u32),
+        fps: u32,
+    ) -> Result<Self> {
+        let (width, height) = output_size;
         ensure!(
             width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0 && fps > 0,
             "native NV12 encoding requires positive even dimensions and frame rate"
         );
         unsafe {
-            let _ = interop
-                .context()
+            let _ = device_context
                 .cast::<ID3D10Multithread>()?
                 .SetMultithreadProtected(true);
         }
-        let video: ID3D11VideoDevice = interop.device().cast()?;
-        let context: ID3D11VideoContext = interop.context().cast()?;
+        let video: ID3D11VideoDevice = device.cast()?;
+        let context: ID3D11VideoContext = device_context.cast()?;
         let rate = DXGI_RATIONAL {
             Numerator: fps,
             Denominator: 1,
@@ -35,8 +68,8 @@ impl Converter {
             video.CreateVideoProcessorEnumerator(&D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
                 InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
                 InputFrameRate: rate,
-                InputWidth: width,
-                InputHeight: height,
+                InputWidth: input_size.0,
+                InputHeight: input_size.1,
                 OutputFrameRate: rate,
                 OutputWidth: width,
                 OutputHeight: height,
@@ -63,6 +96,21 @@ impl Converter {
                 DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
             );
             context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+            let source = windows62::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: input_size.0 as i32,
+                bottom: input_size.1 as i32,
+            };
+            let destination = windows62::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            };
+            context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source));
+            context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&destination));
+            context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&destination));
         }
         Ok(Self {
             video,
@@ -70,6 +118,7 @@ impl Converter {
             enumerator,
             processor,
             size: (width, height),
+            input: input_size,
         })
     }
     #[cfg(test)]
@@ -112,6 +161,7 @@ impl Converter {
         Ok(output)
     }
 
+    #[cfg(test)]
     pub fn convert_into(
         &self,
         frame: &NativeFrame,
@@ -119,8 +169,21 @@ impl Converter {
         subresource: u32,
         index: u32,
     ) -> Result<()> {
+        self.convert_texture(frame.texture(), output, subresource, index)
+    }
+    pub fn convert_texture(
+        &self,
+        texture: &ID3D11Texture2D,
+        output: &ID3D11Texture2D,
+        subresource: u32,
+        index: u32,
+    ) -> Result<()> {
+        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut source_desc);
+        }
         ensure!(
-            frame.size() == self.size,
+            (source_desc.Width, source_desc.Height) == self.input,
             "GPU encoder frame dimensions changed"
         );
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -155,7 +218,7 @@ impl Converter {
         let (mut input_view, mut output_view) = (None, None);
         unsafe {
             self.video.CreateVideoProcessorInputView(
-                frame.texture(),
+                texture,
                 &self.enumerator,
                 &D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                     FourCC: 0,

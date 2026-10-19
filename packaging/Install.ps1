@@ -69,7 +69,7 @@ try {
     } else {
         Set-ProgressText 'Downloading media tools (about 110 MB). Internet is required only for setup.'
         $client = New-Object Net.WebClient
-        $client.Headers['User-Agent'] = 'Cam-Setup/0.1.0'
+        $client.Headers['User-Agent'] = 'Cam-Setup/' + $package.version
         $download = $client.DownloadFileTaskAsync([uri]$manifest.url, $archive)
         $timer = [Diagnostics.Stopwatch]::StartNew()
         while (!$download.IsCompleted) {

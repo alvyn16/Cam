@@ -13,5 +13,6 @@ pub mod record;
 pub mod screen;
 pub mod tcc;
 pub mod wgc;
+mod native;
 pub mod winsize;
 pub mod writer;

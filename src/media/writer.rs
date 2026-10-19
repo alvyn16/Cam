@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct WriterSpec {
     pub width: u32,
     pub height: u32,
