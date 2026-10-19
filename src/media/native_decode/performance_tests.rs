@@ -34,6 +34,26 @@ fn high_resolution_preview_throughput_and_resources() {
         duration_ms: video.duration_ms,
     };
     let mut reader = Reader::open(&track).unwrap();
+    for (name, media) in [
+        ("native", unsafe {
+            reader
+                .reader
+                .GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)
+                .unwrap()
+        }),
+        ("current", unsafe {
+            reader
+                .reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+                .unwrap()
+        }),
+    ] {
+        eprintln!(
+            "{name}: matrix={:?}, range={:?}",
+            unsafe { media.GetUINT32(&MF_MT_YUV_MATRIX) },
+            unsafe { media.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }
+        );
+    }
     let first = reader.frame_at(0.0, &|| false).unwrap().unwrap();
     drop(first);
     // Isolate conversion/readback from compressed video decode. Use a real
@@ -72,7 +92,11 @@ fn high_resolution_preview_throughput_and_resources() {
     let conversion_cpu = cpu_seconds() - cpu;
     let cpu = cpu_seconds();
     let started = std::time::Instant::now();
-    for i in 1..=240 {
+    let playback_frames = ((track.duration_ms * track.fps / 1000.0).floor() as u32)
+        .saturating_sub(2)
+        .min(240);
+    assert!(playback_frames > 0);
+    for i in 1..=playback_frames {
         let at = i as f64 * 1000.0 / track.fps;
         let frame = reader.frame_at(at, &|| false).unwrap().unwrap();
         assert!((frame.pts_ms - at).abs() <= 1000.0 / track.fps + 1.0);
@@ -95,7 +119,7 @@ fn high_resolution_preview_throughput_and_resources() {
             .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut memory)
             .unwrap()
     };
-    let metrics = serde_json::json!({"frames":240,"source":[track.width,track.height],"conversion_seconds":conversion_wall,"conversion_cpu_seconds":conversion_cpu,"conversion_fps":240.0/conversion_wall,"playback_seconds":playback_wall,"playback_cpu_seconds":playback_cpu,"playback_fps":240.0/playback_wall,"local_gpu_bytes":memory.CurrentUsage});
+    let metrics = serde_json::json!({"frames":240,"playback_frames":playback_frames,"source":[track.width,track.height],"conversion_seconds":conversion_wall,"conversion_cpu_seconds":conversion_cpu,"conversion_fps":240.0/conversion_wall,"playback_seconds":playback_wall,"playback_cpu_seconds":playback_cpu,"playback_fps":playback_frames as f64/playback_wall,"local_gpu_bytes":memory.CurrentUsage});
     eprintln!("Preview performance: {metrics}");
     if let Some(output) = std::env::var_os("CAM_PERF_RESULT") {
         std::fs::write(output, metrics.to_string()).unwrap();

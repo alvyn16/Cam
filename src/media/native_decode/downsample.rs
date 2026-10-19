@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use windows62::{
     Win32::Graphics::{
-        Direct3D::{Fxc::D3DCompile, ID3DInclude},
+        Direct3D::{D3D_SRV_DIMENSION_TEXTURE2D, Fxc::D3DCompile, ID3DInclude},
         Direct3D11::*,
         Dxgi::Common::*,
     },
@@ -10,6 +10,8 @@ use windows62::{
 pub(super) struct Downsample {
     pub output: ID3D11Texture2D,
     source: ID3D11ShaderResourceView,
+    chroma: ID3D11ShaderResourceView,
+    sampler: ID3D11SamplerState,
     target: ID3D11UnorderedAccessView,
     shader: ID3D11ComputeShader,
     constants: ID3D11Buffer,
@@ -21,6 +23,8 @@ impl Downsample {
         source: &ID3D11Texture2D,
         input: (u32, u32),
         size: (u32, u32),
+        matrix: u32,
+        full_range: bool,
     ) -> Result<Self> {
         let code = include_bytes!("downsample.hlsl");
         let (mut compiled, mut error) = (None, None);
@@ -51,9 +55,42 @@ impl Downsample {
         unsafe {
             device.CreateComputeShader(bytes, None, Some(&mut shader))?;
         }
-        let mut source_view = None;
+        let view = |format| -> Result<ID3D11ShaderResourceView> {
+            let mut view = None;
+            unsafe {
+                device.CreateShaderResourceView(
+                    source,
+                    Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D11_TEX2D_SRV {
+                                MostDetailedMip: 0,
+                                MipLevels: 1,
+                            },
+                        },
+                    }),
+                    Some(&mut view),
+                )?;
+            }
+            view.context("GPU preview NV12 plane view")
+        };
+        let source_view = view(DXGI_FORMAT_R8_UNORM)?;
+        let chroma = view(DXGI_FORMAT_R8G8_UNORM)?;
+        let mut sampler = None;
         unsafe {
-            device.CreateShaderResourceView(source, None, Some(&mut source_view))?;
+            device.CreateSamplerState(
+                &D3D11_SAMPLER_DESC {
+                    Filter: D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+                    AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                    AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                    AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                    ComparisonFunc: D3D11_COMPARISON_NEVER,
+                    MaxLOD: f32::MAX,
+                    ..Default::default()
+                },
+                Some(&mut sampler),
+            )?;
         }
         let mut output = None;
         unsafe {
@@ -81,12 +118,21 @@ impl Downsample {
         unsafe {
             device.CreateUnorderedAccessView(&output, None, Some(&mut target))?;
         }
-        let sizes = [input.0, input.1, size.0, size.1];
+        let sizes = [
+            input.0,
+            input.1,
+            size.0,
+            size.1,
+            matrix,
+            u32::from(full_range),
+            0,
+            0,
+        ];
         let mut constants = None;
         unsafe {
             device.CreateBuffer(
                 &D3D11_BUFFER_DESC {
-                    ByteWidth: 16,
+                    ByteWidth: 32,
                     Usage: D3D11_USAGE_IMMUTABLE,
                     BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
                     ..Default::default()
@@ -100,7 +146,9 @@ impl Downsample {
         }
         Ok(Self {
             output,
-            source: source_view.context("GPU preview SRV")?,
+            source: source_view,
+            chroma,
+            sampler: sampler.context("GPU preview chroma sampler")?,
             target: target.context("GPU preview UAV")?,
             shader: shader.context("GPU preview shader")?,
             constants: constants.context("GPU preview dimensions")?,
@@ -110,7 +158,11 @@ impl Downsample {
     pub fn run(&self, context: &ID3D11DeviceContext) {
         unsafe {
             context.CSSetShader(&self.shader, None);
-            context.CSSetShaderResources(0, Some(&[Some(self.source.clone())]));
+            context.CSSetShaderResources(
+                0,
+                Some(&[Some(self.source.clone()), Some(self.chroma.clone())]),
+            );
+            context.CSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             context.CSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
             context.CSSetUnorderedAccessViews(
                 0,
@@ -119,7 +171,8 @@ impl Downsample {
                 None,
             );
             context.Dispatch(self.size.0.div_ceil(8), self.size.1.div_ceil(8), 1);
-            context.CSSetShaderResources(0, Some(&[None]));
+            context.CSSetShaderResources(0, Some(&[None, None]));
+            context.CSSetSamplers(0, Some(&[None]));
             context.CSSetUnorderedAccessViews(0, 1, Some([None].as_ptr()), None);
             context.CSSetConstantBuffers(0, Some(&[None]));
             context.CSSetShader(None, None);

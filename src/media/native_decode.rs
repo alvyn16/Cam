@@ -1,10 +1,11 @@
 //! Persistent Media Foundation preview decoder. Decode/scale stays on D3D11;
 //! only the reduced preview image is mapped for the existing compositor upload.
 mod callback;
+mod color;
 mod downsample;
-mod scale;
 #[cfg(test)]
 mod performance_tests;
+mod scale;
 use super::{Frame, mf_encoder::Runtime, preview_decode::Track};
 use anyhow::{Context, Result, bail, ensure};
 use std::{os::windows::ffi::OsStrExt, sync::Arc};
@@ -111,18 +112,23 @@ impl Reader {
         }
         let source =
             unsafe { reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)? };
-        let matrix = unsafe { source.GetUINT32(&MF_MT_YUV_MATRIX) }.unwrap_or(2);
-        ensure!(
-            matches!(matrix, 1 | 2),
-            "native preview color matrix is unsupported; use FFmpeg"
-        );
-        let full_range = unsafe { source.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }.unwrap_or(2) == 1;
+        // The Windows byte-stream handler can omit encoded color tags even
+        // when the source contains them. Probe once per reader, never per frame.
+        let probe = super::ffmpeg::probe(&track.path)?;
+        let stream = probe["streams"]
+            .as_array()
+            .and_then(|streams| streams.iter().find(|s| s["codec_type"] == "video"))
+            .context("preview color metadata")?;
+        let (matrix, full_range) = color::description(
+            stream,
+            unsafe { source.GetUINT32(&MF_MT_YUV_MATRIX) }.unwrap_or(2),
+            unsafe { source.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }.unwrap_or(2) == 1,
+        )?;
         let scaler = scale::Scale::new(
             &device,
             &context,
             (track.width, track.height),
             size,
-            track.fps.round().max(1.0) as u32,
             matrix,
             full_range,
         )?;
