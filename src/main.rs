@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -246,6 +248,9 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    attach_parent_console_for_cli();
+
     #[cfg(target_os = "windows")]
     if cam::export::native_worker::entry()? {
         return Ok(());
@@ -559,6 +564,20 @@ fn main() -> Result<()> {
             Ok(())
         }
         None => cam::app::run(None),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn attach_parent_console_for_cli() {
+    let Some(argument) = std::env::args_os().nth(1) else { return };
+    if argument == "gui" || argument == "__native-export-worker" {
+        return;
+    }
+    // CLI commands can use an existing terminal, but never open a new one.
+    unsafe {
+        let _ = windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
     }
 }
 
@@ -896,7 +915,11 @@ static CAPTION_PROGRESS: std::sync::OnceLock<std::sync::Weak<cam::whisper::Progr
 fn console_cancellation() -> Result<()> {
     STOP.store(false, std::sync::atomic::Ordering::SeqCst);
     unsafe {
-        windows::Win32::System::Console::SetConsoleCtrlHandler(Some(console_stop), true)?;
+        // A detached command with redirected output has no console to cancel.
+        // Recording/export still work there without allocating a terminal.
+        if windows::Win32::System::Console::GetConsoleCP() != 0 {
+            windows::Win32::System::Console::SetConsoleCtrlHandler(Some(console_stop), true)?;
+        }
     }
     Ok(())
 }

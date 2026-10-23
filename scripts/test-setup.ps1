@@ -56,6 +56,27 @@ $previousFfprobe = $env:CAM_FFPROBE
 $previousEncoder = $env:CAM_ENCODER
 $previousGpuCapture = $env:CAM_GPU_CAPTURE
 $previousGpuPreview = $env:CAM_GPU_PREVIEW
+function Invoke-CamCheck([string[]]$Arguments, [string]$Stdout, [string]$Stderr) {
+    # PowerShell does not reliably wait for Windows GUI-subsystem executables
+    # invoked with &: use the owned process's actual exit code, not a stale
+    # LASTEXITCODE left by the intentional corrupt-install check above.
+    $quoted = foreach ($argument in $Arguments) {
+        if ($argument.Contains('"') -or $argument.EndsWith('\')) {
+            throw 'Unexpected quoting in a package-test argument.'
+        }
+        '"' + $argument + '"'
+    }
+    $process = Start-Process -FilePath $cam -ArgumentList $quoted -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+    try {
+        if (!$process.WaitForExit(60000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw "Installed Cam command timed out; see $Stderr"
+        }
+        if ($process.ExitCode -ne 0) { throw "Installed Cam exited $($process.ExitCode); see $Stderr" }
+    } finally { $process.Dispose() }
+}
 if ($HighResolutionProject) { $HighResolutionProject = (Resolve-Path -LiteralPath $HighResolutionProject).Path }
 try {
     $env:CAM_FFMPEG = $null
@@ -65,14 +86,34 @@ try {
     $cam = Join-Path $target 'cam.exe'
     $gui = Start-Process -FilePath $cam -WorkingDirectory $root -PassThru -RedirectStandardOutput (Join-Path $root 'gui.stdout.log') -RedirectStandardError (Join-Path $root 'gui.stderr.log')
     try {
-        # Cam is a console-subsystem executable that creates its GUI afterward;
-        # WaitForInputIdle can throw before winit creates the window.
+        # Wait for winit to create the GUI window before inspecting its modules.
         $deadline = [DateTime]::UtcNow.AddSeconds(15)
         do { Start-Sleep -Milliseconds 100; $gui.Refresh() } while (!$gui.HasExited -and !$gui.MainWindowHandle -and [DateTime]::UtcNow -lt $deadline)
         if ($gui.HasExited -or !$gui.MainWindowHandle) { throw 'Installed GUI did not open its window.' }
         # Winit creates the HWND before asynchronous GPU/device startup ends.
         Start-Sleep -Seconds 3
         $gui.Refresh()
+        # Probe from a detached helper so the test never detaches the caller's
+        # own terminal. A GUI process must have no console to attach to.
+        $probePath = Join-Path $root 'console-probe.ps1'
+        @'
+param([uint32]$GuiId, [string]$OutputFile, [string]$CamExe, [string]$TestRoot)
+Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class CamSetupConsoleProbe { [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AttachConsole(uint id); [DllImport("kernel32.dll")] public static extern bool FreeConsole(); }'
+[void][CamSetupConsoleProbe]::FreeConsole()
+$attached = [CamSetupConsoleProbe]::AttachConsole($GuiId)
+$code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+if ($attached) { [void][CamSetupConsoleProbe]::FreeConsole() }
+$record = Start-Process -FilePath $CamExe -ArgumentList @('record','--area','100,100,320,200','--duration','1','--fps','10','--no-system-audio','--dir',('"{0}"' -f $TestRoot),'--name','Detached') -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TestRoot 'detached.stdout.log') -RedirectStandardError (Join-Path $TestRoot 'detached.stderr.log')
+if (!$record.WaitForExit(30000)) { $record.Kill(); throw 'Detached recording timed out.' }
+[IO.File]::WriteAllText($OutputFile, (@{attached=$attached;error_code=$code;detached_record_exit=$record.ExitCode} | ConvertTo-Json))
+'@ | Set-Content -LiteralPath $probePath -Encoding UTF8
+        $consolePath = Join-Path $root 'console-probe.json'
+        $helper = Start-Process -FilePath $ps -ArgumentList @('-NoProfile','-File',('"{0}"' -f $probePath),'-GuiId',$gui.Id,'-OutputFile',('"{0}"' -f $consolePath),'-CamExe',('"{0}"' -f $cam),'-TestRoot',('"{0}"' -f $root)) -WindowStyle Hidden -PassThru
+        if (!$helper.WaitForExit(45000)) { $helper.Kill(); throw 'GUI console probe timed out.' }
+        if ($helper.ExitCode -ne 0) { throw 'GUI console probe failed.' }
+        $console = Get-Content -LiteralPath $consolePath -Raw | ConvertFrom-Json
+        if ($console.attached -or $console.error_code -ne 6) { throw 'Installed GUI unexpectedly has a console window.' }
+        if ($console.detached_record_exit -ne 0) { throw 'Detached CLI recording failed; see detached.stderr.log.' }
         foreach ($dll in @('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll')) {
             $module = $gui.Modules | Where-Object ModuleName -eq $dll
             if (!$module -or $module.FileName -ne (Join-Path $target $dll)) { throw "GUI did not load its app-local $dll" }
@@ -84,27 +125,24 @@ try {
     if ($HighResolutionProject) {
         # Exercise the native codecs with the packaged app-local C++ runtime.
         $env:CAM_GPU_PREVIEW = 'require'
-        & $cam bench-preview $HighResolutionProject --scrub --width 1280 --height 720 > (Join-Path $root 'native-preview.json') 2> (Join-Path $root 'native-preview.log')
-        if ($LASTEXITCODE -ne 0) { throw 'Installed native high-resolution preview failed.' }
+        Invoke-CamCheck @('bench-preview',$HighResolutionProject,'--scrub','--width','1280','--height','720') (Join-Path $root 'native-preview.json') (Join-Path $root 'native-preview.log')
         $preview = Get-Content (Join-Path $root 'native-preview.json') -Raw | ConvertFrom-Json
         if ($null -eq $preview.final_frame_mse -or $preview.final_frame_mse -ge 100) { throw 'Installed native preview failed pixel comparison.' }
         $env:CAM_ENCODER = $null
         $env:CAM_GPU_CAPTURE = 'require'
-        & $cam record --area 100,100,320,200 --duration 1 --fps 10 --no-system-audio --dir $root --name NativeRecorded > (Join-Path $root 'native-record.log') 2>&1
-        if ($LASTEXITCODE -ne 0 -or !(Select-String -LiteralPath (Join-Path $root 'native-record.log') -Pattern 'GPU' -Quiet)) { throw 'Installed native GPU capture failed.' }
+        Invoke-CamCheck @('record','--area','100,100,320,200','--duration','1','--fps','10','--no-system-audio','--dir',$root,'--name','NativeRecorded') (Join-Path $root 'native-record.stdout.log') (Join-Path $root 'native-record.log')
+        if (!(Select-String -LiteralPath (Join-Path $root 'native-record.log') -Pattern 'GPU' -Quiet)) { throw 'Installed native GPU capture was not selected.' }
         & (Join-Path $target 'ffmpeg.exe') -v error -nostdin -i (Join-Path $root 'NativeRecorded.cam\recording\screen.mov') -f null - 2> (Join-Path $root 'native-record-decode.log')
         if ($LASTEXITCODE -ne 0) { throw 'Installed native recording failed independent decoding.' }
         $env:CAM_GPU_CAPTURE = $previousGpuCapture
         $env:CAM_GPU_PREVIEW = $previousGpuPreview
         $env:CAM_ENCODER = 'software'
     }
-    & $cam record --area 100,100,320,200 --duration 1 --fps 10 --no-system-audio --dir $root --name Recorded > (Join-Path $root 'record.log') 2>&1
-    if ($LASTEXITCODE -ne 0) { throw 'Installed screen recording failed.' }
+    Invoke-CamCheck @('record','--area','100,100,320,200','--duration','1','--fps','10','--no-system-audio','--dir',$root,'--name','Recorded') (Join-Path $root 'record.stdout.log') (Join-Path $root 'record.log')
     & (Join-Path $target 'ffmpeg.exe') -v error -nostdin -i (Join-Path $root 'Recorded.cam\recording\screen.mov') -f null - 2> (Join-Path $root 'record-decode.log')
     if ($LASTEXITCODE -ne 0) { throw 'Installed screen recording failed independent decoding.' }
     $project = Join-Path $root 'Media.cam'
-    & $cam synth $project --duration 1 --width 160 --height 90 > (Join-Path $root 'synth.log') 2>&1
-    if ($LASTEXITCODE -ne 0) { throw 'Installed Cam cannot generate media without tools on PATH.' }
+    Invoke-CamCheck @('synth',$project,'--duration','1','--width','160','--height','90') (Join-Path $root 'synth.stdout.log') (Join-Path $root 'synth.log')
     & (Join-Path $target 'ffmpeg.exe') -v error -f lavfi -i 'sine=frequency=1234:duration=1' -ar 48000 -ac 2 (Join-Path $project 'recording\mic.wav')
     if ($LASTEXITCODE -ne 0) { throw 'Installed audio encoding failed.' }
     $metaPath = Join-Path $project 'recording\meta.json'
@@ -112,8 +150,7 @@ try {
     $meta | Add-Member -NotePropertyName mic -NotePropertyValue @{file='mic.wav';track=0} -Force
     $meta | ConvertTo-Json -Depth 12 | Set-Content $metaPath -Encoding UTF8
     $output = Join-Path $root 'Export.mp4'
-    & $cam export $project --output $output --height 96 --fps 10 --quality web > (Join-Path $root 'export.log') 2>&1
-    if ($LASTEXITCODE -ne 0) { throw 'Installed Cam cannot export without tools on PATH.' }
+    Invoke-CamCheck @('export',$project,'--output',$output,'--height','96','--fps','10','--quality','web') (Join-Path $root 'export.stdout.log') (Join-Path $root 'export.log')
     & (Join-Path $target 'ffmpeg.exe') -v error -nostdin -i $output -f null - 2> (Join-Path $root 'decode.log')
     if ($LASTEXITCODE -ne 0) { throw 'Installed export failed full decoding.' }
     $probe = & (Join-Path $target 'ffprobe.exe') -v error -show_streams -of json $output | ConvertFrom-Json
@@ -130,6 +167,6 @@ try {
 & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $target 'Uninstall.ps1') -Quiet > (Join-Path $root 'uninstall.log') 2>&1
 if ($LASTEXITCODE -ne 0 -or (Test-Path (Join-Path $target 'cam.exe')) -or (Get-Content (Join-Path $target 'keep-me.txt')) -ne 'user data') { throw 'Uninstall failed to preserve user files.' }
 if ($Integration -and ((Test-Path $key) -or @($links | Where-Object { Test-Path -LiteralPath $_ }).Count)) { throw 'Uninstall left registration/shortcuts behind.' }
-@{status='PASS';checks=@('self-extraction','Windows PowerShell 5.1 installation','update preserves user files','corrupt download preserves installation','GUI loads app-local C++ runtime','real screen recording without tools on PATH','H.264/AAC export without tools on PATH','full independent decode','uninstall preserves user files');download_tested=[bool]$Download;integration_tested=[bool]$Integration;artifacts=$root} |
+@{status='PASS';checks=@('self-extraction','Windows PowerShell 5.1 installation','update preserves user files','corrupt download preserves installation','GUI has no console window','detached CLI recording without a console','GUI loads app-local C++ runtime','real screen recording without tools on PATH','H.264/AAC export without tools on PATH','full independent decode','uninstall preserves user files');download_tested=[bool]$Download;integration_tested=[bool]$Integration;artifacts=$root} |
     ForEach-Object { $_.high_resolution_tested = [bool]$HighResolutionProject; $_ } |
     ConvertTo-Json -Depth 4 | Tee-Object -FilePath (Join-Path $root 'result.json')
