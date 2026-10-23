@@ -68,6 +68,7 @@ function Invoke-CamCheck([string[]]$Arguments, [string]$Stdout, [string]$Stderr)
     }
     $process = Start-Process -FilePath $cam -ArgumentList $quoted -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+    $null = $process.Handle # Cache the owned handle before a fast child exits (Windows PowerShell 5.1).
     try {
         if (!$process.WaitForExit(60000)) {
             $process.Kill()
@@ -104,6 +105,7 @@ $attached = [CamSetupConsoleProbe]::AttachConsole($GuiId)
 $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 if ($attached) { [void][CamSetupConsoleProbe]::FreeConsole() }
 $record = Start-Process -FilePath $CamExe -ArgumentList @('record','--area','100,100,320,200','--duration','1','--fps','10','--no-system-audio','--dir',('"{0}"' -f $TestRoot),'--name','Detached') -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $TestRoot 'detached.stdout.log') -RedirectStandardError (Join-Path $TestRoot 'detached.stderr.log')
+$null = $record.Handle
 if (!$record.WaitForExit(30000)) { $record.Kill(); throw 'Detached recording timed out.' }
 [IO.File]::WriteAllText($OutputFile, (@{attached=$attached;error_code=$code;detached_record_exit=$record.ExitCode} | ConvertTo-Json))
 '@ | Set-Content -LiteralPath $probePath -Encoding UTF8
